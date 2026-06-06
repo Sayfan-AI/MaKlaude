@@ -17,7 +17,7 @@ Treat the well-known "multi-agent Kubernetes DevOps" pattern (a coordinator dele
 
 ## Setup
 
-This repo runs autonomously via GitHub Actions. The orchestrator workflows authenticate as the Genesis GitHub App and call the Anthropic API, so they need three repository secrets. **The repo and issue #1 were created without them, but until these are set the workflows fail silently and no autonomous work happens.**
+This repo runs autonomously via GitHub Actions, but **genesis ships those workflows disabled**. They authenticate as the Genesis GitHub App and call the Anthropic API, so running them before the credentials exist would just fail on every trigger. The repo and issue #1 already exist; the autonomous loop stays dormant until you complete these steps.
 
 1. **Install the Genesis GitHub App** on this repository, granting it `contents`, `issues`, `pull-requests`, and `workflows` permissions.
 
@@ -29,9 +29,15 @@ This repo runs autonomously via GitHub Actions. The orchestrator workflows authe
    gh secret set GENESIS_APP_PRIVATE_KEY < genesis-app.pem  # the App's private key (PEM)
    ```
 
-3. **(Optional) Observability & notifications** — set Loki credentials in `.genesis/config.toml` for logs, and configure the A2H gateway if you want Slack/email instead of GitHub-issue comms.
+3. **Activate the dev system** — enable the workflows once the App and secrets are in place:
 
-Once the secrets are in place, the next scheduled run (every 6h) or any issue/PR/comment event wakes the orchestrator and onboarding begins on issue #1.
+   ```bash
+   .genesis/scripts/activate.sh
+   ```
+
+   It checks the secrets are set, then enables all the workflows genesis disabled. The next trigger (an issue/PR/comment event, a push, or the cron) wakes the orchestrator and onboarding begins on issue #1.
+
+4. **(Optional) Observability & notifications** — set Loki credentials in `.genesis/config.toml` for logs, and configure the A2H gateway if you want Slack/email instead of GitHub-issue comms.
 
 ---
 
