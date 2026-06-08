@@ -43,4 +43,4 @@ jobs:
             - Event: ${{ github.event_name }} / ${{ github.event.action }}
 
             Assess this event in context of the project state and take appropriate action.
-          claude_args: "--max-turns 10 --allowedTools Read,Edit,Bash,Glob,Grep,Agent"
+          claude_args: "--max-turns 10 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"

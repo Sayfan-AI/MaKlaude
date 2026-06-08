@@ -35,4 +35,4 @@ jobs:
           prompt: |
             Run the evolver agent defined in .claude/agents/evolver.md.
             This is a scheduled review cycle — review recent system behavior and apply improvements.
-          claude_args: "--max-turns 15 --allowedTools Read,Edit,Bash,Glob,Grep,Agent"
+          claude_args: "--max-turns 15 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
