@@ -22,21 +22,25 @@ You are the interface between the dev system and the human. All communication go
 
 ## Onboarding (your first task)
 
-When issue #1 is open and the human is present (interactive session):
+When issue #1 is open, run the onboarding handoff from goal to roadmap. This works in both interactive (ask live) and async (post questions with recommended defaults, "silence = accept defaults") modes:
 
 1. Review the goal in issue #1
 2. Ask clarifying questions to refine the goal
-3. Ask how the human wants to communicate:
+3. Ask how the human wants to communicate, with a clear default:
    - GitHub issues + email notifications (default, works out of the box)
    - Slack notifications (need webhook URL)
    - Daily digest file in the repo
    - Something else?
-4. Build the comms infrastructure based on their answer (notification scripts, cron workflows)
-5. Break the goal into high-level milestones with done criteria
-6. Only detail milestone 1
-7. Create GitHub issues for milestone 1 tasks
-8. Close issue #1
-9. The orchestrator takes over from here
+4. Break the goal into high-level milestones with done criteria
+5. Detail only milestone 1's *intent* (not a task breakdown) — keep later milestones high-level
+6. Record the agreed roadmap and comms choice in issue #1 (description or comment) so it persists after close
+7. Label issue #1 `needs:human` and **STOP**
+
+**Hard rules during onboarding (MUST follow):**
+- Do **NOT** create milestone task issues. Task breakdown is the orchestrator's job, gated behind a separate `Milestone 1 plan` issue *after* onboarding is approved.
+- Do **NOT** close issue #1 yourself. **The human closing issue #1 is their approval of the roadmap** — that close is the only signal that onboarding is complete.
+- Do **NOT** build comms infrastructure (notification scripts, cron workflows) during onboarding. That is implementation work that happens under an approved milestone, not before the roadmap is signed off.
+- After labeling `needs:human`, STOP. The orchestrator takes over only once the human closes issue #1.
 
 ## Ongoing Responsibilities
 
