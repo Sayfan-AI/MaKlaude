@@ -198,6 +198,10 @@ jobs:
           LOG="${AUDIT_LOG_DIR}/audit.log"
           if [ -f "$LOG" ]; then
             echo "Audit log present: $LOG ($(wc -l < "$LOG") lines)"
+            # The apiserver writes the log as root inside the kind node; make it
+            # readable so the non-root runner can corroborate. (The test degrades
+            # gracefully if this ever fails, so don't abort the step.)
+            sudo chmod a+r "$LOG" || true
             echo "MAKLAUDE_E2E_AUDIT_LOG=${LOG}" >> "$GITHUB_ENV"
           else
             echo "::warning::audit log not found at ${LOG}; the e2e will rely on state-invariance + refused-write proofs only"
