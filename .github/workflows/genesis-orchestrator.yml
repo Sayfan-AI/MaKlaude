@@ -48,17 +48,9 @@ jobs:
       # skipped runs to the Actions tab; benign cancellations don't trigger it.
       - name: Escalate on failure
         if: failure()
+        run: bash .genesis/scripts/escalate.sh
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_REPO: ${{ github.repository }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           WF_NAME: ${{ github.workflow }}
-        run: |
-          set -euo pipefail
-          existing=$(gh issue list --state open --label "automation:failure" --json number --jq '.[0].number // empty')
-          body=$(printf 'A workflow run failed and the loop could not self-advance.\n\n- Workflow: **%s**\n- Failed run: %s\n\nLikely cause: the agent hit max-turns, an API error, or an unrecoverable task. Review the run, unblock, and close this issue once resolved.' "$WF_NAME" "$RUN_URL")
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body "$body"
-          else
-            gh issue create --title "Autonomous system needs help: a workflow run failed" --label "needs:human" --label "automation:failure" --body "$body"
-          fi
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
