@@ -39,7 +39,7 @@ MaKlaude is written in **Go** (1.24+). The codebase follows the standard Go
 project layout:
 
 ```
-cmd/maklaude/      # CLI entrypoint (skeleton: builds, prints version/help)
+cmd/maklaude/      # CLI entrypoint (version/help + `scan`, see below)
 internal/          # private packages
   version/         #   build/version metadata
   cluster/         #   cluster registry & config surface (see below)
@@ -47,7 +47,27 @@ internal/          # private packages
   health/          #   judgment-free snapshot collection (read-only)
   detect/          #   deterministic findings from a snapshot
   escalate/        #   human comms trail: issue-per-problem (see below)
+  scan/            #   one-shot pipeline wiring (collect -> detect -> escalate)
+test/e2e/          # end-to-end test on kind (build tag `e2e`) + seed manifests
 ```
+
+## Running a scan
+
+`maklaude scan` runs the full read-only pipeline once across every registered
+cluster: for each cluster it collects health signals, detects problems
+deterministically, and reconciles the findings into the comms trail, then prints
+a report. It performs **no mutating action** against any cluster — its only
+writes are to the escalation trail, and those degrade to an in-memory dry-run
+unless GitHub is configured (see below).
+
+```bash
+maklaude scan --config config.yaml        # human-readable report
+maklaude scan --config config.yaml --json # machine-readable report (used by e2e)
+```
+
+The JSON report carries, per cluster, the reachability, the findings
+(identity / severity / object / title / message, most-urgent-first), and the
+escalation outcome (opened / updated / closed), plus cross-cluster totals.
 
 ## Comms trail & escalation
 
@@ -168,6 +188,7 @@ or see the docs), then:
 | `task`            | List all available tasks                                |
 | `task build`      | Build the `maklaude` binary into `./bin`                |
 | `task test`       | Run unit tests with the race detector and coverage      |
+| `task e2e`        | Run the end-to-end test (needs a seeded kind cluster; see below) |
 | `task lint`       | Run `golangci-lint` (auto-installs the pinned version)  |
 | `task vet`        | Run `go vet ./...`                                       |
 | `task fmt`        | Format all Go source with `gofmt`                       |
@@ -183,12 +204,37 @@ CI (`.github/workflows/ci.yml`) runs on every pull request and on pushes to
 `main`. It builds the project, runs `golangci-lint`, and executes the unit
 tests — the same checks `task ci` runs locally. Keep the gate green.
 
-Try the CLI skeleton:
+### End-to-end test (kind)
+
+A separate CI job (`.github/workflows/e2e.yml`) runs on every pull request: it
+creates a real [kind](https://kind.sigs.k8s.io/) cluster, applies the read-only
+RBAC bundle, seeds two failure scenarios — a **crashlooping** pod and an
+**unschedulable/pending** pod (see [`test/e2e/manifests/`](test/e2e/manifests/))
+— waits for them to manifest, then runs the pipeline **as MaKlaude's
+least-privilege ServiceAccount** and asserts:
+
+1. **Findings** — a critical `pod.crashloop` and a warning `pod.pending` are detected.
+2. **Escalation** — an issue is opened for each (in-memory dry-run, no external writes).
+3. **Zero writes** — proven four ways, belt-and-suspenders:
+   - RBAC: the SA has only `get`/`list`/`watch` (verified with `kubectl auth can-i`);
+   - state invariance: the seeded objects' `resourceVersion`/`generation`/`managedFields` are unchanged across the scan;
+   - active refusal: a deliberate write through the same guarded transport every client uses is refused with `kube.ErrWriteForbidden`;
+   - audit log: the apiserver audit log shows **no** mutating verb attributed to the MaKlaude SA.
+
+   The no-writes assertions are part of the test and **fail the build** if violated.
+
+The test is gated behind the `e2e` build tag (`task e2e`) and expects
+`MAKLAUDE_E2E_KUBECONFIG`, `MAKLAUDE_E2E_CONTEXT`, and (optionally)
+`MAKLAUDE_E2E_AUDIT_LOG`; the CI job sets them. `MAKLAUDE_GITHUB_*` is left unset
+so escalation stays a safe dry-run.
+
+Try the CLI:
 
 ```bash
 task build
 ./bin/maklaude version
 ./bin/maklaude help
+./bin/maklaude scan --config config.yaml   # one-shot read-only scan
 ```
 
 ---

@@ -1,0 +1,224 @@
+name: E2E (kind)
+
+# End-to-end gate: spin up a real kind cluster, seed failure scenarios, run the
+# MaKlaude read-only scan as its least-privilege ServiceAccount, and assert
+#   (a) the expected findings are detected,
+#   (b) an escalation is produced, and
+#   (c) ZERO writes reached the cluster.
+# This job runs on every pull request (and pushes to main) so it gates merges.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.24"
+  # Pinned tool versions for reproducibility.
+  KIND_VERSION: "v0.24.0"
+  # Node image tag is pinned; the digest is intentionally omitted so a stale or
+  # mistyped digest can't break the whole job. kind v0.24.0 ships v1.31.2 as its
+  # default node image, so this pairing is the tested combination.
+  KIND_NODE_IMAGE: "kindest/node:v1.31.2"
+  CLUSTER_NAME: "maklaude-e2e"
+
+jobs:
+  e2e:
+    name: e2e on kind
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare audit policy + log dirs
+        run: |
+          set -euo pipefail
+          # Host directories mounted into the kind control-plane for apiserver
+          # audit logging (the observational half of the zero-writes proof).
+          AUDIT_DIR="${RUNNER_TEMP}/maklaude-audit"
+          AUDIT_LOG_DIR="${RUNNER_TEMP}/maklaude-audit-log"
+          mkdir -p "$AUDIT_DIR" "$AUDIT_LOG_DIR"
+          chmod 777 "$AUDIT_LOG_DIR"
+          cp test/e2e/kind/audit-policy.yaml "$AUDIT_DIR/audit-policy.yaml"
+
+          # Substitute the host-path placeholders in the kind config.
+          KIND_CFG="${RUNNER_TEMP}/kind-config.yaml"
+          sed -e "s#HOST_AUDIT_DIR#${AUDIT_DIR}#g" \
+              -e "s#HOST_AUDIT_LOG_DIR#${AUDIT_LOG_DIR}#g" \
+              test/e2e/kind/kind-config.yaml > "$KIND_CFG"
+          echo "Rendered kind config:"
+          cat "$KIND_CFG"
+
+          echo "AUDIT_LOG_DIR=${AUDIT_LOG_DIR}" >> "$GITHUB_ENV"
+          echo "KIND_CFG=${KIND_CFG}" >> "$GITHUB_ENV"
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.10.0
+        with:
+          version: ${{ env.KIND_VERSION }}
+          node_image: ${{ env.KIND_NODE_IMAGE }}
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          config: ${{ env.KIND_CFG }}
+          wait: 120s
+
+      - name: Apply read-only RBAC bundle
+        run: |
+          set -euo pipefail
+          kubectl apply -k deploy/rbac
+          # Confirm the SA exists before minting a token.
+          kubectl -n maklaude get serviceaccount maklaude
+
+      - name: Verify RBAC is read-only (auth can-i)
+        run: |
+          set -euo pipefail
+          SA=system:serviceaccount:maklaude:maklaude
+          echo "Grants for $SA:"
+          kubectl auth can-i --list --as="$SA" || true
+
+          fail=0
+          assert_yes() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" != "yes" ]; then
+              echo "::error::expected ALLOWED but denied: $*"; fail=1
+            fi
+          }
+          assert_no() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" = "yes" ]; then
+              echo "::error::expected DENIED but allowed: $*"; fail=1
+            fi
+          }
+          assert_yes list pods --as="$SA" -A
+          assert_yes list nodes --as="$SA"
+          assert_yes list events --as="$SA" -A
+          assert_yes list deployments.apps --as="$SA" -A
+          assert_no create pods --as="$SA"
+          assert_no delete pods --as="$SA"
+          assert_no patch deployments.apps --as="$SA"
+          assert_no get secrets --as="$SA" -A
+          [ "$fail" -eq 0 ] || { echo "RBAC read-only assertions failed"; exit 1; }
+          echo "RBAC is read-only as expected."
+
+      - name: Seed failure scenarios
+        run: |
+          set -euo pipefail
+          kubectl apply -f test/e2e/manifests/crashloop-pod.yaml
+          kubectl apply -f test/e2e/manifests/pending-pod.yaml
+
+      - name: Wait for crashloop pod to enter CrashLoopBackOff
+        run: |
+          set -euo pipefail
+          ns=maklaude-e2e
+          deadline=$(( $(date +%s) + 180 ))
+          while :; do
+            reason=$(kubectl -n "$ns" get pod crashloop \
+              -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)
+            restarts=$(kubectl -n "$ns" get pod crashloop \
+              -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo 0)
+            echo "crashloop: reason='${reason}' restarts='${restarts}'"
+            if [ "$reason" = "CrashLoopBackOff" ]; then
+              echo "crashloop pod reached CrashLoopBackOff."
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::crashloop pod did not reach CrashLoopBackOff in time"
+              kubectl -n "$ns" describe pod crashloop || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Wait for pending pod to be Unschedulable
+        run: |
+          set -euo pipefail
+          ns=maklaude-e2e
+          deadline=$(( $(date +%s) + 120 ))
+          while :; do
+            phase=$(kubectl -n "$ns" get pod pending -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            echo "pending pod phase='${phase}'"
+            if [ "$phase" = "Pending" ]; then
+              # Confirm it is actually unschedulable (a FailedScheduling condition),
+              # not merely briefly pending during normal startup.
+              cond=$(kubectl -n "$ns" get pod pending \
+                -o jsonpath='{.status.conditions[?(@.type=="PodScheduled")].reason}' 2>/dev/null || true)
+              echo "pending pod PodScheduled reason='${cond}'"
+              if [ "$cond" = "Unschedulable" ]; then
+                echo "pending pod is Unschedulable."
+                break
+              fi
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::pending pod did not become Unschedulable in time"
+              kubectl -n "$ns" describe pod pending || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Mint read-only ServiceAccount kubeconfig
+        run: |
+          set -euo pipefail
+          KCFG="${RUNNER_TEMP}/maklaude-sa.kubeconfig"
+
+          SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+          kubectl config view --minify --raw \
+            -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > "${RUNNER_TEMP}/ca.crt"
+          TOKEN=$(kubectl -n maklaude create token maklaude --duration=1h)
+
+          kubectl --kubeconfig "$KCFG" config set-cluster "${CLUSTER_NAME}" \
+            --server="$SERVER" --certificate-authority="${RUNNER_TEMP}/ca.crt" --embed-certs=true
+          kubectl --kubeconfig "$KCFG" config set-credentials maklaude --token="$TOKEN"
+          kubectl --kubeconfig "$KCFG" config set-context "${CLUSTER_NAME}" \
+            --cluster="${CLUSTER_NAME}" --user=maklaude
+          kubectl --kubeconfig "$KCFG" config use-context "${CLUSTER_NAME}"
+          chmod 600 "$KCFG"
+
+          echo "MAKLAUDE_E2E_KUBECONFIG=${KCFG}" >> "$GITHUB_ENV"
+          echo "MAKLAUDE_E2E_CONTEXT=${CLUSTER_NAME}" >> "$GITHUB_ENV"
+
+      - name: Locate audit log
+        run: |
+          set -euo pipefail
+          LOG="${AUDIT_LOG_DIR}/audit.log"
+          if [ -f "$LOG" ]; then
+            echo "Audit log present: $LOG ($(wc -l < "$LOG") lines)"
+            echo "MAKLAUDE_E2E_AUDIT_LOG=${LOG}" >> "$GITHUB_ENV"
+          else
+            echo "::warning::audit log not found at ${LOG}; the e2e will rely on state-invariance + refused-write proofs only"
+          fi
+
+      - name: Run e2e (detect + escalate + zero-writes)
+        env:
+          # MAKLAUDE_GITHUB_* intentionally unset -> in-memory dry-run escalation.
+          MAKLAUDE_E2E_KUBECONFIG: ${{ env.MAKLAUDE_E2E_KUBECONFIG }}
+          MAKLAUDE_E2E_CONTEXT: ${{ env.MAKLAUDE_E2E_CONTEXT }}
+          MAKLAUDE_E2E_AUDIT_LOG: ${{ env.MAKLAUDE_E2E_AUDIT_LOG }}
+        run: task e2e
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== pods ==="
+          kubectl get pods -A || true
+          echo "=== e2e namespace ==="
+          kubectl -n maklaude-e2e describe pods || true
+          echo "=== audit tail (MaKlaude SA) ==="
+          if [ -n "${AUDIT_LOG_DIR:-}" ] && [ -f "${AUDIT_LOG_DIR}/audit.log" ]; then
+            grep "system:serviceaccount:maklaude:maklaude" "${AUDIT_LOG_DIR}/audit.log" | tail -50 || true
+          fi

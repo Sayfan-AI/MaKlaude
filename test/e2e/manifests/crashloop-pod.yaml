@@ -1,0 +1,42 @@
+# Seed scenario (a): a crashlooping pod.
+#
+# The container exits non-zero almost immediately and is restarted by the
+# kubelet on the default (Always) restart policy. After a few rapid failures the
+# kubelet backs the container off into CrashLoopBackOff, which is exactly the
+# waiting-state reason MaKlaude's collector keys on (PodSignal.CrashLoopingContainers)
+# and the detector turns into a critical "pod.crashloop" finding.
+#
+# It lives in its own namespace so the e2e harness can scope reads/cleanup and so
+# the scenario never collides with system workloads.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: maklaude-e2e
+  labels:
+    app.kubernetes.io/part-of: maklaude-e2e
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crashloop
+  namespace: maklaude-e2e
+  labels:
+    app.kubernetes.io/part-of: maklaude-e2e
+    scenario: crashloop
+spec:
+  # Always (the default) so the kubelet keeps restarting the failing container
+  # until it enters CrashLoopBackOff.
+  restartPolicy: Always
+  containers:
+    - name: app
+      image: busybox:1.36
+      # Fail fast and loudly: print a line, then exit 1. Repeated rapid exits
+      # drive the container into CrashLoopBackOff within a few cycles.
+      command: ["/bin/sh", "-c", "echo 'maklaude-e2e: intentional crash'; exit 1"]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 50m
+          memory: 32Mi

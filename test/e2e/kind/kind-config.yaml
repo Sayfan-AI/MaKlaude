@@ -1,0 +1,46 @@
+# kind cluster configuration for MaKlaude's end-to-end test.
+#
+# A single-node cluster is enough for the seed scenarios (a crashlooping pod and
+# an unschedulable pending pod). The non-default piece here is API server audit
+# logging: we mount an audit policy into the control-plane node and point the
+# kube-apiserver at it, so every request is recorded with its verb and user. The
+# e2e harness then asserts that NO mutating verb was ever attributed to
+# MaKlaude's ServiceAccount — the observational half of the zero-writes proof.
+#
+# Paths under /etc/kubernetes are inside the control-plane container; the host
+# paths in extraMounts are filled in by the CI workflow before `kind create`.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            audit-policy-file: /etc/kubernetes/audit/audit-policy.yaml
+            audit-log-path: /var/log/kubernetes/audit/audit.log
+            audit-log-maxsize: "100"
+            audit-log-maxbackup: "1"
+          extraVolumes:
+            - name: audit-policy
+              hostPath: /etc/kubernetes/audit/audit-policy.yaml
+              mountPath: /etc/kubernetes/audit/audit-policy.yaml
+              readOnly: true
+              pathType: File
+            - name: audit-log
+              hostPath: /var/log/kubernetes/audit
+              mountPath: /var/log/kubernetes/audit
+              readOnly: false
+              pathType: DirectoryOrCreate
+    extraMounts:
+      # Host directory (on the CI runner) that holds the audit policy file; mapped
+      # to the in-node path the kubeadm patch references.
+      - hostPath: HOST_AUDIT_DIR
+        containerPath: /etc/kubernetes/audit
+        readOnly: true
+      # Host directory that will receive the audit log so the harness can read it
+      # back out after the scan.
+      - hostPath: HOST_AUDIT_LOG_DIR
+        containerPath: /var/log/kubernetes/audit
+        readOnly: false
