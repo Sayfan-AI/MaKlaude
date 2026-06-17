@@ -5,10 +5,13 @@ on:
     workflows: ["CI"]
     types: [completed]
 
-# Share the orchestrator concurrency group: a merge run and an orchestrator run
-# must not execute at the same time (both push to main / mutate issue state).
+# Auto-merge gets its OWN group, NOT the orchestrator group. Sharing it meant a
+# triage/orchestrator run already in the group would starve and cancel the
+# Auto-Merge run that fires on a green PR — leaving the PR green but unmerged and
+# the milestone stalled. Merges only need to serialize among themselves; a merge
+# (server-side squash) running alongside an orchestrator is harmless.
 concurrency:
-  group: genesis-orchestrator-${{ github.repository }}
+  group: genesis-merge-${{ github.repository }}
   cancel-in-progress: false
 
 permissions:
