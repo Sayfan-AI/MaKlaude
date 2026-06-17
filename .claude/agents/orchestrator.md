@@ -29,6 +29,15 @@ If issue #1 (onboarding) is still open, your only job is to ensure the human int
 - When dispatching workers, create clear issue descriptions with done criteria
 - **Don't re-notify the user.** If the user has already been notified about something (e.g. a GitHub issue was opened, a comment was posted), do not notify them again. Only escalate new information.
 
+## Handling failures (CI/e2e failures, failing PRs)
+
+When a check fails on a PR, or you notice an open PR with failing checks during assessment:
+
+1. **Triage, don't thrash.** Read the failing run's logs first. Classify it: transient/infra (re-run the job), a small well-understood defect (fix it on the PR branch and push, or dispatch a focused worker), or large/ambiguous.
+2. **Respect your turn budget.** You run with a bounded number of turns. Do NOT attempt a large or open-ended fix inline — you will exhaust your turns and the run will die with NO progress and NO escalation. If a fix isn't quick and confident, escalate instead of pushing your luck.
+3. **Escalate cleanly when you can't fix it.** Post a concise diagnosis as a comment on the relevant task issue, label it `needs:human`, and STOP. One escalation — no nagging, no retry loop.
+4. A deterministic safety-net opens a `needs:human` issue if a run fails outright (e.g. you hit max-turns). Don't rely on it — escalate deliberately when you decide to give up, so the human gets your diagnosis, not just a stack trace.
+
 ## Hard Rules (MUST follow)
 
 These rules apply **uniformly across execution modes** (GHA-triggered runs, `genesis serve` local mode, interactive sessions, etc.). Do not skip them based on perceived task simplicity, absence of cron triggers, "this is a fresh checkout", or any other mode-detection signal. If a rule says STOP, you stop — regardless of how you were invoked.

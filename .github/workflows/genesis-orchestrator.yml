@@ -41,4 +41,4 @@ jobs:
           prompt: |
             Run the orchestrator agent defined in .claude/agents/orchestrator.md.
             This is a scheduled run — assess project state and advance work.
-          claude_args: "--max-turns 20 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
+          claude_args: "--max-turns 40 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"

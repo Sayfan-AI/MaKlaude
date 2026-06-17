@@ -1,0 +1,58 @@
+name: Genesis Failure Escalation
+
+# Deterministic safety-net: if an orchestrator/merge run fails outright (e.g. the
+# agent hit max-turns, an API error, or an unrecoverable task), the brain can't
+# escalate for itself — it's dead. This workflow notices the failed run and opens
+# a needs:human issue so the human is never left in the dark. No LLM in this path.
+
+on:
+  workflow_run:
+    workflows:
+      - "Genesis Orchestrator (Scheduled)"
+      - "Genesis Orchestrator (Events)"
+      - "Genesis Auto-Merge"
+      - "Genesis CI Failure Triage"
+    types: [completed]
+
+# Separate group from the orchestrator: escalation only reads/writes issues and
+# must run even while the orchestrator group is busy.
+concurrency:
+  group: genesis-escalation-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  escalate:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.GENESIS_APP_ID }}
+          private-key: ${{ secrets.GENESIS_APP_PRIVATE_KEY }}
+          permission-issues: write
+          permission-contents: read
+
+      - name: Open or update a needs:human escalation issue
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          WF_NAME: ${{ github.event.workflow_run.name }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          # Dedup on the dedicated label: reuse an open escalation issue if present.
+          existing=$(gh issue list --state open --label "automation:failure" --json number --jq '.[0].number // empty')
+          body=$(printf 'The autonomous loop could not self-advance: a workflow run failed.\n\n- Workflow: **%s**\n- Failed run: %s\n\nLikely cause: the agent hit max-turns, an API error, or an unrecoverable task. A human should review the failed run, unblock the work, and close this issue once resolved.' "$WF_NAME" "$RUN_URL")
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create \
+              --title "Autonomous system needs help: a workflow run failed" \
+              --label "needs:human" --label "automation:failure" \
+              --body "$body"
+          fi
