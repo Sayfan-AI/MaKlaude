@@ -64,3 +64,13 @@ Defaults (override as needed):
 - **Database:** Neon (serverless Postgres)
 - **Deployment:** Cloudflare, cloud free-tier
 - **Local dev:** Tilt + kind (K8s), LocalStack (AWS)
+
+## Learnings
+
+Curated memory — non-obvious lessons so future sessions don't relearn them. The evolver maintains this.
+
+### Health detection
+- **Pod container state oscillates; don't detect crashloop on instantaneous state.** A crashlooping pod cycles `Waiting(CrashLoopBackOff)` → `Running` → `Terminated(Error)` → back, so a point-in-time scan keyed only on `state.waiting.reason == "CrashLoopBackOff"` misses it about half the time — and the same race bites a real interval scan, not just the e2e. Detect on a *stable* signal: instantaneous `CrashLoopBackOff` **OR** `RestartCount >= 2` with a non-zero last/current termination. See `internal/health/collector.go` (`containerCrashLooping`) + regression test `TestCollect_CrashLoopMidCycle`.
+
+### Testing / CI
+- **Local kind on macOS is NOT a faithful proxy for CI on Linux — CI is the source of truth.** macOS Docker Desktop remaps bind-mount ownership to the host user, so a root-written file (e.g. the apiserver audit log) is readable locally but `root:0600` and unreadable by the non-root runner on Linux CI. A green local e2e gave false confidence; the bug existed only on Linux. Two rules, both applied: (1) optional test corroboration must **degrade gracefully** (warn + skip), never hard-fail, when the primary proof already holds; (2) when CI must read an apiserver-written file, `chmod` it readable in the workflow. See `test/e2e/e2e_test.go` (`assertNoMutatingAudit`) + `.github/workflows/e2e.yml`.
