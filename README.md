@@ -40,8 +40,49 @@ project layout:
 
 ```
 cmd/maklaude/      # CLI entrypoint (skeleton: builds, prints version/help)
-internal/          # private packages (e.g. internal/version)
+internal/          # private packages
+  version/         #   build/version metadata
+  cluster/         #   cluster registry & config surface (see below)
 ```
+
+## Cluster configuration
+
+MaKlaude operates the Kubernetes clusters a human puts under its care. You
+declare those clusters in a YAML config file. The format is **secret-safe by
+design**: each cluster is referenced by a *path* to an existing kubeconfig
+file and a context name — credentials are never stored in or read from this
+config, and nothing here should ever be committed to version control.
+
+A starter file lives at [`config.example.yaml`](config.example.yaml):
+
+```yaml
+clusters:
+  - name: prod-us-east           # unique, human-friendly identifier
+    kubeconfig: /home/alice/.kube/prod-us-east.yaml  # path to an existing kubeconfig
+    context: prod-us-east        # context to select within that kubeconfig
+
+  - name: staging
+    kubeconfig: ~/.kube/config   # a leading "~" expands to your home directory
+    context: staging
+```
+
+Each entry requires three fields:
+
+| Field        | Description                                                        |
+| ------------ | ------------------------------------------------------------------ |
+| `name`       | Unique, human-friendly cluster identifier (must be unique).        |
+| `kubeconfig` | Filesystem path to an existing kubeconfig file (never inline creds).|
+| `context`    | Name of the context to select within that kubeconfig.              |
+
+The configuration is loaded and validated by the `internal/cluster` package.
+Validation **fails loudly with clear, actionable errors** and aggregates every
+problem it finds at once. It rejects: a missing or empty file, malformed YAML,
+unknown fields, an empty `clusters` list, missing required fields, duplicate
+cluster names, and any referenced kubeconfig file that does not exist on disk.
+
+Each successfully validated cluster resolves to an isolated `Handle` (name,
+kubeconfig path, context) with **no shared or global mutable state** across
+clusters — a later milestone turns a handle into a live Kubernetes client.
 
 ### Task runner
 
