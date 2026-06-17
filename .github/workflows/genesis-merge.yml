@@ -49,5 +49,5 @@ jobs:
             - Use squash merge
             - After merging, close the corresponding task issue if one exists
             - After all merges are done, trigger the orchestrator so it can assess state and continue work:
-              gh workflow run genesis-orchestrator.yml
+              gh workflow run genesis-orchestrator.yml --ref main
           claude_args: "--max-turns 10 --allowedTools Bash,Read,Glob,Grep"

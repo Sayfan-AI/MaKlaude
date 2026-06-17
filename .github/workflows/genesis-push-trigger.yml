@@ -15,8 +15,11 @@ jobs:
           app-id: ${{ secrets.GENESIS_APP_ID }}
           private-key: ${{ secrets.GENESIS_APP_PRIVATE_KEY }}
           permission-actions: write
+          permission-contents: read
 
-      - run: gh workflow run genesis-orchestrator.yml
+      # Pin --ref so `gh` doesn't need a default-branch lookup, which requires
+      # repo metadata the actions-only token lacks (caused a hard failure before).
+      - run: gh workflow run genesis-orchestrator.yml --ref main
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_REPO: ${{ github.repository }}
