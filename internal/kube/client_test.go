@@ -11,6 +11,11 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+
 	"github.com/Sayfan-AI/MaKlaude/internal/cluster"
 )
 
@@ -153,6 +158,50 @@ func TestClient_Unreachable(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "broken") {
 		t.Fatalf("expected error to name the cluster %q, got: %v", "broken", err)
+	}
+}
+
+// TestClient_ListReadsAgainstFakeClientset proves the apps/v1 and events read
+// methods (added for health-signal collection) return the objects the API
+// server holds, exercised here against a fake clientset wired in via
+// NewClientWithInterface.
+func TestClient_ListReadsAgainstFakeClientset(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset(
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}},
+		&appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web-abc"}},
+		&corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "evt-1"},
+			Type:       corev1.EventTypeWarning,
+			Reason:     "BackOff",
+		},
+	)
+	client := NewClientWithInterface("fixture", fakeClient)
+	if client.Name() != "fixture" {
+		t.Fatalf("expected client name %q, got %q", "fixture", client.Name())
+	}
+
+	deps, err := client.ListDeployments(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListDeployments failed: %v", err)
+	}
+	if len(deps) != 1 || deps[0].Name != "web" {
+		t.Fatalf("unexpected deployments: %+v", deps)
+	}
+
+	rss, err := client.ListReplicaSets(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListReplicaSets failed: %v", err)
+	}
+	if len(rss) != 1 || rss[0].Name != "web-abc" {
+		t.Fatalf("unexpected replicasets: %+v", rss)
+	}
+
+	events, err := client.ListEvents(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListEvents failed: %v", err)
+	}
+	if len(events) != 1 || events[0].Reason != "BackOff" {
+		t.Fatalf("unexpected events: %+v", events)
 	}
 }
 

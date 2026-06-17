@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"net/http"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/version"
@@ -100,6 +101,26 @@ func NewClient(h *cluster.Handle) (*Client, error) {
 		clusterName: h.Name(),
 		clientset:   clientset,
 	}, nil
+}
+
+// NewClientWithInterface wraps a pre-built clientset as a read-only [Client]
+// for the named cluster. It exists so callers that already hold a
+// [kubernetes.Interface] — most importantly tests using a
+// k8s.io/client-go/kubernetes/fake clientset — can exercise the read-only
+// surface without a live API server.
+//
+// The wrapped interface is stored unexported and never handed back, so the
+// returned client still exposes only this package's read operations. Note that
+// this constructor does not install the transport-level write guard (the guard
+// lives on the rest.Config of clients built via [NewClient]); it relies on the
+// type's read-only method surface alone. It is therefore intended for in-process
+// wiring and tests, not for adopting an arbitrary externally-built writable
+// client in production paths.
+func NewClientWithInterface(clusterName string, clientset kubernetes.Interface) *Client {
+	return &Client{
+		clusterName: clusterName,
+		clientset:   clientset,
+	}
 }
 
 // restConfigForHandle constructs a *rest.Config from a handle's kubeconfig path
@@ -196,4 +217,49 @@ func (c *Client) GetNamespace(ctx context.Context, name string) (*corev1.Namespa
 		return nil, fmt.Errorf("%w %q: getting namespace %q: %w", ErrUnreachable, c.clusterName, name, err)
 	}
 	return ns, nil
+}
+
+// ListDeployments returns the deployments in the given namespace. An empty
+// namespace lists deployments across all namespaces. It is a read-only (list)
+// operation; connectivity failures surface as an error wrapping
+// [ErrUnreachable] naming the cluster.
+func (c *Client) ListDeployments(ctx context.Context, namespace string) ([]appsv1.Deployment, error) {
+	list, err := c.clientset.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("%w %q: listing deployments in namespace %q: %w",
+			ErrUnreachable, c.clusterName, namespace, err)
+	}
+	return list.Items, nil
+}
+
+// ListReplicaSets returns the replica sets in the given namespace. An empty
+// namespace lists replica sets across all namespaces. It is a read-only (list)
+// operation; connectivity failures surface as an error wrapping
+// [ErrUnreachable] naming the cluster.
+func (c *Client) ListReplicaSets(ctx context.Context, namespace string) ([]appsv1.ReplicaSet, error) {
+	list, err := c.clientset.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("%w %q: listing replicasets in namespace %q: %w",
+			ErrUnreachable, c.clusterName, namespace, err)
+	}
+	return list.Items, nil
+}
+
+// ListEvents returns the events in the given namespace. An empty namespace
+// lists events across all namespaces. It is a read-only (list) operation;
+// connectivity failures surface as an error wrapping [ErrUnreachable] naming
+// the cluster.
+//
+// Events are the cluster's own record of recent, noteworthy occurrences (a
+// scheduling failure, an image pull error, a probe failure). Callers that only
+// care about a subset — for example warnings within a recent window — filter
+// the returned slice; this method deliberately does no filtering so the read
+// stays a faithful, unopinionated mirror of the API server.
+func (c *Client) ListEvents(ctx context.Context, namespace string) ([]corev1.Event, error) {
+	list, err := c.clientset.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("%w %q: listing events in namespace %q: %w",
+			ErrUnreachable, c.clusterName, namespace, err)
+	}
+	return list.Items, nil
 }
