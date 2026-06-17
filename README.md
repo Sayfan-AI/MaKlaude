@@ -33,6 +33,14 @@ This repo runs autonomously via GitHub Actions, but **genesis ships those workfl
 
 ---
 
+## Operator quickstart
+
+If you just want to point MaKlaude at a cluster and run a read-only scan, follow
+the three-step **[operator quickstart](docs/quickstart.md)**: grant read-only
+RBAC, register the cluster, and run `maklaude scan`. MaKlaude only ever *reads*
+your clusters — see the **[no-writes guarantee](docs/no-writes.md)** for how that
+is enforced and tested.
+
 ## Development
 
 MaKlaude is written in **Go** (1.24+). The codebase follows the standard Go
@@ -222,6 +230,8 @@ least-privilege ServiceAccount** and asserts:
    - audit log: the apiserver audit log shows **no** mutating verb attributed to the MaKlaude SA.
 
    The no-writes assertions are part of the test and **fail the build** if violated.
+   See [`docs/no-writes.md`](docs/no-writes.md) for the full belt-and-suspenders
+   guarantee and the exact code/tests that back each layer.
 
 The test is gated behind the `e2e` build tag (`task e2e`) and expects
 `MAKLAUDE_E2E_KUBECONFIG`, `MAKLAUDE_E2E_CONTEXT`, and (optionally)
