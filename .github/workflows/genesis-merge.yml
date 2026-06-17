@@ -1,0 +1,53 @@
+name: Genesis Auto-Merge
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+# Share the orchestrator concurrency group: a merge run and an orchestrator run
+# must not execute at the same time (both push to main / mutate issue state).
+concurrency:
+  group: genesis-orchestrator-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    # Only run when CI succeeds on a PR
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.GENESIS_APP_ID }}
+          private-key: ${{ secrets.GENESIS_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          allowed_bots: "genesis-dev-bot[bot],dependabot[bot]"
+          prompt: |
+            CI just passed on a PR. Check if there are any open PRs created by genesis-dev-bot
+            where all CI checks have passed. If so, merge them.
+
+            Rules:
+            - Only merge PRs created by genesis-dev-bot[bot]
+            - All CI checks must be passing
+            - Use squash merge
+            - After merging, close the corresponding task issue if one exists
+            - After all merges are done, trigger the orchestrator so it can assess state and continue work:
+              gh workflow run genesis-orchestrator.yml
+          claude_args: "--max-turns 10 --allowedTools Bash,Read,Glob,Grep"

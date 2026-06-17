@@ -8,6 +8,12 @@ on:
   issue_comment:
     types: [created]
 
+# Serialize all orchestrator activity across triggers (events, schedule, merge)
+# so two near-simultaneous events can't run two orchestrators and duplicate work.
+concurrency:
+  group: genesis-orchestrator-${{ github.repository }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
   issues: write
