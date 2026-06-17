@@ -1,0 +1,19 @@
+# Kubernetes API server audit policy for the MaKlaude e2e cluster.
+#
+# Its sole job is to make EVERY request the apiserver handles auditable at the
+# Metadata level — enough to see the verb, the user/SA, and the resource without
+# logging request/response bodies. The e2e harness greps this log for any
+# mutating verb (create/update/patch/delete/deletecollection) attributed to
+# MaKlaude's ServiceAccount; finding none is the strongest observational proof
+# that the read-only guarantee held against a real API server.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+# Do not log the noisy, high-volume read traffic from system components or the
+# watch/get spam; we only need a faithful record of what MaKlaude did. We still
+# log MaKlaude's own reads at Metadata so the harness can prove it was active.
+omitStages:
+  - RequestReceived
+rules:
+  # Record everything at Metadata level. Bodies are never needed (and could carry
+  # secrets), so Metadata is both sufficient and safe.
+  - level: Metadata

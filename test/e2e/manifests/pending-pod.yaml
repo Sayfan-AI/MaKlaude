@@ -1,0 +1,35 @@
+# Seed scenario (b): an unschedulable / pending pod.
+#
+# The nodeSelector demands a label no node in a default kind cluster carries, so
+# the scheduler can never place the pod and it stays Pending indefinitely (the
+# scheduler also records a FailedScheduling warning event). MaKlaude's collector
+# reports PodSignal.Pending=true and the detector turns it into a warning
+# "pod.pending" finding.
+#
+# A nodeSelector (rather than a huge resource request) is used deliberately: it
+# makes the pod *permanently* unschedulable with zero dependence on the node's
+# actual capacity, so the scenario is deterministic across CI runners.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pending
+  namespace: maklaude-e2e
+  labels:
+    app.kubernetes.io/part-of: maklaude-e2e
+    scenario: pending
+spec:
+  # No node will ever carry this label in a stock kind cluster, so the pod is
+  # unschedulable forever — a stable, capacity-independent Pending.
+  nodeSelector:
+    maklaude.io/nonexistent-node-label: "definitely-not-present"
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 50m
+          memory: 32Mi

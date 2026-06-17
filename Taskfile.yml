@@ -35,6 +35,19 @@ tasks:
     cmds:
       - go test -race -coverprofile=coverage.out ./...
 
+  e2e:
+    desc: |
+      Run the end-to-end test against a live cluster. Requires a kind cluster
+      seeded with the failure scenarios and these env vars:
+        MAKLAUDE_E2E_KUBECONFIG  path to the read-only ServiceAccount kubeconfig
+        MAKLAUDE_E2E_CONTEXT     context to select within that kubeconfig
+        MAKLAUDE_E2E_AUDIT_LOG   (optional) apiserver audit log for corroboration
+      MAKLAUDE_GITHUB_* MUST be unset so escalation stays an in-memory dry-run.
+      This target only runs the Go test; the kind cluster + seeding is driven by
+      the CI e2e job (see .github/workflows/e2e.yml).
+    cmds:
+      - go test -tags e2e -count=1 -v ./test/e2e/...
+
   vet:
     desc: Run go vet
     cmds:

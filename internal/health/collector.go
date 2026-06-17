@@ -175,6 +175,37 @@ func nodeConditionTrue(n *corev1.Node, t corev1.NodeConditionType) bool {
 	return false
 }
 
+// crashLoopMinRestarts is the per-container restart count at or above which a
+// container that has most recently exited with an error is treated as
+// crashlooping even when it is caught between backoff windows.
+const crashLoopMinRestarts int32 = 2
+
+// containerCrashLooping reports whether a container status represents a
+// crashlooping container.
+//
+// A crashlooping container oscillates: the kubelet parks it in
+// Waiting/CrashLoopBackOff, restarts it (briefly Running), it exits again
+// (briefly Terminated), then back to CrashLoopBackOff. Keying solely on the
+// instantaneous Waiting/CrashLoopBackOff state makes detection a coin flip for a
+// point-in-time scan — the scan is just as likely to catch the container
+// mid-restart, miss it, and under-report a genuinely failing pod. So we also
+// treat a container that has restarted repeatedly and most recently terminated
+// with a non-zero exit code as crashlooping.
+func containerCrashLooping(cs *corev1.ContainerStatus) bool {
+	if cs.State.Waiting != nil && cs.State.Waiting.Reason == "CrashLoopBackOff" {
+		return true
+	}
+	if cs.RestartCount >= crashLoopMinRestarts {
+		if t := cs.LastTerminationState.Terminated; t != nil && t.ExitCode != 0 {
+			return true
+		}
+		if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // podSignals transforms raw pods into sorted [PodSignal]s, deriving restart
 // counts and crashloop facts from container statuses.
 func podSignals(pods []corev1.Pod) []PodSignal {
@@ -192,7 +223,7 @@ func podSignals(pods []corev1.Pod) []PodSignal {
 		for j := range statuses {
 			cs := &statuses[j]
 			restarts += cs.RestartCount
-			if cs.State.Waiting != nil && cs.State.Waiting.Reason == "CrashLoopBackOff" {
+			if containerCrashLooping(cs) {
 				crashlooping = append(crashlooping, cs.Name)
 			}
 		}
