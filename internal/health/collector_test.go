@@ -196,6 +196,55 @@ func TestCollect_Pods(t *testing.T) {
 	}
 }
 
+// TestCollect_CrashLoopMidCycle covers the oscillation race: a crashlooping pod
+// is frequently caught between backoff windows, with its container Terminated
+// (non-zero exit) rather than Waiting/CrashLoopBackOff at the instant of the
+// scan. It must still be reported as crashlooping. Regression for the T8 e2e
+// failure, where a point-in-time scan caught the container mid-restart and
+// under-reported an actively-crashing pod.
+func TestCollect_CrashLoopMidCycle(t *testing.T) {
+	// app: restarted twice, just exited with an error -> crashlooping.
+	// flaky: restarted once, exited with an error -> below threshold, NOT yet
+	//        crashlooping (don't false-positive on a single transient restart).
+	crashing := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "crash"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name:         "app",
+					RestartCount: 2,
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"},
+					},
+					LastTerminationState: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"},
+					},
+				},
+				{
+					Name:         "flaky",
+					RestartCount: 1,
+					LastTerminationState: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"},
+					},
+				},
+			},
+		},
+	}
+
+	col := newTestCollector(t, crashing)
+	snap, err := col.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+	if len(snap.Pods) != 1 {
+		t.Fatalf("expected 1 pod signal, got %d", len(snap.Pods))
+	}
+	if got := snap.Pods[0].CrashLoopingContainers; !reflect.DeepEqual(got, []string{"app"}) {
+		t.Fatalf("expected only app flagged crashlooping mid-cycle, got %+v", got)
+	}
+}
+
 func TestCollect_Workloads(t *testing.T) {
 	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"},
