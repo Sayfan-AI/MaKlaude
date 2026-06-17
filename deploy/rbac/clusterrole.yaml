@@ -1,0 +1,64 @@
+# MaKlaude's least-privilege, READ-ONLY ClusterRole.
+#
+# This role grants exactly — and only — the reads MaKlaude's code performs. Every
+# rule below is tied to a specific call site in the source. There are NO mutating
+# verbs anywhere in this role: no create, update, patch, delete, or
+# deletecollection. The only verbs used are get, list, and watch.
+#
+#   - list  : MaKlaude lists each resource across all namespaces every cycle
+#             (internal/health/collector.go -> Collect).
+#   - get   : single-object reads (e.g. internal/kube/client.go GetNamespace);
+#             included alongside list/watch as the standard read triad.
+#   - watch : not yet used by the current collector (it re-lists each cycle), but
+#             granted so MaKlaude can move to efficient informer/watch-based
+#             collection later without an RBAC change. watch is still read-only.
+#
+# Cluster scope: the collector reads across ALL namespaces (it calls List with an
+# empty namespace), so a ClusterRole — not a namespaced Role — is required.
+#
+# DISCOVERY / REACHABILITY NOTE:
+#   internal/kube/client.go CheckReachable calls the discovery client
+#   (Discovery().ServerVersion()), which hits the non-resource URLs /version and
+#   /api*. Those are NOT granted here on purpose: Kubernetes ships a built-in
+#   ClusterRole "system:discovery" that is bound (via the
+#   "system:discovery" ClusterRoleBinding) to the "system:authenticated" group,
+#   i.e. every authenticated identity — including this ServiceAccount. So
+#   discovery already works without any extra grant. Adding nonResourceURLs here
+#   would be redundant, so we deliberately keep this role to resources only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: maklaude-readonly
+  labels:
+    app.kubernetes.io/name: maklaude
+    app.kubernetes.io/component: rbac
+rules:
+  # core/v1 (apiGroup "") — nodes, pods, events.
+  #   nodes  : ListNodes  (collector reads node Ready/pressure conditions)
+  #   pods   : ListPods   (collector reads phase, restarts, crashloop state)
+  #   events : ListEvents (collector reads recent Warning events)
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - pods
+      - events
+    verbs: ["get", "list", "watch"]
+
+  # apps/v1 (apiGroup "apps") — deployments, replicasets.
+  #   deployments  : ListDeployments (desired/ready/available/updated replicas)
+  #   replicasets  : ListReplicaSets (desired/ready/available replicas)
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - replicasets
+    verbs: ["get", "list", "watch"]
+
+  # core/v1 namespaces — get/list.
+  #   internal/kube/client.go exposes ListNamespaces and GetNamespace. The
+  #   current collector does not call them, but they are part of the read-only
+  #   client surface, so namespace reads are granted to keep the identity
+  #   consistent with the code's read capability. Still read-only.
+  - apiGroups: [""]
+    resources:
+      - namespaces
+    verbs: ["get", "list", "watch"]
