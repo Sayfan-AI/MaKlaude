@@ -43,7 +43,70 @@ cmd/maklaude/      # CLI entrypoint (skeleton: builds, prints version/help)
 internal/          # private packages
   version/         #   build/version metadata
   cluster/         #   cluster registry & config surface (see below)
+  kube/            #   read-only Kubernetes client/transport
+  health/          #   judgment-free snapshot collection (read-only)
+  detect/          #   deterministic findings from a snapshot
+  escalate/        #   human comms trail: issue-per-problem (see below)
 ```
+
+## Comms trail & escalation
+
+MaKlaude keeps humans informed through an **auditable comms trail** rather than
+a stream of alerts. The `internal/escalate` package turns the deterministic
+[`detect.Finding`](internal/detect/finding.go)s into exactly **one tracked
+GitHub issue per active problem**, and keeps that issue in sync as the problem
+recurs and clears.
+
+The whole model hangs off the stable `detect.Identity` key (the same ongoing
+problem yields the same identity every cycle):
+
+- **One issue per problem.** A newly seen identity opens a single, well-formed
+  issue: severity, cluster, the affected object, the human-readable message, and
+  the detection time. The cluster is named in the title so multi-cluster setups
+  stay legible at a glance.
+- **Recurrence updates, never duplicates.** When the same problem is detected
+  again on a later cycle, MaKlaude refreshes the existing issue's body and adds a
+  recurrence comment — it does **not** open a second issue. This dedup is the
+  core guarantee, and it is unit-tested without any network.
+- **Clearance closes the trail.** When a previously-active problem is no longer
+  in the current findings, its issue is closed with a closing comment, so the
+  record stays complete and self-explanatory.
+- **`needs:human` gating.** Warnings and criticals are labelled `needs:human`
+  (in addition to the `maklaude` management label) to flag that a decision is
+  wanted. Info-level findings are recorded but not gated. MaKlaude never takes a
+  mutating action on a cluster — escalation is purely informational.
+- **Restart-safe.** Each issue embeds its identity in a hidden marker
+  (`<!-- maklaude:identity=… -->`). The escalator rediscovers which open issue
+  maps to which problem by listing issues, so it stays correct even if the
+  monitor process restarts — it never relies solely on in-memory state.
+
+### Email notifications (M1)
+
+For M1, MaKlaude relies on **GitHub's own notification emails** — it does not
+ship a separate SMTP layer. Watchers, assignees, and `needs:human` label
+subscribers are emailed by GitHub whenever an issue is opened, commented on, or
+closed, which is exactly the open/recur/clear lifecycle above. A dedicated email
+channel can be added later behind the same `IssueSink` boundary without touching
+the reconcile logic.
+
+### Configuration
+
+GitHub access is injected via environment variables; with none set, escalation
+degrades gracefully to a **no-op, side-effect-free dry run** (an in-memory sink),
+so unit tests and the e2e harness run without real credentials.
+
+| Variable                | Description                                                     |
+| ----------------------- | --------------------------------------------------------------- |
+| `MAKLAUDE_GITHUB_REPO`  | `owner/repo` of the repository to use as the comms trail.       |
+| `MAKLAUDE_GITHUB_TOKEN` | Token with `issues:write` on that repo. Never logged.           |
+| `MAKLAUDE_GITHUB_API`   | Optional REST API base override (for GitHub Enterprise).         |
+
+The reconcile core (`escalate.Reconcile`) is a **pure function** of
+`(findings, tracked issues)` — no I/O, no clock — and the GitHub interaction
+sits behind the small `escalate.IssueSink` interface, so the interesting logic
+is exhaustively unit-tested with a fake in-memory sink. The package touches
+GitHub and **never** a Kubernetes cluster, keeping MaKlaude's read-only safety
+boundary intact.
 
 ## Cluster configuration
 
