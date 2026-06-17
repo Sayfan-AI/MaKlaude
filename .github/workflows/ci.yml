@@ -1,0 +1,76 @@
+name: CI
+
+# Quality gate for the Go codebase: build, lint, and unit tests.
+# Runs on pull requests and on pushes to main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.24"
+
+jobs:
+  build-and-test:
+    name: Build, lint & test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify no Makefile exists
+        run: |
+          if ls Makefile makefile GNUmakefile 2>/dev/null; then
+            echo "::error::A Makefile was found. This project forbids Makefiles; use Taskfile.yml."
+            exit 1
+          fi
+          echo "No Makefile present — good."
+
+      - name: Check formatting
+        run: task fmt:check
+
+      - name: Build
+        run: task build
+
+      - name: Vet
+        run: task vet
+
+      - name: Run unit tests
+        run: task test
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8

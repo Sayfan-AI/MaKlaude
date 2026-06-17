@@ -1,0 +1,87 @@
+# Taskfile for MaKlaude — https://taskfile.dev
+#
+# This project uses Task as its sole task runner. There is intentionally NO
+# Makefile and `make` is never used anywhere in this repository.
+#
+# Run `task --list` to see available tasks.
+version: "3"
+
+vars:
+  BIN_DIR: bin
+  BINARY: maklaude
+  PKG: ./cmd/maklaude
+  GOLANGCI_LINT_VERSION: v1.64.8
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  tidy:
+    desc: Tidy and verify go.mod / go.sum
+    cmds:
+      - go mod tidy
+      - go mod verify
+
+  build:
+    desc: Build the maklaude binary into ./bin
+    cmds:
+      - go build -o {{.BIN_DIR}}/{{.BINARY}} {{.PKG}}
+
+  test:
+    desc: Run unit tests with race detector and coverage
+    cmds:
+      - go test -race -coverprofile=coverage.out ./...
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  fmt:
+    desc: Format all Go source files
+    cmds:
+      - gofmt -w .
+
+  fmt:check:
+    desc: Fail if any Go source file is not gofmt-clean
+    cmds:
+      - |
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "The following files are not gofmt-clean:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+  lint:
+    desc: Run golangci-lint (auto-installs the pinned version if missing)
+    cmds:
+      - |
+        if ! command -v golangci-lint >/dev/null 2>&1; then
+          echo "golangci-lint not found; running pinned version via 'go run'..."
+          go run github.com/golangci/golangci-lint/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}} run ./...
+        else
+          golangci-lint run ./...
+        fi
+
+  ci:
+    desc: Run the full quality gate (build + lint + test) — mirrors CI
+    cmds:
+      - task: build
+      - task: fmt:check
+      - task: vet
+      - task: lint
+      - task: test
+
+  check:
+    desc: Alias for the full quality gate
+    cmds:
+      - task: ci
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf {{.BIN_DIR}} coverage.out

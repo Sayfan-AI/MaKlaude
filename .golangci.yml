@@ -1,0 +1,30 @@
+# golangci-lint configuration for MaKlaude.
+# Docs: https://golangci-lint.run/usage/configuration/
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck      # unchecked errors
+    - govet         # suspicious constructs
+    - ineffassign   # ineffectual assignments
+    - staticcheck   # broad static analysis suite
+    - unused        # unused code
+    - gofmt         # formatting
+    - goimports     # import grouping/formatting
+    - misspell      # common misspellings
+    - revive        # style/lint rules (golint successor)
+    - gosec         # security issues
+    - bodyclose     # unclosed HTTP response bodies
+    - unconvert     # unnecessary type conversions
+    - errorlint     # error wrapping correctness
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    # Allow dot-free, terse assertions in tests; relax gosec there.
+    - path: _test\.go
+      linters:
+        - gosec
