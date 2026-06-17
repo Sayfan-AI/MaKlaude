@@ -1,8 +1,16 @@
 name: Genesis Auto-Merge
 
+# Trigger on the completion of EITHER gating workflow ("CI" fast + "E2E (kind)" slow),
+# so whichever finishes LAST triggers a merge attempt. Listening only on "CI" was a trap:
+# when CI finished first and fired this workflow, E2E was still pending so the merge was
+# skipped; when E2E later went green NO event fired (it wasn't in the list), leaving the
+# PR green-but-unmerged. This is safe because the merge agent independently verifies that
+# ALL CI checks are passing before merging — triggering on either completion just
+# guarantees a merge attempt happens after the last gate goes green, never on a red PR.
+
 on:
   workflow_run:
-    workflows: ["CI"]
+    workflows: ["CI", "E2E (kind)"]
     types: [completed]
 
 # Auto-merge gets its OWN group, NOT the orchestrator group. Sharing it meant a
