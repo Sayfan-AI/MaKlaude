@@ -33,4 +33,51 @@ This repo runs autonomously via GitHub Actions, but **genesis ships those workfl
 
 ---
 
+## Development
+
+MaKlaude is written in **Go** (1.24+). The codebase follows the standard Go
+project layout:
+
+```
+cmd/maklaude/      # CLI entrypoint (skeleton: builds, prints version/help)
+internal/          # private packages (e.g. internal/version)
+```
+
+### Task runner
+
+This project uses [**Task**](https://taskfile.dev) as its task runner via
+`Taskfile.yml`. **There is no Makefile and `make` is never used** — this is an
+explicit project rule. Install Task (`go install github.com/go-task/task/v3/cmd/task@latest`
+or see the docs), then:
+
+| Command           | What it does                                            |
+| ----------------- | ------------------------------------------------------- |
+| `task`            | List all available tasks                                |
+| `task build`      | Build the `maklaude` binary into `./bin`                |
+| `task test`       | Run unit tests with the race detector and coverage      |
+| `task lint`       | Run `golangci-lint` (auto-installs the pinned version)  |
+| `task vet`        | Run `go vet ./...`                                       |
+| `task fmt`        | Format all Go source with `gofmt`                       |
+| `task fmt:check`  | Fail if any file is not `gofmt`-clean                   |
+| `task tidy`       | Run `go mod tidy` and `go mod verify`                   |
+| `task ci`         | Full quality gate: build + fmt-check + vet + lint + test |
+| `task check`      | Alias for `task ci`                                     |
+| `task clean`      | Remove build artifacts                                  |
+
+### Quality gate
+
+CI (`.github/workflows/ci.yml`) runs on every pull request and on pushes to
+`main`. It builds the project, runs `golangci-lint`, and executes the unit
+tests — the same checks `task ci` runs locally. Keep the gate green.
+
+Try the CLI skeleton:
+
+```bash
+task build
+./bin/maklaude version
+./bin/maklaude help
+```
+
+---
+
 *Bootstrapped by [Genesis](https://github.com/Sayfan-AI/genesis) — an autonomous agentic AI dev system.*

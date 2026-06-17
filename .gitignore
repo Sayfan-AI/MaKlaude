@@ -1,1 +1,16 @@
 .idea
+
+# Build artifacts
+/bin/
+# Compiled binary at the repo root only (not the cmd/maklaude package dir)
+/maklaude
+
+# Test / coverage output
+coverage.out
+coverage.html
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
