@@ -1,0 +1,19 @@
+# MaKlaude cluster registry — example configuration.
+#
+# This file declares the Kubernetes clusters MaKlaude operates on your behalf.
+# Copy it (e.g. to `config.yaml`), edit the values, and point MaKlaude at it.
+#
+# SECRET-SAFE BY DESIGN: this file references clusters by *path* only. It never
+# contains credentials, tokens, or certificate data — only the filesystem path
+# to an existing kubeconfig and the context to select within it. Never commit a
+# real kubeconfig or any credentials to version control.
+
+clusters:
+  # Each entry must have a unique `name`, a `kubeconfig` path, and a `context`.
+  - name: prod-us-east           # unique, human-friendly identifier
+    kubeconfig: /home/alice/.kube/prod-us-east.yaml  # path to an existing kubeconfig file
+    context: prod-us-east        # context to select within that kubeconfig
+
+  - name: staging
+    kubeconfig: ~/.kube/config   # a leading "~" is expanded to your home directory
+    context: staging
