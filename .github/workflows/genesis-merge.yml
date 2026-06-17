@@ -33,6 +33,7 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
           permission-workflows: write
+          permission-actions: write
 
       - uses: anthropics/claude-code-action@v1
         with:
@@ -48,6 +49,15 @@ jobs:
             - All CI checks must be passing
             - Use squash merge
             - After merging, close the corresponding task issue if one exists
-            - After all merges are done, trigger the orchestrator so it can assess state and continue work:
-              gh workflow run genesis-orchestrator.yml --ref main
-          claude_args: "--max-turns 10 --allowedTools Bash,Read,Glob,Grep"
+            Do NOT trigger any workflow yourself — a deterministic step after you handles that.
+          claude_args: "--max-turns 15 --allowedTools Bash,Read,Glob,Grep"
+
+      # Deterministic re-trigger: guarantees the orchestrator wakes even if the
+      # merge agent above hit max-turns or errored. Runs regardless of outcome.
+      # Needs actions:write (workflow_dispatch) + contents:read (ref resolution).
+      - name: Re-trigger orchestrator
+        if: always()
+        run: gh workflow run genesis-orchestrator.yml --ref main
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
