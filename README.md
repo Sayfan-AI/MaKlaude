@@ -147,6 +147,15 @@ Each successfully validated cluster resolves to an isolated `Handle` (name,
 kubeconfig path, context) with **no shared or global mutable state** across
 clusters — a later milestone turns a handle into a live Kubernetes client.
 
+### Read-only access (RBAC)
+
+MaKlaude only ever reads a cluster. The least-privilege RBAC bundle in
+[`deploy/rbac/`](deploy/rbac/) grants its ServiceAccount exactly the
+`get`/`list`/`watch` access the code needs and **no mutating verbs**. Apply it
+with `kubectl apply -k deploy/rbac`. See [`docs/rbac.md`](docs/rbac.md) for the
+full access model, how to mint a kubeconfig for the ServiceAccount and register
+it above, and how to verify the access is truly read-only.
+
 ### Task runner
 
 This project uses [**Task**](https://taskfile.dev) as its task runner via

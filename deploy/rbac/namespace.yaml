@@ -1,0 +1,14 @@
+# Namespace that houses MaKlaude's read-only identity.
+#
+# The ServiceAccount and its token live here. This namespace is *only* an
+# identity home — MaKlaude reads cluster-wide via a ClusterRole, so its
+# permissions are unaffected by which namespace the account sits in. If your
+# environment already provisions namespaces out-of-band, you can drop this file
+# from the kustomization and create the namespace yourself.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: maklaude
+  labels:
+    app.kubernetes.io/name: maklaude
+    app.kubernetes.io/component: rbac

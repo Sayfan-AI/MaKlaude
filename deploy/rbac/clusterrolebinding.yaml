@@ -1,0 +1,20 @@
+# Grants the maklaude ServiceAccount the read-only ClusterRole.
+#
+# This is the only thing that gives the ServiceAccount any access at all. Because
+# the role it references contains no mutating verbs, this binding can only ever
+# confer read access, cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: maklaude-readonly
+  labels:
+    app.kubernetes.io/name: maklaude
+    app.kubernetes.io/component: rbac
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: maklaude-readonly
+subjects:
+  - kind: ServiceAccount
+    name: maklaude
+    namespace: maklaude
