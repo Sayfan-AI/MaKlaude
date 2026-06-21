@@ -36,3 +36,16 @@ jobs:
             Run the evolver agent defined in .claude/agents/evolver.md.
             This is a scheduled review cycle — review recent system behavior and apply improvements.
           claude_args: "--max-turns 15 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
+
+      # Escalate a real run failure (e.g. agent hit max-turns) to a human. Without
+      # this, an evolver failure is silent — nobody learns the self-improvement
+      # loop has stopped. Mirrors the orchestrator/merge/events/ci-failure
+      # workflows; shares the same dedup'd escalation issue via escalate.sh.
+      - name: Escalate on failure
+        if: failure()
+        run: bash .genesis/scripts/escalate.sh
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          WF_NAME: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
