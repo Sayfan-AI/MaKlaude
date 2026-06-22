@@ -83,7 +83,10 @@ func (s *MemorySink) ListOpen(_ context.Context) ([]TrackedIssue, error) {
 		if !ok {
 			continue
 		}
-		out = append(out, TrackedIssue{Identity: id, Ref: iss.ref})
+		// Recover the durable Slack thread handle when present (absent for issues
+		// opened before a chat root was posted, or when chat is unconfigured).
+		threadTS, _ := ParseThreadMarker(iss.body)
+		out = append(out, TrackedIssue{Identity: id, Ref: iss.ref, ThreadTS: threadTS})
 	}
 	return out, nil
 }

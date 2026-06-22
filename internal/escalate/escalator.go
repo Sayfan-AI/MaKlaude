@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/detect"
+	"github.com/Sayfan-AI/MaKlaude/internal/notify"
 )
 
 // Escalator is the side-effecting shell around the pure [Reconcile] core. Given
@@ -18,19 +19,51 @@ import (
 // [Escalator.Reconcile] re-lists from the sink, so it is correct across process
 // restarts and never relies on remembered mappings. The durable identity marker
 // embedded in each issue is what makes that re-listing authoritative.
+//
+// # Chat continuity (T3)
+//
+// Alongside the GitHub trail the escalator drives a [notify.Notifier] so the same
+// lifecycle is mirrored into chat (Slack) as ONE threaded conversation: opening a
+// problem posts a thread root, recurrence replies an update, and clearance replies
+// a resolution. Continuity is durable across process restarts because the chat
+// thread handle (Slack's "thread_ts") is persisted in the backing issue body (a
+// hidden thread marker) when the root is posted, and recovered — via the
+// [TrackedIssue.ThreadTS] parsed on every ListOpen — on the next reconcile. The
+// escalator passes that recovered handle back to the notifier so the reply lands
+// in the original thread, with no duplicate threads even after a restart.
+//
+// The chat side is strictly best-effort and comms-only: a notifier error is
+// recorded but never fails the reconcile or strands the GitHub trail, and the
+// notifier has no path to a cluster. When no notifier is configured the escalator
+// uses a [notify.NopNotifier], so behavior is byte-for-byte the GitHub + email
+// trail of Milestone 1.
 type Escalator struct {
-	sink IssueSink
+	sink     IssueSink
+	notifier notify.Notifier
 }
 
-// NewEscalator builds an escalator over the given sink. A nil sink panics: a
-// caller that wants a no-op escalator should pass a [MemorySink] (or use a
-// real sink's graceful-degradation path), making the no-op explicit rather than
-// hiding it behind a nil.
+// NewEscalator builds an escalator over the given sink with a no-op notifier. A
+// nil sink panics: a caller that wants a no-op escalator should pass a [MemorySink]
+// (or use a real sink's graceful-degradation path), making the no-op explicit
+// rather than hiding it behind a nil. To also mirror the lifecycle into chat, use
+// [NewEscalatorWithNotifier].
 func NewEscalator(sink IssueSink) *Escalator {
+	return NewEscalatorWithNotifier(sink, nil)
+}
+
+// NewEscalatorWithNotifier builds an escalator that, in addition to the GitHub
+// trail, mirrors the escalation lifecycle into chat via notifier. A nil sink
+// panics as in [NewEscalator]; a nil notifier is replaced with a
+// [notify.NopNotifier], so callers never have to nil-check and an unconfigured
+// chat backend degrades to exactly the Milestone 1 behavior.
+func NewEscalatorWithNotifier(sink IssueSink, notifier notify.Notifier) *Escalator {
 	if sink == nil {
 		panic("escalate: NewEscalator requires a non-nil sink (use NewMemorySink for a no-op)")
 	}
-	return &Escalator{sink: sink}
+	if notifier == nil {
+		notifier = notify.NopNotifier{}
+	}
+	return &Escalator{sink: sink, notifier: notifier}
 }
 
 // Reconcile brings the comms trail in line with findings for one reconciliation
@@ -68,13 +101,30 @@ func (e *Escalator) Reconcile(ctx context.Context, findings []detect.Finding) (O
 				errs = append(errs, fmt.Errorf("opening issue for %q: %w", a.Identity, err))
 				continue
 			}
-			_ = ref
 			out.Opened++
 
+			// Mirror to chat as the thread ROOT, then persist the returned thread
+			// handle into the issue body so a future reconcile (even after a restart)
+			// can reply into this same thread. Both are best-effort: a chat or
+			// persistence hiccup is recorded but never strands the GitHub trail.
+			threadTS, nerr := e.notifier.NotifyEscalation(ctx, a.Identity, Title(a.Finding), string(ref))
+			if nerr != nil {
+				errs = append(errs, fmt.Errorf("notifying escalation for %q: %w", a.Identity, nerr))
+				continue
+			}
+			if threadTS != "" {
+				body := withThreadMarker(Body(a.Finding), threadTS)
+				if uerr := e.sink.Update(ctx, ref, Title(a.Finding), body, LabelsFor(a.Finding)); uerr != nil {
+					errs = append(errs, fmt.Errorf("persisting thread marker on %q for %q: %w", ref, a.Identity, uerr))
+				}
+			}
+
 		case ActionUpdate:
-			// Refresh the body/labels to the latest state, then record the
-			// recurrence in a comment so the timeline shows it persisting.
-			if err := e.sink.Update(ctx, a.Ref, Title(a.Finding), Body(a.Finding), LabelsFor(a.Finding)); err != nil {
+			// Refresh the body/labels to the latest state, preserving the durable
+			// thread marker so continuity is not lost, then record the recurrence in
+			// a comment so the timeline shows it persisting.
+			body := withThreadMarker(Body(a.Finding), a.ThreadTS)
+			if err := e.sink.Update(ctx, a.Ref, Title(a.Finding), body, LabelsFor(a.Finding)); err != nil {
 				errs = append(errs, fmt.Errorf("updating issue %q for %q: %w", a.Ref, a.Identity, err))
 				continue
 			}
@@ -83,6 +133,11 @@ func (e *Escalator) Reconcile(ctx context.Context, findings []detect.Finding) (O
 				continue
 			}
 			out.Updated++
+
+			// Mirror the recurrence into the original chat thread (recovered ts).
+			if nerr := e.notifier.NotifyUpdate(ctx, a.Identity, a.ThreadTS, RecurrenceComment(a.Finding)); nerr != nil {
+				errs = append(errs, fmt.Errorf("notifying update for %q: %w", a.Identity, nerr))
+			}
 
 		case ActionClose:
 			// Leave a closing note before closing so the record explains itself.
@@ -95,6 +150,11 @@ func (e *Escalator) Reconcile(ctx context.Context, findings []detect.Finding) (O
 				continue
 			}
 			out.Closed++
+
+			// Mirror the resolution into the original chat thread (recovered ts).
+			if nerr := e.notifier.NotifyResolution(ctx, a.Identity, a.ThreadTS, ClosingComment(a.Identity)); nerr != nil {
+				errs = append(errs, fmt.Errorf("notifying resolution for %q: %w", a.Identity, nerr))
+			}
 
 		default:
 			errs = append(errs, fmt.Errorf("unknown action kind %d for %q", a.Kind, a.Identity))

@@ -56,20 +56,24 @@ func Reconcile(findings []detect.Finding, tracked []TrackedIssue) []Action {
 		switch {
 		case !stillActive:
 			// The problem has cleared (or this is an extra duplicate issue handled
-			// below) — close it.
+			// below) — close it. Carry the recovered thread_ts so the resolution can
+			// reply into the original chat thread.
 			closes = append(closes, Action{
 				Kind:     ActionClose,
 				Identity: ti.Identity,
 				Ref:      ti.Ref,
+				ThreadTS: ti.ThreadTS,
 			})
 		case !seenTrackedID[ti.Identity]:
-			// First open issue for an active problem — update it in place.
+			// First open issue for an active problem — update it in place. Carry the
+			// recovered thread_ts so the recurrence update threads correctly.
 			seenTrackedID[ti.Identity] = true
 			updates = append(updates, Action{
 				Kind:     ActionUpdate,
 				Identity: ti.Identity,
 				Finding:  currentByID[ti.Identity],
 				Ref:      ti.Ref,
+				ThreadTS: ti.ThreadTS,
 			})
 		default:
 			// A second (duplicate) open issue for the same active problem. Collapse
@@ -78,6 +82,7 @@ func Reconcile(findings []detect.Finding, tracked []TrackedIssue) []Action {
 				Kind:     ActionClose,
 				Identity: ti.Identity,
 				Ref:      ti.Ref,
+				ThreadTS: ti.ThreadTS,
 			})
 		}
 	}

@@ -97,13 +97,19 @@ func TestSlackNotifier_ThreadLifecycle(t *testing.T) {
 
 	id := detect.Identity("prod|pod.crashloop|pod/team/api")
 
-	if err := sn.NotifyEscalation(ctx, id, "Pod crashlooping in team/api", "42"); err != nil {
+	rootTS, err := sn.NotifyEscalation(ctx, id, "Pod crashlooping in team/api", "42")
+	if err != nil {
 		t.Fatalf("NotifyEscalation: %v", err)
 	}
-	if err := sn.NotifyUpdate(ctx, id, "still crashlooping, 5 restarts"); err != nil {
+	if rootTS != "111.000001" {
+		t.Fatalf("NotifyEscalation returned ts = %q, want the root ts 111.000001", rootTS)
+	}
+	// Pass an empty threadTS so this exercises the in-memory same-run fallback;
+	// the durable cross-restart path is covered by TestSlackNotifier_DurableThreadAcrossRestart.
+	if err := sn.NotifyUpdate(ctx, id, "", "still crashlooping, 5 restarts"); err != nil {
 		t.Fatalf("NotifyUpdate: %v", err)
 	}
-	if err := sn.NotifyResolution(ctx, id, "pod recovered"); err != nil {
+	if err := sn.NotifyResolution(ctx, id, "", "pod recovered"); err != nil {
 		t.Fatalf("NotifyResolution: %v", err)
 	}
 
@@ -163,8 +169,9 @@ func TestSlackNotifier_GracefulDegradationOnUnknownThread(t *testing.T) {
 	sn, _ := NewSlackNotifier(testConfig(), fake)
 	id := detect.Identity("prod|node.notready|node/node-a")
 
-	// No prior escalation: update must succeed and post top-level (no thread_ts).
-	if err := sn.NotifyUpdate(ctx, id, "recurred after restart"); err != nil {
+	// No prior escalation AND no supplied handle: update must succeed and post
+	// top-level (no thread_ts).
+	if err := sn.NotifyUpdate(ctx, id, "", "recurred after restart"); err != nil {
 		t.Fatalf("NotifyUpdate on unknown thread must not error: %v", err)
 	}
 	if _, present := fake.requests[0].body["thread_ts"]; present {
@@ -174,8 +181,9 @@ func TestSlackNotifier_GracefulDegradationOnUnknownThread(t *testing.T) {
 		t.Errorf("degraded update should self-label: %q", txt)
 	}
 
-	// The degraded update remembered a new root; a second update threads under it.
-	if err := sn.NotifyUpdate(ctx, id, "still recurring"); err != nil {
+	// The degraded update remembered a new root; a second update (still no supplied
+	// handle) threads under it via the in-memory fallback.
+	if err := sn.NotifyUpdate(ctx, id, "", "still recurring"); err != nil {
 		t.Fatalf("second NotifyUpdate: %v", err)
 	}
 	if got := fake.requests[1].body["thread_ts"]; got != "900.000001" {
@@ -184,11 +192,57 @@ func TestSlackNotifier_GracefulDegradationOnUnknownThread(t *testing.T) {
 
 	// A resolution with no known thread also degrades without error.
 	other := detect.Identity("prod|pod.crashloop|pod/team/db")
-	if err := sn.NotifyResolution(ctx, other, "cleared"); err != nil {
+	if err := sn.NotifyResolution(ctx, other, "", "cleared"); err != nil {
 		t.Fatalf("NotifyResolution on unknown thread must not error: %v", err)
 	}
 	if _, present := fake.requests[2].body["thread_ts"]; present {
 		t.Error("degraded resolution should be top-level (no thread_ts)")
+	}
+}
+
+// TestSlackNotifier_DurableThreadAcrossRestart is the T3 headline test: a FRESH
+// notifier (modelling a process restart that wiped the in-memory map) still threads
+// an update and resolution into the original root when the caller supplies the
+// durably-recovered thread_ts. No new root is posted; the replies carry the
+// supplied thread_ts; and they are NOT self-labelled as degraded.
+func TestSlackNotifier_DurableThreadAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+
+	// "Process 1" posts the root and learns its ts (which the caller would persist
+	// in the backing issue).
+	fake1 := &fakeSlack{tsQueue: []string{"111.000001"}}
+	sn1, _ := NewSlackNotifier(testConfig(), fake1)
+	id := detect.Identity("prod|pod.crashloop|pod/team/api")
+	rootTS, err := sn1.NotifyEscalation(ctx, id, "Pod crashlooping", "42")
+	if err != nil {
+		t.Fatalf("NotifyEscalation: %v", err)
+	}
+
+	// "Process 2": a brand-new notifier with an empty in-memory map. The caller
+	// recovered rootTS from the issue and supplies it.
+	fake2 := &fakeSlack{tsQueue: []string{"222.000002", "333.000003"}}
+	sn2, _ := NewSlackNotifier(testConfig(), fake2)
+	if _, known := sn2.lookup(id); known {
+		t.Fatal("fresh notifier must have no in-memory thread for the identity")
+	}
+
+	if err := sn2.NotifyUpdate(ctx, id, rootTS, "still crashlooping"); err != nil {
+		t.Fatalf("NotifyUpdate: %v", err)
+	}
+	if err := sn2.NotifyResolution(ctx, id, rootTS, "recovered"); err != nil {
+		t.Fatalf("NotifyResolution: %v", err)
+	}
+
+	if len(fake2.requests) != 2 {
+		t.Fatalf("restart process should post exactly 2 replies (no new root), got %d", len(fake2.requests))
+	}
+	for i, r := range fake2.requests {
+		if got := r.body["thread_ts"]; got != rootTS {
+			t.Errorf("reply %d thread_ts = %v, want recovered root %q", i, got, rootTS)
+		}
+		if txt, _ := r.body["text"].(string); strings.Contains(txt, "new message") {
+			t.Errorf("reply %d should NOT be self-labelled as degraded: %q", i, txt)
+		}
 	}
 }
 
@@ -199,7 +253,7 @@ func TestSlackNotifier_SlackLogicalError(t *testing.T) {
 	fake := &fakeSlack{failOK: true, errCode: "channel_not_found"}
 
 	sn, _ := NewSlackNotifier(testConfig(), fake)
-	err := sn.NotifyEscalation(ctx, "prod|x|pod/a/b", "summary", "1")
+	_, err := sn.NotifyEscalation(ctx, "prod|x|pod/a/b", "summary", "1")
 	if err == nil {
 		t.Fatal("expected an error for ok:false response")
 	}
@@ -218,7 +272,7 @@ func TestSlackNotifier_HTTPError(t *testing.T) {
 	fake := &fakeSlack{httpStatus: http.StatusTooManyRequests}
 
 	sn, _ := NewSlackNotifier(testConfig(), fake)
-	err := sn.NotifyEscalation(ctx, "prod|x|pod/a/b", "summary", "1")
+	_, err := sn.NotifyEscalation(ctx, "prod|x|pod/a/b", "summary", "1")
 	if err == nil || !strings.Contains(err.Error(), "429") {
 		t.Fatalf("expected a 429 error, got %v", err)
 	}
@@ -236,9 +290,9 @@ func TestSlackNotifier_NoTokenInPayloadBody(t *testing.T) {
 
 	sn, _ := NewSlackNotifier(testConfig(), fake)
 	id := detect.Identity("prod|pod.crashloop|pod/team/api")
-	_ = sn.NotifyEscalation(ctx, id, "summary", "42")
-	_ = sn.NotifyUpdate(ctx, id, "update note")
-	_ = sn.NotifyResolution(ctx, id, "resolved note")
+	_, _ = sn.NotifyEscalation(ctx, id, "summary", "42")
+	_ = sn.NotifyUpdate(ctx, id, "1.1", "update note")
+	_ = sn.NotifyResolution(ctx, id, "1.1", "resolved note")
 
 	for i, r := range fake.requests {
 		if strings.Contains(string(r.bodyBytes), "xoxb-test-token") {

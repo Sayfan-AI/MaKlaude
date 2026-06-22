@@ -117,6 +117,14 @@ type TrackedIssue struct {
 	// number). The reconcile core treats it as an opaque value; only the sink
 	// interprets it.
 	Ref IssueRef
+
+	// ThreadTS is the Slack thread timestamp recovered from the issue's hidden
+	// thread marker, or empty when none is present (Slack unconfigured, or the
+	// issue predates the marker). It is what gives the comms layer durable,
+	// cross-restart chat-thread continuity: the escalator threads it back into the
+	// [Action] so a recurrence/clearance replies into the original thread. The pure
+	// reconcile layer treats it as opaque and merely carries it through.
+	ThreadTS string
 }
 
 // IssueRef is an opaque, sink-specific handle to an existing issue (for example
@@ -144,4 +152,10 @@ type Action struct {
 	// Ref is the existing issue to act on for update/close. It is empty for
 	// [ActionOpen], where no issue exists yet.
 	Ref IssueRef
+
+	// ThreadTS is the Slack thread timestamp recovered from the tracked issue, set
+	// for [ActionUpdate] and [ActionClose] so the escalator can reply into the
+	// original chat thread. It is empty for [ActionOpen] (no thread exists yet) and
+	// whenever the tracked issue carried no thread marker.
+	ThreadTS string
 }

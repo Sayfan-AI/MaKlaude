@@ -58,24 +58,30 @@ type threadRef struct {
 // counterpart to how the escalator updates and closes one GitHub issue per
 // problem.
 //
-// # Thread persistence (T2 scope) and graceful degradation
+// # Durable thread continuity (T3) and graceful degradation
 //
-// The identity→thread mapping is held in an in-memory map for the lifetime of the
-// process. This is deliberately the MINIMAL correct approach for T2: the approved
-// durable design persists the thread marker in the backing GitHub issue so the
-// mapping survives a process restart, but doing that here would force notify to
-// import escalate — and escalate already depends on a notifier being called from
-// its reconcile loop, so the import would be a cycle. Durable, cross-restart
-// thread continuity therefore lands with T3 (which owns the issue-marker
-// recovery), wired from a layer that can see both packages without a cycle.
+// Continuity is now durable across process restarts, and the durable store is the
+// backing GitHub issue — NOT this type. [SlackNotifier.NotifyEscalation] RETURNS
+// the root's thread_ts; the escalator persists it in the issue body (a hidden
+// marker) and, on a later recurrence or clearance, recovers it and passes it back
+// in as the threadTS argument to NotifyUpdate / NotifyResolution. The reply then
+// lands in the original thread even after a restart that wiped all in-memory
+// state. notify cannot persist anything itself (it must not import escalate, which
+// would be an import cycle), so the caller owns persistence — exactly why this
+// argument exists.
 //
-// Until then the interface contract is honored exactly: when no thread is known
-// for an identity — the common case after a restart, since the map was lost —
-// NotifyUpdate / NotifyResolution DEGRADE GRACEFULLY. They do not error; they post
-// the note as a fresh top-level message (and, for an update, remember the new root
-// so any further updates in this run still thread together). Worst case is a
-// slightly fragmented thread across a restart, never a dropped notification and
-// never a failed reconcile.
+// A small in-memory identity→thread map is retained purely as a same-process
+// optimization / fallback: if the caller has no handle to supply (an empty
+// threadTS), a thread learned earlier in this run is still reused. The supplied
+// threadTS always takes precedence over the cached one.
+//
+// When no thread can be determined at all — an empty supplied threadTS AND no
+// cached handle (an issue opened before continuity existed, or a fresh process
+// that has not posted a root) — NotifyUpdate / NotifyResolution DEGRADE
+// GRACEFULLY: they do not error; they post the note as a self-labelled top-level
+// message (and, for an update, remember it so further updates this run thread
+// together). Worst case is a slightly fragmented thread, never a dropped
+// notification and never a failed reconcile.
 //
 // # Safety boundary (locked)
 //
@@ -119,29 +125,33 @@ func NewSlackNotifier(cfg SlackConfig, client doer) (*SlackNotifier, bool) {
 	}, true
 }
 
-// NotifyEscalation posts the thread ROOT for a newly-escalated problem and records
-// the resulting thread timestamp under id so later updates and the resolution
-// thread under it. summary is the human-facing one-liner (the same text titling
+// NotifyEscalation posts the thread ROOT for a newly-escalated problem and returns
+// the resulting Slack thread timestamp so the caller can persist it durably (the
+// escalator writes it into the backing issue). It also records the ts in the
+// in-memory cache so a same-run update/resolution still threads if the caller does
+// not supply a handle. summary is the human-facing one-liner (the same text titling
 // the GitHub issue); ref is the backing issue reference (possibly empty) used to
 // link the chat message back to the auditable trail.
-func (s *SlackNotifier) NotifyEscalation(ctx context.Context, id detect.Identity, summary, ref string) error {
+func (s *SlackNotifier) NotifyEscalation(ctx context.Context, id detect.Identity, summary, ref string) (string, error) {
 	text := escalationText(id, summary, ref)
 	ts, err := s.post(ctx, text, "")
 	if err != nil {
-		return fmt.Errorf("notify/slack: posting escalation for %q: %w", id, err)
+		return "", fmt.Errorf("notify/slack: posting escalation for %q: %w", id, err)
 	}
 	s.remember(id, threadRef{channel: s.cfg.Channel, threadTS: ts})
-	return nil
+	return ts, nil
 }
 
-// NotifyUpdate posts a follow-up reply into the existing thread for id. If no
-// thread is known (for example the process restarted and the in-memory map was
-// lost), it degrades gracefully: it posts a new top-level message rather than
-// erroring, and remembers that message as the new thread root so subsequent
-// updates in this run still thread together.
-func (s *SlackNotifier) NotifyUpdate(ctx context.Context, id detect.Identity, note string) error {
-	ref, known := s.lookup(id)
-	ts, err := s.post(ctx, updateText(note, known), ref.threadTS)
+// NotifyUpdate posts a follow-up reply into the thread for id. The caller-supplied
+// threadTS (recovered durably from the backing issue) is authoritative; if it is
+// empty, an in-memory handle learned earlier this run is used as a fallback. If
+// neither is known (an issue opened before continuity existed, or a fresh process
+// that has not posted a root) it degrades gracefully: it posts a self-labelled
+// top-level message rather than erroring, and remembers that message as a thread
+// root so subsequent updates this run still thread together.
+func (s *SlackNotifier) NotifyUpdate(ctx context.Context, id detect.Identity, threadTS, note string) error {
+	parent, known := s.resolveThread(id, threadTS)
+	ts, err := s.post(ctx, updateText(note, known), parent)
 	if err != nil {
 		return fmt.Errorf("notify/slack: posting update for %q: %w", id, err)
 	}
@@ -153,16 +163,32 @@ func (s *SlackNotifier) NotifyUpdate(ctx context.Context, id detect.Identity, no
 	return nil
 }
 
-// NotifyResolution posts a closing reply into the existing thread for id and then
-// forgets the mapping. As with NotifyUpdate, an unknown identity degrades to a
-// top-level message rather than an error.
-func (s *SlackNotifier) NotifyResolution(ctx context.Context, id detect.Identity, note string) error {
-	ref, known := s.lookup(id)
-	if _, err := s.post(ctx, resolutionText(note, known), ref.threadTS); err != nil {
+// NotifyResolution posts a closing reply into the thread for id and then forgets
+// the in-memory mapping. As with NotifyUpdate the caller-supplied threadTS is
+// authoritative, falling back to the in-memory cache, and an unknown thread
+// degrades to a self-labelled top-level message rather than an error.
+func (s *SlackNotifier) NotifyResolution(ctx context.Context, id detect.Identity, threadTS, note string) error {
+	parent, known := s.resolveThread(id, threadTS)
+	if _, err := s.post(ctx, resolutionText(note, known), parent); err != nil {
 		return fmt.Errorf("notify/slack: posting resolution for %q: %w", id, err)
 	}
 	s.forget(id)
 	return nil
+}
+
+// resolveThread decides which thread_ts a reply should carry. The caller-supplied
+// handle (recovered durably from the backing issue) wins; if it is empty, a handle
+// cached in this process from an earlier post is used. known reports whether ANY
+// thread was found, which drives the graceful-degradation self-labelling in the
+// reply text.
+func (s *SlackNotifier) resolveThread(id detect.Identity, threadTS string) (parent string, known bool) {
+	if strings.TrimSpace(threadTS) != "" {
+		return threadTS, true
+	}
+	if ref, ok := s.lookup(id); ok {
+		return ref.threadTS, true
+	}
+	return "", false
 }
 
 // remember records the thread handle for an identity under the lock.
