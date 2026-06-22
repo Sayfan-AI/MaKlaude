@@ -9,33 +9,53 @@ GitHub's own per-issue notification emails — with zero behavior change. This i
 the same graceful-degradation seam the GitHub trail uses (see the
 [no-writes guarantee](no-writes.md) and [`internal/escalate`](../internal/escalate)).
 
-> **Status.** As of M2 T2 the **outbound** Slack backend is live: a configured
-> deployment posts escalations as thread roots and replies updates/resolutions
-> into the same thread over the Slack Web API (`chat.postMessage`) — see
-> [`internal/notify/slack_notifier.go`](../internal/notify/slack_notifier.go).
-> The **inbound** Socket Mode conversation path (the app-level token) is not yet
-> wired; it lands in a later task. An unconfigured deployment still degrades to
-> the no-op with zero behavior change versus Milestone 1.
+> **Status.** As of M2 T3 the **outbound** Slack backend is live **and wired into
+> the escalation reconcile loop with durable, cross-restart thread continuity**: a
+> configured deployment posts each escalation as a thread root, and recurrences and
+> the eventual resolution reply into that **same** thread over the Slack Web API
+> (`chat.postMessage`) — even after the monitor process restarts — see
+> [`internal/notify/slack_notifier.go`](../internal/notify/slack_notifier.go) and
+> [`internal/escalate/escalator.go`](../internal/escalate/escalator.go). The
+> **inbound** Socket Mode conversation path (the app-level token) is not yet wired;
+> it lands in a later task. An unconfigured deployment still degrades to the no-op
+> with zero behavior change versus Milestone 1.
 
 ## How notifications work
 
 MaKlaude models each problem as a conversation, keyed by the same stable
 *identity* the GitHub escalator uses to dedup an active issue across cycles:
 
-| Lifecycle step | `Notifier` method | What the live backend will do |
+| Lifecycle step | `Notifier` method | What the live backend does |
 | -------------- | ----------------- | ----------------------------- |
-| Problem first escalated | `NotifyEscalation` | Post a top-level message — the thread root — linking back to the GitHub issue |
-| Problem recurs / changes | `NotifyUpdate` | Reply into the same thread |
+| Problem first escalated | `NotifyEscalation` | Post a top-level message — the thread root — linking back to the GitHub issue, and return its `thread_ts` |
+| Problem recurs / changes | `NotifyUpdate` | Reply into the same thread (using the recovered `thread_ts`) |
 | Problem clears | `NotifyResolution` | Post a closing reply into the same thread |
 
-The identity → Slack thread mapping is held **in memory** for the lifetime of
-the process in T2: the escalation root's timestamp is recorded under the
-identity and reused as `thread_ts` for the update and resolution replies. If the
-process restarts and the map is lost, the notifier **degrades gracefully** — it
-posts a new top-level message rather than erroring, so a notification is never
-dropped. Durable, cross-restart thread continuity (persisting the marker in the
-backing **GitHub issue**, the approved default) lands in T3, wired from a layer
-that can see both packages without creating a `notify → escalate` import cycle.
+### Durable, cross-restart thread continuity
+
+The full lifecycle of one problem stays in **one** Slack thread — no duplicate
+threads on recurrence — and this holds **even across a monitor restart**. The
+thread handle is stored where the rest of MaKlaude's state already lives: the
+**backing GitHub issue**, the auditable source of truth. No new datastore is
+introduced.
+
+1. On first escalation, `NotifyEscalation` posts the root and **returns** Slack's
+   `thread_ts`. The escalator writes it into the issue body as a second hidden
+   marker (`<!-- maklaude:thread=… -->`), alongside the existing identity marker.
+2. On every later reconcile the escalator re-lists open issues and **recovers**
+   that `thread_ts` from the marker (`ParseThreadMarker`), regardless of whether
+   the process has restarted.
+3. The recovered handle is passed back to `NotifyUpdate` / `NotifyResolution`, so
+   the recurrence and the resolution reply into the **original** thread.
+
+Because continuity is owned by the escalate/scan layer (the only layer that can
+see both the issue store and the notifier), `notify` never needs to import
+`escalate` — there is no import cycle. If a thread handle cannot be recovered (an
+issue opened before this feature existed, or Slack reachable only after the root
+was lost), the notifier **degrades gracefully**: it posts a self-labelled
+top-level message rather than erroring, so a notification is never dropped and a
+reconcile is never failed. The Slack side is strictly **best-effort** — a Slack
+error is recorded but never strands the GitHub trail.
 
 ## Connection model
 

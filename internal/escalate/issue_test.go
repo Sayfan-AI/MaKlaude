@@ -54,6 +54,68 @@ func TestParseIdentityMarker_FromFullBody(t *testing.T) {
 	}
 }
 
+func TestParseThreadMarker_RoundTrip(t *testing.T) {
+	const ts = "1700000000.000123"
+	body := "preamble\n" + identityMarker("prod|x|y") + "\n" + threadMarker(ts) + "\nepilogue"
+	got, ok := ParseThreadMarker(body)
+	if !ok || got != ts {
+		t.Fatalf("round-trip failed: got %q ok=%v, want %q", got, ok, ts)
+	}
+	// The identity marker must still parse alongside it.
+	if _, ok := ParseIdentityMarker(body); !ok {
+		t.Error("identity marker should coexist with the thread marker")
+	}
+}
+
+func TestParseThreadMarker_Negative(t *testing.T) {
+	cases := map[string]string{
+		"no marker":     "just a normal issue body",
+		"empty body":    "",
+		"unterminated":  "<!-- maklaude:thread=1700.0001",
+		"empty ts":      "<!-- maklaude:thread= -->",
+		"whitespace ts": "<!-- maklaude:thread=   -->",
+		"identity only": Body(sampleFinding(detect.SeverityCritical)),
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, ok := ParseThreadMarker(body); ok {
+				t.Errorf("expected no thread marker parsed from %q", body)
+			}
+		})
+	}
+}
+
+func TestWithThreadMarker(t *testing.T) {
+	base := Body(sampleFinding(detect.SeverityCritical))
+
+	// Adding a marker makes it parseable without disturbing the identity marker.
+	withTS := withThreadMarker(base, "111.0001")
+	if got, ok := ParseThreadMarker(withTS); !ok || got != "111.0001" {
+		t.Fatalf("withThreadMarker did not embed ts: got %q ok=%v", got, ok)
+	}
+	if id, ok := ParseIdentityMarker(withTS); !ok || id != sampleFinding(detect.SeverityCritical).Identity {
+		t.Errorf("identity marker disturbed: got %q ok=%v", id, ok)
+	}
+
+	// Re-applying replaces, never accumulates.
+	replaced := withThreadMarker(withTS, "222.0002")
+	if got, _ := ParseThreadMarker(replaced); got != "222.0002" {
+		t.Errorf("re-apply should replace ts, got %q", got)
+	}
+	if n := strings.Count(replaced, threadMarkerPrefix); n != 1 {
+		t.Errorf("want exactly one thread marker after re-apply, got %d", n)
+	}
+
+	// An empty ts strips any existing marker and leaves a plain body.
+	stripped := withThreadMarker(withTS, "")
+	if _, ok := ParseThreadMarker(stripped); ok {
+		t.Error("empty ts should strip the thread marker")
+	}
+	if _, ok := ParseIdentityMarker(stripped); !ok {
+		t.Error("stripping the thread marker must not remove the identity marker")
+	}
+}
+
 func TestTitle_NamesClusterAndSeverity(t *testing.T) {
 	got := Title(sampleFinding(detect.SeverityCritical))
 	for _, want := range []string{"CRITICAL", "prod", "Pod crashlooping"} {

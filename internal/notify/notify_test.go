@@ -128,13 +128,17 @@ func TestNopNotifier_MethodsAreSafe(t *testing.T) {
 	// safe to call with no error.
 	notifiers := []Notifier{NopNotifier{}, NewNopNotifier()}
 	for _, n := range notifiers {
-		if err := n.NotifyEscalation(ctx, id, "pod is crashlooping", "42"); err != nil {
+		ts, err := n.NotifyEscalation(ctx, id, "pod is crashlooping", "42")
+		if err != nil {
 			t.Errorf("NotifyEscalation: unexpected error %v", err)
 		}
-		if err := n.NotifyUpdate(ctx, id, "still crashlooping"); err != nil {
+		if ts != "" {
+			t.Errorf("NopNotifier.NotifyEscalation should return an empty thread handle, got %q", ts)
+		}
+		if err := n.NotifyUpdate(ctx, id, "111.0001", "still crashlooping"); err != nil {
 			t.Errorf("NotifyUpdate: unexpected error %v", err)
 		}
-		if err := n.NotifyResolution(ctx, id, "recovered"); err != nil {
+		if err := n.NotifyResolution(ctx, id, "111.0001", "recovered"); err != nil {
 			t.Errorf("NotifyResolution: unexpected error %v", err)
 		}
 	}
@@ -152,7 +156,7 @@ func TestNotifierFromEnv_GracefulDegradation(t *testing.T) {
 	}
 	// Whatever the env, the returned notifier is always safe to call (T1 keeps it
 	// a no-op even when configured).
-	if err := notifier.NotifyEscalation(context.Background(), "id", "s", "ref"); err != nil {
+	if _, err := notifier.NotifyEscalation(context.Background(), "id", "s", "ref"); err != nil {
 		t.Errorf("returned notifier should be safe to call: %v", err)
 	}
 	// With no Slack env in the unit environment, degradation must hold.

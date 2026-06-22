@@ -147,9 +147,13 @@ func (g *GitHubSink) ListOpen(ctx context.Context) ([]TrackedIssue, error) {
 			if !ok {
 				continue
 			}
+			// Recover the durable Slack thread handle when present so updates and
+			// the resolution reply into the original thread across restarts.
+			threadTS, _ := ParseThreadMarker(issues[i].Body)
 			tracked = append(tracked, TrackedIssue{
 				Identity: id,
 				Ref:      IssueRef(fmt.Sprintf("%d", issues[i].Number)),
+				ThreadTS: threadTS,
 			})
 		}
 		if len(issues) < 100 {

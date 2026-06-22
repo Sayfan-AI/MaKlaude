@@ -1,6 +1,10 @@
 package escalate
 
-import "os"
+import (
+	"os"
+
+	"github.com/Sayfan-AI/MaKlaude/internal/notify"
+)
 
 // SinkFromEnv selects the comms sink for the running process based on the
 // MAKLAUDE_GITHUB_* environment (see [GitHubConfig]). It is the single seam the
@@ -26,7 +30,19 @@ func SinkFromEnv() (sink IssueSink, live bool) {
 // EscalatorFromEnv is a convenience over [SinkFromEnv] that returns a ready
 // [Escalator] plus whether it is backed by a live comms system. The monitor can
 // call this once at startup and reuse the escalator across reconcile cycles.
+//
+// It also selects the chat [notify.Notifier] from the environment (via
+// [notify.NotifierFromEnv]) and wires it into the escalator, so a configured Slack
+// deployment gets durable, threaded chat mirroring of the escalation lifecycle.
+// This is the layer that owns chat thread continuity: it can see both the issue
+// store (to persist/recover the thread handle) and the notifier, which is why the
+// wiring lives here rather than in notify (notify must not import escalate).
+//
+// The returned live reflects the GITHUB trail (the auditable source of truth), not
+// chat: an unconfigured Slack backend simply yields a [notify.NopNotifier] and the
+// system degrades to exactly the Milestone 1 GitHub + email behavior.
 func EscalatorFromEnv() (esc *Escalator, live bool) {
 	sink, live := SinkFromEnv()
-	return NewEscalator(sink), live
+	notifier, _ := notify.NotifierFromEnv()
+	return NewEscalatorWithNotifier(sink, notifier), live
 }
