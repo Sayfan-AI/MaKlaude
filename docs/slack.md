@@ -9,12 +9,13 @@ GitHub's own per-issue notification emails — with zero behavior change. This i
 the same graceful-degradation seam the GitHub trail uses (see the
 [no-writes guarantee](no-writes.md) and [`internal/escalate`](../internal/escalate)).
 
-> **Status.** This task (M2 T1) establishes the configuration surface, the
-> [`Notifier`](../internal/notify/notify.go) interface, and the no-op default.
-> It does **not** post to Slack yet — even a fully-configured deployment still
-> degrades to the no-op. The live Slack backend (outbound posting + Socket Mode
-> inbound) lands in T2. The env vars below are stable and safe to set now; they
-> become active in T2.
+> **Status.** As of M2 T2 the **outbound** Slack backend is live: a configured
+> deployment posts escalations as thread roots and replies updates/resolutions
+> into the same thread over the Slack Web API (`chat.postMessage`) — see
+> [`internal/notify/slack_notifier.go`](../internal/notify/slack_notifier.go).
+> The **inbound** Socket Mode conversation path (the app-level token) is not yet
+> wired; it lands in a later task. An unconfigured deployment still degrades to
+> the no-op with zero behavior change versus Milestone 1.
 
 ## How notifications work
 
@@ -27,9 +28,14 @@ MaKlaude models each problem as a conversation, keyed by the same stable
 | Problem recurs / changes | `NotifyUpdate` | Reply into the same thread |
 | Problem clears | `NotifyResolution` | Post a closing reply into the same thread |
 
-The identity → Slack thread mapping is persisted in the backing **GitHub issue
-via a hidden marker** (the approved default), so no new datastore is introduced.
-T1 establishes this seam; T2 implements it.
+The identity → Slack thread mapping is held **in memory** for the lifetime of
+the process in T2: the escalation root's timestamp is recorded under the
+identity and reused as `thread_ts` for the update and resolution replies. If the
+process restarts and the map is lost, the notifier **degrades gracefully** — it
+posts a new top-level message rather than erroring, so a notification is never
+dropped. Durable, cross-restart thread continuity (persisting the marker in the
+backing **GitHub issue**, the approved default) lands in T3, wired from a layer
+that can see both packages without creating a `notify → escalate` import cycle.
 
 ## Connection model
 
