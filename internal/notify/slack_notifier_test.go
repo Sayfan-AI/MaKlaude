@@ -97,7 +97,7 @@ func TestSlackNotifier_ThreadLifecycle(t *testing.T) {
 
 	id := detect.Identity("prod|pod.crashloop|pod/team/api")
 
-	rootTS, err := sn.NotifyEscalation(ctx, id, "Pod crashlooping in team/api", "42")
+	rootTS, err := sn.NotifyEscalation(ctx, id, "Pod crashlooping in team/api", "42", false)
 	if err != nil {
 		t.Fatalf("NotifyEscalation: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestSlackNotifier_DurableThreadAcrossRestart(t *testing.T) {
 	fake1 := &fakeSlack{tsQueue: []string{"111.000001"}}
 	sn1, _ := NewSlackNotifier(testConfig(), fake1)
 	id := detect.Identity("prod|pod.crashloop|pod/team/api")
-	rootTS, err := sn1.NotifyEscalation(ctx, id, "Pod crashlooping", "42")
+	rootTS, err := sn1.NotifyEscalation(ctx, id, "Pod crashlooping", "42", false)
 	if err != nil {
 		t.Fatalf("NotifyEscalation: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestSlackNotifier_SlackLogicalError(t *testing.T) {
 	fake := &fakeSlack{failOK: true, errCode: "channel_not_found"}
 
 	sn, _ := NewSlackNotifier(testConfig(), fake)
-	_, err := sn.NotifyEscalation(ctx, "prod|x|pod/a/b", "summary", "1")
+	_, err := sn.NotifyEscalation(ctx, "prod|x|pod/a/b", "summary", "1", false)
 	if err == nil {
 		t.Fatal("expected an error for ok:false response")
 	}
@@ -272,7 +272,7 @@ func TestSlackNotifier_HTTPError(t *testing.T) {
 	fake := &fakeSlack{httpStatus: http.StatusTooManyRequests}
 
 	sn, _ := NewSlackNotifier(testConfig(), fake)
-	_, err := sn.NotifyEscalation(ctx, "prod|x|pod/a/b", "summary", "1")
+	_, err := sn.NotifyEscalation(ctx, "prod|x|pod/a/b", "summary", "1", false)
 	if err == nil || !strings.Contains(err.Error(), "429") {
 		t.Fatalf("expected a 429 error, got %v", err)
 	}
@@ -290,7 +290,7 @@ func TestSlackNotifier_NoTokenInPayloadBody(t *testing.T) {
 
 	sn, _ := NewSlackNotifier(testConfig(), fake)
 	id := detect.Identity("prod|pod.crashloop|pod/team/api")
-	_, _ = sn.NotifyEscalation(ctx, id, "summary", "42")
+	_, _ = sn.NotifyEscalation(ctx, id, "summary", "42", false)
 	_ = sn.NotifyUpdate(ctx, id, "1.1", "update note")
 	_ = sn.NotifyResolution(ctx, id, "1.1", "resolved note")
 

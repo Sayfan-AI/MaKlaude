@@ -14,6 +14,7 @@ import "strings"
 //	MAKLAUDE_SLACK_APP_TOKEN        app-level token (xapp-…) for Socket Mode inbound
 //	MAKLAUDE_SLACK_SIGNING_SECRET   signing secret used to verify inbound requests
 //	MAKLAUDE_SLACK_CHANNEL          target channel (ID or #name) for escalations
+//	MAKLAUDE_SLACK_OPERATOR         operator to @-mention on needs:human escalations
 //
 // Socket Mode is the approved default inbound transport: the app-level token
 // opens an outbound WebSocket so MaKlaude needs no public HTTP endpoint, while
@@ -43,6 +44,17 @@ type SlackConfig struct {
 	// Channel is the target channel for escalation threads, given either as a
 	// channel ID (e.g. "C0123456789") or a "#name". It is not a secret.
 	Channel string
+
+	// Operator, when set, is the Slack handle MaKlaude @-mentions on an escalation
+	// that warrants human attention (the needs:human gate), so the operator gets a
+	// real notification — and, crucially, a mobile push — rather than a silent
+	// channel post. It is given as a Slack user ID ("U0123456789", rendered as
+	// "<@U0123456789>"), a user group ID ("S0123456789", rendered as
+	// "<!subteam^S0123456789>"), or a literal mention token already in Slack's
+	// "<…>" form, which is passed through verbatim. It is NOT a secret and is
+	// optional: when empty, escalations post without an @-mention (no behavior
+	// change). See [SlackConfig.mentionPrefix].
+	Operator string
 }
 
 // Configured reports whether the config carries the minimum needed to talk to
@@ -72,6 +84,38 @@ func SlackConfigFromEnv(getenv func(string) string) SlackConfig {
 		AppToken:      strings.TrimSpace(getenv("MAKLAUDE_SLACK_APP_TOKEN")),
 		SigningSecret: strings.TrimSpace(getenv("MAKLAUDE_SLACK_SIGNING_SECRET")),
 		Channel:       strings.TrimSpace(getenv("MAKLAUDE_SLACK_CHANNEL")),
+		Operator:      strings.TrimSpace(getenv("MAKLAUDE_SLACK_OPERATOR")),
+	}
+}
+
+// mentionPrefix renders the configured operator as a Slack mention token suitable
+// for prefixing an escalation message so the operator is notified (and a mobile
+// push fires). It returns an empty string when no operator is configured, so the
+// caller simply omits the mention. The token is recognized in three forms:
+//
+//   - an explicit "<…>" mention is passed through verbatim (operator knows best);
+//   - a "U…" value becomes a user mention "<@U…>";
+//   - an "S…" value becomes a user-group mention "<!subteam^S…>";
+//   - anything else (e.g. a "@name" or bare name) is wrapped as "<@value>" on a
+//     best-effort basis — Slack resolves a valid user ID and otherwise renders it
+//     harmlessly as text, so this never errors or leaks.
+//
+// The operator handle is not a secret, so it is rendered verbatim.
+func (c SlackConfig) mentionPrefix() string {
+	op := strings.TrimSpace(c.Operator)
+	if op == "" {
+		return ""
+	}
+	if strings.HasPrefix(op, "<") && strings.HasSuffix(op, ">") {
+		return op
+	}
+	switch op[0] {
+	case 'S':
+		return "<!subteam^" + op + ">"
+	case 'U', 'W':
+		return "<@" + op + ">"
+	default:
+		return "<@" + strings.TrimPrefix(op, "@") + ">"
 	}
 }
 
@@ -101,6 +145,7 @@ func (c SlackConfig) Redacted() SlackConfig {
 		AppToken:      redact(c.AppToken),
 		SigningSecret: redact(c.SigningSecret),
 		Channel:       c.Channel,
+		Operator:      c.Operator,
 	}
 }
 
@@ -122,6 +167,7 @@ func (c SlackConfig) String() string {
 	b.WriteString(" AppToken:" + set(c.AppToken))
 	b.WriteString(" SigningSecret:" + set(c.SigningSecret))
 	b.WriteString(" Channel:" + quoteChannel(c.Channel))
+	b.WriteString(" Operator:" + quoteChannel(c.Operator))
 	b.WriteString(" Configured:")
 	if c.Configured() {
 		b.WriteString("true")

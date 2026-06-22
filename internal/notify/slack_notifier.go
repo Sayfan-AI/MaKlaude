@@ -132,8 +132,12 @@ func NewSlackNotifier(cfg SlackConfig, client doer) (*SlackNotifier, bool) {
 // not supply a handle. summary is the human-facing one-liner (the same text titling
 // the GitHub issue); ref is the backing issue reference (possibly empty) used to
 // link the chat message back to the auditable trail.
-func (s *SlackNotifier) NotifyEscalation(ctx context.Context, id detect.Identity, summary, ref string) (string, error) {
-	text := escalationText(id, summary, ref)
+func (s *SlackNotifier) NotifyEscalation(ctx context.Context, id detect.Identity, summary, ref string, needsHuman bool) (string, error) {
+	mention := ""
+	if needsHuman {
+		mention = s.cfg.mentionPrefix()
+	}
+	text := escalationText(id, summary, ref, mention)
 	ts, err := s.post(ctx, text, "")
 	if err != nil {
 		return "", fmt.Errorf("notify/slack: posting escalation for %q: %w", id, err)
@@ -293,14 +297,22 @@ func redactedSlackError(code string) string {
 }
 
 // escalationText renders the thread-root message for a newly-escalated problem:
-// the one-line summary, the cluster it concerns (recovered from the stable
-// identity so the line is accurate even though the interface passes only the
-// summary), and a link back to the backing GitHub issue when one exists.
-func escalationText(id detect.Identity, summary, ref string) string {
+// an optional operator @-mention (so a needs:human escalation fires a real
+// notification / mobile push), the one-line summary, the cluster it concerns
+// (recovered from the stable identity so the line is accurate even though the
+// interface passes only the summary), and a link back to the backing GitHub issue
+// when one exists. mention is the already-rendered Slack mention token (or empty
+// to omit it); the caller decides whether to supply one based on needs:human.
+func escalationText(id detect.Identity, summary, ref, mention string) string {
 	var b strings.Builder
 	b.WriteString(":rotating_light: *MaKlaude escalation*")
 	if cluster := clusterOf(id); cluster != "" {
 		b.WriteString(" on cluster `" + cluster + "`")
+	}
+	if m := strings.TrimSpace(mention); m != "" {
+		// Lead the body with the mention so it is the first thing the operator sees
+		// and so Slack treats the post as a direct ping (mobile-push eligible).
+		b.WriteString("\n" + m + " needs:human — please review.")
 	}
 	b.WriteString("\n")
 	b.WriteString(strings.TrimSpace(summary))

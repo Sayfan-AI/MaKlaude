@@ -107,7 +107,7 @@ func (e *Escalator) Reconcile(ctx context.Context, findings []detect.Finding) (O
 			// handle into the issue body so a future reconcile (even after a restart)
 			// can reply into this same thread. Both are best-effort: a chat or
 			// persistence hiccup is recorded but never strands the GitHub trail.
-			threadTS, nerr := e.notifier.NotifyEscalation(ctx, a.Identity, Title(a.Finding), string(ref))
+			threadTS, nerr := e.notifier.NotifyEscalation(ctx, a.Identity, Title(a.Finding), string(ref), wantsHuman(a.Finding))
 			if nerr != nil {
 				errs = append(errs, fmt.Errorf("notifying escalation for %q: %w", a.Identity, nerr))
 				continue

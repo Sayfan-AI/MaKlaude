@@ -79,7 +79,14 @@ type Notifier interface {
 	// whose post did not surface a handle); callers must treat empty as "no thread
 	// to persist" and not as an error signal — the error return is the only failure
 	// signal.
-	NotifyEscalation(ctx context.Context, id detect.Identity, summary, ref string) (threadTS string, err error)
+	//
+	// needsHuman reports whether this escalation warrants a human decision (the
+	// caller's needs:human gate). A real backend uses it to @-mention the configured
+	// operator on the root so the operator is actually notified — and a mobile push
+	// fires — rather than the post sitting silently in a channel. It is purely a
+	// notification hint: it NEVER triggers any action and a backend with no operator
+	// configured simply ignores it.
+	NotifyEscalation(ctx context.Context, id detect.Identity, summary, ref string, needsHuman bool) (threadTS string, err error)
 
 	// NotifyUpdate posts a follow-up into the existing thread for an identity, used
 	// when an active problem recurs or its details change. threadTS is the thread
@@ -120,7 +127,7 @@ func NewNopNotifier() NopNotifier { return NopNotifier{} }
 // NotifyEscalation does nothing and returns an empty thread handle and a nil
 // error. The empty handle means the caller persists no thread marker, exactly as
 // if Slack were unconfigured — which is the whole point of the no-op.
-func (NopNotifier) NotifyEscalation(context.Context, detect.Identity, string, string) (string, error) {
+func (NopNotifier) NotifyEscalation(context.Context, detect.Identity, string, string, bool) (string, error) {
 	return "", nil
 }
 
