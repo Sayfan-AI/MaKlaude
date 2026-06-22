@@ -117,3 +117,5 @@ of the README for the issue lifecycle (open / recur / clear) and the
 - [`docs/no-writes.md`](no-writes.md) — the documented, test-backed guarantee that
   MaKlaude issues no mutating API calls.
 - [`docs/rbac.md`](rbac.md) — the full read-only access model and verification.
+- [`docs/slack.md`](slack.md) — optional Slack / ChatOps notifications; unset by
+  default and degrades cleanly to GitHub + email with zero behavior change.
