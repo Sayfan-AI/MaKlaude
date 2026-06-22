@@ -17,6 +17,9 @@ import (
 // slackPostMessageURL is the Slack Web API endpoint used for every outbound
 // post. Escalation roots and the replies that update or resolve them all go
 // through chat.postMessage; a reply is just a post that carries a thread_ts.
+// It is the default the notifier targets; the endpoint is overridable only via
+// [WithBaseURL] so a test can stand a faithful [net/http/httptest.Server] in
+// front of it (production never passes the option and hits Slack directly).
 const slackPostMessageURL = "https://slack.com/api/chat.postMessage"
 
 // doer is the narrow transport seam the [SlackNotifier] posts through. It is the
@@ -101,8 +104,35 @@ type SlackNotifier struct {
 	cfg    SlackConfig
 	client doer
 
+	// postURL is the chat.postMessage endpoint this notifier posts to. It defaults
+	// to [slackPostMessageURL] (the real Slack Web API) and is overridable ONLY via
+	// [WithBaseURL] so a faithful end-to-end test can point a local httptest server
+	// at the notifier. Production never sets it, so production behavior is unchanged.
+	postURL string
+
 	mu      sync.Mutex
 	threads map[detect.Identity]threadRef
+}
+
+// Option customizes a [SlackNotifier] at construction. It exists for exactly one
+// reason: a faithful, network-free end-to-end test needs to redirect outbound
+// posts at a local [net/http/httptest.Server]. Production wiring passes no
+// options, so the live notifier targets the real Slack Web API unchanged.
+type Option func(*SlackNotifier)
+
+// WithBaseURL overrides the chat.postMessage endpoint the notifier posts to. The
+// only intended caller is a test that runs a stand-in Slack server (an
+// httptest.Server) and wants the REAL notifier — same request building, same
+// thread_ts logic, same response handling — to talk to it over real HTTP rather
+// than to slack.com. An empty url is ignored so the production default always
+// wins. This is the deliberately-minimal seam called for by M2 T5: it adds one
+// optional field and changes nothing about the default code path.
+func WithBaseURL(url string) Option {
+	return func(s *SlackNotifier) {
+		if strings.TrimSpace(url) != "" {
+			s.postURL = url
+		}
+	}
 }
 
 // NewSlackNotifier builds a live Slack notifier from cfg. ok is false when cfg is
@@ -111,18 +141,23 @@ type SlackNotifier struct {
 // graceful-degradation seam that keeps a credential-less deployment behaving
 // exactly like Milestone 1. The HTTP client is injectable purely for tests
 // (a fake transport); production passes nil and gets a sensible timeout.
-func NewSlackNotifier(cfg SlackConfig, client doer) (*SlackNotifier, bool) {
+func NewSlackNotifier(cfg SlackConfig, client doer, opts ...Option) (*SlackNotifier, bool) {
 	if !cfg.Configured() {
 		return nil, false
 	}
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
-	return &SlackNotifier{
+	sn := &SlackNotifier{
 		cfg:     cfg,
 		client:  client,
+		postURL: slackPostMessageURL,
 		threads: make(map[detect.Identity]threadRef),
-	}, true
+	}
+	for _, opt := range opts {
+		opt(sn)
+	}
+	return sn, true
 }
 
 // NotifyEscalation posts the thread ROOT for a newly-escalated problem and returns
@@ -250,7 +285,15 @@ func (s *SlackNotifier) post(ctx context.Context, text, threadTS string) (string
 		return "", fmt.Errorf("marshalling message: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, slackPostMessageURL, bytes.NewReader(buf))
+	// postURL defaults to slackPostMessageURL; a test may have redirected it to a
+	// local httptest server via WithBaseURL. Either way it is a constant, non-secret
+	// endpoint, so it is safe to include in error messages (the token never is).
+	endpoint := s.postURL
+	if endpoint == "" {
+		endpoint = slackPostMessageURL
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(buf))
 	if err != nil {
 		return "", fmt.Errorf("building request: %w", err)
 	}
@@ -261,14 +304,14 @@ func (s *SlackNotifier) post(ctx context.Context, text, threadTS string) (string
 	if err != nil {
 		// Never wrap the raw error with anything token-bearing; the URL and method
 		// are constant and safe.
-		return "", fmt.Errorf("POST %s: %w", slackPostMessageURL, err)
+		return "", fmt.Errorf("POST %s: %w", endpoint, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		excerpt, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return "", fmt.Errorf("POST %s: unexpected status %d: %s",
-			slackPostMessageURL, resp.StatusCode, strings.TrimSpace(string(excerpt)))
+			endpoint, resp.StatusCode, strings.TrimSpace(string(excerpt)))
 	}
 
 	var out slackPostResponse
