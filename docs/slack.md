@@ -9,16 +9,27 @@ GitHub's own per-issue notification emails — with zero behavior change. This i
 the same graceful-degradation seam the GitHub trail uses (see the
 [no-writes guarantee](no-writes.md) and [`internal/escalate`](../internal/escalate)).
 
-> **Status.** As of M2 T3 the **outbound** Slack backend is live **and wired into
-> the escalation reconcile loop with durable, cross-restart thread continuity**: a
-> configured deployment posts each escalation as a thread root, and recurrences and
-> the eventual resolution reply into that **same** thread over the Slack Web API
-> (`chat.postMessage`) — even after the monitor process restarts — see
+> **Status.** As of M2 T4 **both directions are live**. **Outbound** (T3): a
+> configured deployment posts each escalation as a thread root and replies
+> recurrences/resolutions into that **same** thread over the Slack Web API
+> (`chat.postMessage`), with durable cross-restart continuity — see
 > [`internal/notify/slack_notifier.go`](../internal/notify/slack_notifier.go) and
-> [`internal/escalate/escalator.go`](../internal/escalate/escalator.go). The
-> **inbound** Socket Mode conversation path (the app-level token) is not yet wired;
-> it lands in a later task. An unconfigured deployment still degrades to the no-op
-> with zero behavior change versus Milestone 1.
+> [`internal/escalate/escalator.go`](../internal/escalate/escalator.go).
+> **Inbound** (T4): a human reply in an escalation thread is captured, resolved
+> back to the incident/issue/cluster it belongs to (reusing the same durable
+> thread mapping), and **mirrored onto the backing GitHub issue** as a comment so
+> the audit trail records the full two-way conversation — see
+> [`internal/notify/slack_inbound.go`](../internal/notify/slack_inbound.go) and
+> [`internal/escalate/mirror.go`](../internal/escalate/mirror.go). The default
+> inbound transport is **Socket Mode**; an optional **HTTP Events API** transport
+> is also supported and **every HTTP request is signature-verified** before it is
+> parsed. An unconfigured deployment still degrades to the no-op with zero behavior
+> change versus Milestone 1.
+>
+> **Safety (locked):** inbound is strictly read / notify / converse. A captured
+> reply only ever becomes a GitHub comment — there is **no code path** from an
+> inbound event to a cluster mutation or any actionable behavior. Anything
+> actionable still routes through MaKlaude's existing human gates.
 
 ## How notifications work
 
@@ -27,9 +38,53 @@ MaKlaude models each problem as a conversation, keyed by the same stable
 
 | Lifecycle step | `Notifier` method | What the live backend does |
 | -------------- | ----------------- | ----------------------------- |
-| Problem first escalated | `NotifyEscalation` | Post a top-level message — the thread root — linking back to the GitHub issue, and return its `thread_ts` |
+| Problem first escalated | `NotifyEscalation` | Post a top-level message — the thread root — linking back to the GitHub issue, and return its `thread_ts`. A **needs:human** escalation also @-mentions the configured operator so a mobile push fires |
 | Problem recurs / changes | `NotifyUpdate` | Reply into the same thread (using the recovered `thread_ts`) |
 | Problem clears | `NotifyResolution` | Post a closing reply into the same thread |
+
+### needs:human ⇒ operator @-mention (mobile push)
+
+When an escalation warrants a human decision (the `needs:human` gate — warning or
+critical severity, the same gate that labels the GitHub issue), the thread root
+**@-mentions the operator** configured in `MAKLAUDE_SLACK_OPERATOR`. Slack treats
+a direct mention as a notification, so the operator gets a real ping — including a
+**mobile push** — rather than a message sitting silently in a channel. Info-level
+escalations are recorded without a mention. When no operator is configured the
+post simply carries no mention (no behavior change). The mention is purely a
+notification; it triggers **no** action.
+
+## Inbound: replies understood in context
+
+A human reply in an escalation thread is **captured and mirrored onto the backing
+GitHub issue**, so the audit trail records both sides of the conversation. The
+inbound listener:
+
+1. Receives the Slack `message` event (Socket Mode by default, or the optional
+   HTTP Events API). It ignores anything that is not a fresh human reply inside a
+   thread — thread roots, MaKlaude's own bot posts (so nothing echoes back),
+   message edits/deletes, and top-level messages are all dropped.
+2. Resolves the reply's `thread_ts` back to the incident/issue/cluster using the
+   **same durable thread marker** the outbound side persists (`ParseThreadMarker`),
+   so inbound and outbound agree on which conversation is which — even across a
+   monitor restart.
+3. Posts the reply as a **comment on the matching issue**, attributed to its Slack
+   author. A reply whose thread maps to no open issue is a best-effort no-op (never
+   an error), so an out-of-band reply never disrupts the listener.
+
+This is strictly **read / notify / converse**: a captured reply only ever becomes
+a GitHub comment. There is **no path** from an inbound event to a cluster
+mutation; anything actionable still routes through MaKlaude's existing human gates.
+
+### HTTP Events API: request signatures are verified
+
+If an operator runs the optional HTTP transport instead of Socket Mode, **every
+request is signature-verified before it is parsed or mirrored**. MaKlaude computes
+`HMAC-SHA256("v0:{timestamp}:{body}", signing_secret)` and compares it in constant
+time to the `X-Slack-Signature` header, also rejecting any request whose
+`X-Slack-Request-Timestamp` is more than five minutes old (replay protection). A
+missing, mis-signed, or stale request is rejected with `401` and never reaches the
+issue trail. The signing secret is used only to verify and is never logged. Slack's
+one-time URL-verification handshake is answered after the signature check.
 
 ### Durable, cross-restart thread continuity
 
@@ -83,6 +138,7 @@ see [`internal/notify/slack.go`](../internal/notify/slack.go)).
 | `MAKLAUDE_SLACK_BOT_TOKEN` | yes | Bot token (`xoxb-…`) for outbound Web API posts. **Secret — never logged.** |
 | `MAKLAUDE_SLACK_APP_TOKEN` | yes | App-level token (`xapp-…`) for Socket Mode inbound. **Secret — never logged.** |
 | `MAKLAUDE_SLACK_CHANNEL` | yes | Target channel for escalation threads — a channel ID (`C0123456789`) or `#name`. Not a secret. |
+| `MAKLAUDE_SLACK_OPERATOR` | no | Operator to @-mention on `needs:human` escalations so a mobile push fires — a user ID (`U0123456789`), a user-group ID (`S0123456789`), or a literal `<…>` mention token. Not a secret. When unset, escalations post without a mention. |
 | `MAKLAUDE_SLACK_SIGNING_SECRET` | no | Signing secret to verify inbound HTTP Events API requests; only needed if you run HTTP mode instead of Socket Mode. **Secret — never logged.** |
 
 When the three required variables are all set, MaKlaude considers Slack

@@ -12,10 +12,11 @@ import (
 // the exact chat lifecycle the escalator drove: which method, for which identity,
 // and with which thread handle.
 type notifyCall struct {
-	method   string // "escalation", "update", or "resolution"
-	id       detect.Identity
-	threadTS string // the thread_ts the escalator SUPPLIED (empty on escalation)
-	note     string
+	method     string // "escalation", "update", or "resolution"
+	id         detect.Identity
+	threadTS   string // the thread_ts the escalator SUPPLIED (empty on escalation)
+	note       string
+	needsHuman bool // the needs:human hint passed on escalation
 }
 
 // fakeNotifier is a zero-network [notify.Notifier] for escalate tests. It records
@@ -31,13 +32,13 @@ type fakeNotifier struct {
 	tsQueue []string
 }
 
-func (f *fakeNotifier) NotifyEscalation(_ context.Context, id detect.Identity, summary, _ string) (string, error) {
+func (f *fakeNotifier) NotifyEscalation(_ context.Context, id detect.Identity, summary, _ string, needsHuman bool) (string, error) {
 	ts := "thread-default"
 	if len(f.tsQueue) > 0 {
 		ts = f.tsQueue[0]
 		f.tsQueue = f.tsQueue[1:]
 	}
-	f.calls = append(f.calls, notifyCall{method: "escalation", id: id, note: summary})
+	f.calls = append(f.calls, notifyCall{method: "escalation", id: id, note: summary, needsHuman: needsHuman})
 	return ts, nil
 }
 

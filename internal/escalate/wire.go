@@ -46,3 +46,27 @@ func EscalatorFromEnv() (esc *Escalator, live bool) {
 	notifier, _ := notify.NotifierFromEnv()
 	return NewEscalatorWithNotifier(sink, notifier), live
 }
+
+// InboundListenerFromEnv selects the INBOUND Slack listener for the running
+// process from the MAKLAUDE_SLACK_* environment (see [notify.SlackConfig]). It is
+// the inbound counterpart of [EscalatorFromEnv], and the layer that wires the two
+// halves of the Slack integration together: it resolves the same sink the
+// escalator writes to, builds a [ReplyMirror] over it so a captured reply lands on
+// the right issue, and hands both to [notify.NewInboundListener].
+//
+//   - When Slack is configured it returns the listener and ok=true (the caller
+//     starts it — Socket Mode by default, or wires the HTTP handler).
+//   - When Slack is NOT configured it returns nil and ok=false, so the caller
+//     starts nothing: no connection, no errors, exactly the Milestone 1 behavior.
+//
+// Construction reuses [notify.NewInboundListener]'s own graceful-degradation seam,
+// so an unconfigured environment can never produce a live inbound listener. The
+// sink is shared with the escalator's view of the trail (both come from
+// [SinkFromEnv]), so inbound replies are mirrored onto the very issues the outbound
+// side opened. Optional Socket Mode dialer / error handler options are passed
+// through to the listener.
+func InboundListenerFromEnv(opts ...notify.InboundOption) (listener *notify.InboundListener, ok bool) {
+	sink, _ := SinkFromEnv()
+	cfg := notify.SlackConfigFromEnv(os.Getenv)
+	return notify.NewInboundListener(cfg, NewReplyMirror(sink), opts...)
+}
