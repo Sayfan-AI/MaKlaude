@@ -35,7 +35,14 @@ jobs:
           prompt: |
             Run the evolver agent defined in .claude/agents/evolver.md.
             This is a scheduled review cycle — review recent system behavior and apply improvements.
-          claude_args: "--max-turns 15 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
+          # The evolver runs the broadest open-ended work of any agent: a full
+          # system review (collect signals → classify → apply fixes → escalate →
+          # curate memory) that also dispatches subagents via the Agent tool —
+          # each of which consumes turns from this budget. 15 turns (tied with the
+          # narrow merge agent for the lowest budget) was too tight and the run
+          # hit max-turns daily (escalations on #38, Jun 22–24). 30 matches the
+          # ci-failure tier, which has the same toolset and comparable scope.
+          claude_args: "--max-turns 30 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
 
       # Escalate a real run failure (e.g. agent hit max-turns) to a human. Without
       # this, an evolver failure is silent — nobody learns the self-improvement
