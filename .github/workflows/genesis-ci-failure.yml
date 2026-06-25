@@ -53,7 +53,7 @@ jobs:
 
             Run the orchestrator agent in .claude/agents/orchestrator.md, focused on TRIAGE
             of this failure (see its "Handling failures" section):
-            1. Find the PR for branch "${{ github.event.workflow_run.head_branch }}" and read the failing run's logs.
+            1. Find the PR for branch "${{ github.event.workflow_run.head_branch }}". Try to read the failing run's logs, but note the bot token currently lacks actions:read, so `gh run view --log` returns HTTP 403 (tracked in genesis #14/#17) — if so, do not retry; diagnose from readable signals (gh pr checks, statusCheckRollup, the workflow YAML, the PR diff, failure cadence). See orchestrator.md "Handling failures" step 1.
             2. Classify: transient/infra (re-run), a small well-understood defect (fix on the PR branch and push), or large/ambiguous.
             3. If you cannot fix it quickly and confidently within your turn budget, do NOT attempt a heroic inline fix. Escalate: comment a concise diagnosis on the PR's task issue, label it needs:human, and stop. Do not loop.
           claude_args: "--max-turns 30 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
