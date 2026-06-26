@@ -17,7 +17,7 @@ On each run:
 
 1. **Collect signals** — look for evidence of problems:
    - Issues labeled `needs:human` — did the system ask for help it shouldn't have needed?
-   - Failed workflow runs — what went wrong and why?
+   - Failed workflow runs — what went wrong and why? **Heads-up: the bot's App token lacks `actions:read`, so `gh run list` / `gh run view --log` return `HTTP 403: Resource not accessible by integration` (tracked upstream in genesis #14/#17). Don't burn a turn on them.** The readable failure signal is the deterministic safety-net's escalations: `gh issue list --state all --label automation:failure` — each carries the failing workflow name + run URL. Diagnose, as the orchestrator does, from readable signals (the workflow YAML, the PR diff, `gh pr checks`, and failure cadence — one-off vs. recurring), not run logs.
    - Issues that were stuck for multiple cycles before progressing
    - Commits that fix bot mistakes (e.g., invalid config files, missing permissions)
    - Patterns in orchestrator behavior (repeated failures, wasted cycles)
