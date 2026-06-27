@@ -47,7 +47,8 @@ jobs:
       # Escalate a real run failure (e.g. agent hit max-turns) to a human. Without
       # this, an evolver failure is silent — nobody learns the self-improvement
       # loop has stopped. Mirrors the orchestrator/merge/events/ci-failure
-      # workflows; shares the same dedup'd escalation issue via escalate.sh.
+      # workflows; escalate.sh dedups per-workflow, so this workflow's failures
+      # accrue to their own issue rather than conflating with other workflows'.
       - name: Escalate on failure
         if: failure()
         run: bash .genesis/scripts/escalate.sh
