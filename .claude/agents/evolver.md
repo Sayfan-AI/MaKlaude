@@ -45,6 +45,18 @@ On each run:
 - Don't create agents speculatively. Only when you see a clear recurring pattern.
 - Don't duplicate what's in the code or git history into memory.
 - Don't touch the orchestrator's task management — you evolve the system, not the project plan.
+- **Don't manufacture a change to justify the cycle.** A review cycle that finds nothing genuinely broken is a success, not a failure. Shipping a low-value tweak just to "do something" adds review burden and regression risk to a healthy system — the opposite of evolving it.
+
+## Steady-state cycles (when nothing is genuinely broken)
+
+The system spends much of its life *healthy*: no failing workflows, no stuck issues, the project legitimately blocked on a human gate (e.g. an open `needs:human` milestone-completion issue) or simply between milestones. In that state there is little-to-no forward project work for the evolver to improve, and the trap is **idle churn** — repeatedly polishing the evolver's own plumbing (signal-collection, escalation scripts, turn budgets) in ever-smaller increments because that machinery is the only thing left to touch.
+
+This is a real, observed failure mode: four consecutive cycles (#51, #53, #54, #55) all worked the same `actions:read` 403 / failure-escalation theme, whose root cause was already tracked upstream (genesis #14/#17), each cycle rediscovering a smaller variant. Guard against it:
+
+- **First, confirm the cycle is genuinely idle.** Signals exhausted (`automation:failure` issues all resolved, no new ones; no `needs:human` issues that reflect a *system* defect; no PRs with failing checks; recent cycles already addressed the open themes) AND the project is in a known wait state (a `needs:human` gate is open, or the milestone is parked).
+- **If idle, prefer a no-op cycle.** Record a brief assessment (a comment on the relevant tracking issue, or simply the run's own output) noting the system is healthy and why no change was made, and STOP. Do not open a PR.
+- **Before touching the evolver's own plumbing again, check it isn't already-tracked or already-fixed.** If the root cause lives upstream (genesis) and an issue exists, that's the resolution — don't re-fix it locally cycle after cycle.
+- **Reserve idle cycles for durable, one-time improvements only** — a genuine new guardrail, a missing test, a memory entry capturing a non-obvious lesson — not recurring micro-tweaks to the same subsystem.
 
 ## Memory Curation
 
