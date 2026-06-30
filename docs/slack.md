@@ -146,27 +146,74 @@ When the three required variables are all set, MaKlaude considers Slack
 any is missing, it falls back to the no-op notifier and the GitHub + email trail
 is unchanged.
 
-## Obtaining the tokens
+## Set up from scratch
 
-Create a Slack app at <https://api.slack.com/apps> (a manifest-based app is
-simplest), then:
+Everything an operator needs to stand this up lives in [`deploy/slack/`](../deploy/slack):
+the [app manifest](../deploy/slack/manifest.yaml) (the exact capability MaKlaude
+needs — and nothing that mutates a cluster), the
+[`setup.sh`](../deploy/slack/setup.sh) channel provisioner, and an
+[env example](../deploy/slack/slack.env.example).
 
-1. **Enable Socket Mode** (Settings → Socket Mode) and generate an **app-level
-   token** with the `connections:write` scope. This is `MAKLAUDE_SLACK_APP_TOKEN`
-   (`xapp-…`).
-2. **Add bot scopes** (Features → OAuth & Permissions → Bot Token Scopes). For
-   posting escalation threads the live backend will need at least `chat:write`;
-   `channels:read`/`groups:read` help resolve a `#name` to a channel ID.
-3. **Install the app to your workspace** and copy the **Bot User OAuth Token**
-   (`xoxb-…`) into `MAKLAUDE_SLACK_BOT_TOKEN`.
-4. **Invite the bot to the channel** you set in `MAKLAUDE_SLACK_CHANNEL` so it
-   can post there (`/invite @your-app`).
-5. (Optional, HTTP mode only) Copy the **Signing Secret** (Settings → Basic
-   Information → App Credentials) into `MAKLAUDE_SLACK_SIGNING_SECRET`.
+**1 — Create the Slack app from the manifest.** Go to
+<https://api.slack.com/apps> → **Create New App** → **From a manifest** → pick
+your workspace → paste [`deploy/slack/manifest.yaml`](../deploy/slack/manifest.yaml)
+→ **Create**. The manifest turns on Socket Mode, declares the bot scopes
+(`chat:write`, `channels:read`, `channels:join`, `channels:history`,
+`channels:manage`, and the `groups:*` parity scopes for private channels), and
+subscribes to the `message.channels` / `message.groups` events the inbound
+listener consumes. The manifest is the **single source of truth** for what
+MaKlaude requests — the scope rationale is documented inline in that file.
 
-> Treat all three tokens/secrets as credentials: supply them via your secret
-> manager or process environment at runtime, keep them out of version control,
-> and never paste them into logs, issues, or config files committed to the repo.
+**2 — Mint the two tokens** (a manifest can't carry secrets):
+
+| Token | Where | Env var |
+| ----- | ----- | ------- |
+| App-level token (`xapp-…`), scope `connections:write` | Basic Information → App-Level Tokens → Generate | `MAKLAUDE_SLACK_APP_TOKEN` |
+| Bot User OAuth Token (`xoxb-…`) | OAuth & Permissions → Install to Workspace → copy | `MAKLAUDE_SLACK_BOT_TOKEN` |
+
+(Signing secret — Basic Information → App Credentials — is **only** needed for the
+optional HTTP Events API mode; in the default Socket Mode you can skip it.)
+
+**3 — Provision the channel.** With the bot token exported, run the provisioner.
+It is idempotent: it resolves the channel by name, creates it if missing, joins
+the bot, invites the operator, and (with `--verify`) posts a throwaway
+escalation→update→resolution thread to prove delivery + threading. It prints the
+`MAKLAUDE_SLACK_CHANNEL` line to wire in and never prints the token.
+
+```sh
+export MAKLAUDE_SLACK_BOT_TOKEN=xoxb-…
+deploy/slack/setup.sh --channel maklaude --operator U0123456789 --verify
+```
+
+**4 — Wire the environment.** Copy
+[`deploy/slack/slack.env.example`](../deploy/slack/slack.env.example) to a local,
+**gitignored** file, fill in the two tokens plus the channel ID from step 3, and
+`source` it before running MaKlaude:
+
+```sh
+cp deploy/slack/slack.env.example .env.slack.local   # .env.* is gitignored
+# …edit in the real values…
+set -a; source .env.slack.local; set +a
+```
+
+> Treat all tokens/secrets as credentials: supply them via your secret manager or
+> process environment at runtime, keep them out of version control, and never
+> paste them into logs, issues, or config files committed to the repo.
+
+### Verify end-to-end against the live workspace
+
+`setup.sh --verify` proves the bot token + channel. To exercise **MaKlaude's own
+notifier** (thread root → threaded update → threaded resolution, plus the
+`needs:human` @-mention) against the live workspace, run the skip-gated manual
+test:
+
+```sh
+set -a; source .env.slack.local; set +a
+MAKLAUDE_SLACK_LIVE=1 go test -run TestLiveSlackManual ./internal/notify -v -count=1
+```
+
+It is skipped by default (no `MAKLAUDE_SLACK_LIVE=1`), so it never runs in CI or
+`task test`.
 
 ## Unconfigured ⇒ clean fallback
 

@@ -14,3 +14,8 @@ coverage.html
 # Go workspace
 go.work
 go.work.sum
+
+# Local-only secrets (Slack live test)
+.env
+.env.*
+!.env.example

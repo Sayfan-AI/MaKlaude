@@ -1,0 +1,70 @@
+# MaKlaude Slack app manifest.
+#
+# Create the app from this file in one step:
+#   https://api.slack.com/apps → Create New App → From a manifest →
+#   pick your workspace → paste this YAML → Create.
+#
+# This encodes exactly the capability MaKlaude needs and NOTHING that mutates a
+# cluster — Slack is comms-only (see docs/slack.md). After creating the app, do
+# the three manual steps the manifest can't carry (they mint secrets):
+#
+#   1. Basic Information → App-Level Tokens → Generate Token and Scopes:
+#        scope `connections:write`  → this is MAKLAUDE_SLACK_APP_TOKEN (xapp-…).
+#   2. OAuth & Permissions → Install to Workspace → copy the
+#        Bot User OAuth Token      → this is MAKLAUDE_SLACK_BOT_TOKEN (xoxb-…).
+#   3. (HTTP Events API mode only — NOT needed for the default Socket Mode)
+#        Basic Information → App Credentials → Signing Secret
+#                                  → this is MAKLAUDE_SLACK_SIGNING_SECRET.
+#
+# Then run deploy/slack/setup.sh to create/resolve the #maklaude channel and
+# print the MAKLAUDE_SLACK_CHANNEL export. See docs/slack.md for the full walk.
+
+display_information:
+  name: MaKlaude
+  description: Autonomous Kubernetes operations — escalations and ChatOps (comms-only; never mutates a cluster)
+  background_color: "#1f2d3d"
+
+features:
+  bot_user:
+    # The handle MaKlaude posts as. Channel is configured separately via
+    # MAKLAUDE_SLACK_CHANNEL; the bot is not bound to any one channel here.
+    display_name: maklaude
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      # --- Outbound (required): post escalation threads and threaded replies ---
+      - chat:write
+      # --- Resolve a "#name" channel to its ID, list channels, check membership ---
+      - channels:read
+      # --- Join the target public channel so the bot can post there ---
+      - channels:join
+      # --- Inbound listener: read replies in escalation threads (Socket Mode) ---
+      - channels:history
+      # --- Setup convenience: let deploy/slack/setup.sh create the channel ---
+      - channels:manage
+      # --- Private-channel parity (only if MAKLAUDE_SLACK_CHANNEL is private) ---
+      - groups:read
+      - groups:history
+      - groups:write
+
+settings:
+  event_subscriptions:
+    # Socket Mode delivers these events over the WebSocket — no public request_url.
+    # MaKlaude's inbound listener only acts on human replies inside a thread; all
+    # other events are dropped (see internal/notify/slack_inbound.go).
+    bot_events:
+      - message.channels
+      - message.groups
+  interactivity:
+    # MaKlaude uses no buttons/modals — inbound is plain-text replies only.
+    is_enabled: false
+  org_deploy_enabled: false
+  # Socket Mode is the approved default inbound transport: an app-level token
+  # opens an outbound WebSocket, so MaKlaude needs no public HTTP endpoint and no
+  # inbound firewall changes. Flip to false and add a request_url only if you run
+  # the optional HTTP Events API mode instead (then MAKLAUDE_SLACK_SIGNING_SECRET
+  # becomes required — every request is signature-verified).
+  socket_mode_enabled: true
+  token_rotation_enabled: false
