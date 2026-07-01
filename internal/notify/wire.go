@@ -1,6 +1,9 @@
 package notify
 
-import "os"
+import (
+	"os"
+	"strings"
+)
 
 // NotifierFromEnv selects the chat notifier for the running process based on the
 // MAKLAUDE_SLACK_* environment (see [SlackConfig]). It is the single seam the
@@ -27,7 +30,29 @@ import "os"
 // before notifying: notifier.NotifyEscalation(...) is always valid, and when not
 // configured it simply discards.
 func NotifierFromEnv() (notifier Notifier, live bool) {
+	return NotifierFromEnvWithIssueBaseURL("")
+}
+
+// NotifierFromEnvWithIssueBaseURL is [NotifierFromEnv] plus the WEB base URL of the
+// backing issue tracker's issues path (e.g. "https://github.com/OWNER/REPO/issues"),
+// so a configured Slack deployment renders the backing issue as a CLICKABLE Slack
+// hyperlink an operator can click straight through (issue #58).
+//
+// It exists because `notify` must NOT import `escalate` (import cycle), so the
+// owner/repo that determines this URL lives in the GitHub config, not the Slack
+// environment. The wiring layer that sees BOTH configs
+// ([github.com/Sayfan-AI/MaKlaude/internal/escalate.EscalatorFromEnv]) derives the
+// URL from the GitHub config and threads it in here, keeping `notify` free of
+// `escalate`.
+//
+// issueBaseURL is a non-secret; it is only stored on the config and never logged as
+// a credential. When empty (the URL is unknown, or Slack is unconfigured) the
+// escalation text degrades to the previous plain "#NNN" form and every other path
+// is unchanged versus [NotifierFromEnv], so an unconfigured deployment still
+// behaves exactly as it did before.
+func NotifierFromEnvWithIssueBaseURL(issueBaseURL string) (notifier Notifier, live bool) {
 	cfg := SlackConfigFromEnv(os.Getenv)
+	cfg.IssueBaseURL = strings.TrimSpace(issueBaseURL)
 	if sn, ok := NewSlackNotifier(cfg, nil); ok {
 		return sn, true
 	}

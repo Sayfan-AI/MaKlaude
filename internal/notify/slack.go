@@ -55,6 +55,23 @@ type SlackConfig struct {
 	// optional: when empty, escalations post without an @-mention (no behavior
 	// change). See [SlackConfig.mentionPrefix].
 	Operator string
+
+	// IssueBaseURL is the WEB base URL of the backing issue tracker's issues path
+	// (e.g. "https://github.com/OWNER/REPO/issues"), used to render the backing
+	// GitHub issue as a CLICKABLE Slack hyperlink in escalation posts so an operator
+	// can click straight through to the tracked issue (issue #58). It is NOT a
+	// secret.
+	//
+	// It is deliberately NOT read from the Slack environment: `notify` must not
+	// import `escalate`, so the owner/repo lives in the GitHub config. The wiring
+	// layer that sees both configs ([github.com/Sayfan-AI/MaKlaude/internal/escalate.EscalatorFromEnv])
+	// derives this from the GitHub config and threads it in via
+	// [NotifierFromEnvWithIssueBaseURL], keeping `notify` free of `escalate`.
+	//
+	// When empty (unknown / unconfigured, as in every unit test that does not set
+	// it), escalation text degrades gracefully to the previous plain "#NNN" form,
+	// so behavior is unchanged when it is not supplied.
+	IssueBaseURL string
 }
 
 // Configured reports whether the config carries the minimum needed to talk to
@@ -146,6 +163,7 @@ func (c SlackConfig) Redacted() SlackConfig {
 		SigningSecret: redact(c.SigningSecret),
 		Channel:       c.Channel,
 		Operator:      c.Operator,
+		IssueBaseURL:  c.IssueBaseURL,
 	}
 }
 
@@ -168,6 +186,7 @@ func (c SlackConfig) String() string {
 	b.WriteString(" SigningSecret:" + set(c.SigningSecret))
 	b.WriteString(" Channel:" + quoteChannel(c.Channel))
 	b.WriteString(" Operator:" + quoteChannel(c.Operator))
+	b.WriteString(" IssueBaseURL:" + quoteChannel(c.IssueBaseURL))
 	b.WriteString(" Configured:")
 	if c.Configured() {
 		b.WriteString("true")
