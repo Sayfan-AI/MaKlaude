@@ -71,6 +71,33 @@ func GitHubConfigFromEnv(getenv func(string) string) GitHubConfig {
 	}
 }
 
+// IssueBaseURL derives the WEB base URL of this repo's issues path — the URL a
+// human opens in a browser, e.g. "https://github.com/OWNER/REPO/issues" — so the
+// comms layer can render a backing issue as a clickable link that opens the tracked
+// issue (issue #58). It returns empty when owner or repo is unknown, so callers
+// degrade gracefully to a non-linked reference.
+//
+// The web host is NOT the REST API host: on github.com the API lives at
+// api.github.com while issues live at github.com, so the default web host is
+// "https://github.com". For GitHub Enterprise, where APIBase is set (typically
+// "https://HOST/api/v3"), the web host is the scheme+host of that API base
+// ("https://HOST"), which is where GHE serves both the API and the web UI. This
+// keeps the derivation self-hosting-aware without a second config knob.
+func (c GitHubConfig) IssueBaseURL() string {
+	owner := strings.TrimSpace(c.Owner)
+	repo := strings.TrimSpace(c.Repo)
+	if owner == "" || repo == "" {
+		return ""
+	}
+	host := "https://github.com"
+	if api := strings.TrimSpace(c.APIBase); api != "" {
+		if u, err := url.Parse(api); err == nil && u.Scheme != "" && u.Host != "" {
+			host = u.Scheme + "://" + u.Host
+		}
+	}
+	return host + "/" + owner + "/" + repo + "/issues"
+}
+
 // splitRepo parses an "owner/repo" string into its parts, tolerating leading or
 // trailing whitespace and returning empties for a malformed value.
 func splitRepo(s string) (owner, repo string) {

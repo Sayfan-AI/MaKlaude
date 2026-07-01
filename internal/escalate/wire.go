@@ -41,9 +41,19 @@ func SinkFromEnv() (sink IssueSink, live bool) {
 // The returned live reflects the GITHUB trail (the auditable source of truth), not
 // chat: an unconfigured Slack backend simply yields a [notify.NopNotifier] and the
 // system degrades to exactly the Milestone 1 GitHub + email behavior.
+//
+// This is also the layer that gives the chat notifier the WEB URL of the issue
+// tracker so a Slack escalation can render its backing issue as a CLICKABLE link
+// (issue #58): it derives the URL from the GitHub config (via
+// [GitHubConfig.IssueBaseURL]) — the only config that knows owner/repo — and threads
+// it in through [notify.NotifierFromEnvWithIssueBaseURL]. `notify` therefore never
+// needs to import `escalate` to learn where the issues live. When GitHub is
+// unconfigured the derived URL is empty and the notifier degrades to the previous
+// plain "#NNN" text, so nothing changes for a credential-less deployment.
 func EscalatorFromEnv() (esc *Escalator, live bool) {
 	sink, live := SinkFromEnv()
-	notifier, _ := notify.NotifierFromEnv()
+	issueBaseURL := GitHubConfigFromEnv(os.Getenv).IssueBaseURL()
+	notifier, _ := notify.NotifierFromEnvWithIssueBaseURL(issueBaseURL)
 	return NewEscalatorWithNotifier(sink, notifier), live
 }
 

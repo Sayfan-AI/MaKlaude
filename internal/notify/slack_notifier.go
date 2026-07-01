@@ -172,7 +172,7 @@ func (s *SlackNotifier) NotifyEscalation(ctx context.Context, id detect.Identity
 	if needsHuman {
 		mention = s.cfg.mentionPrefix()
 	}
-	text := escalationText(id, summary, ref, mention)
+	text := escalationText(id, summary, ref, mention, s.cfg.IssueBaseURL)
 	ts, err := s.post(ctx, text, "")
 	if err != nil {
 		return "", fmt.Errorf("notify/slack: posting escalation for %q: %w", id, err)
@@ -346,7 +346,14 @@ func redactedSlackError(code string) string {
 // interface passes only the summary), and a link back to the backing GitHub issue
 // when one exists. mention is the already-rendered Slack mention token (or empty
 // to omit it); the caller decides whether to supply one based on needs:human.
-func escalationText(id detect.Identity, summary, ref, mention string) string {
+//
+// issueBaseURL is the WEB base URL of the issue tracker's issues path (e.g.
+// "https://github.com/OWNER/REPO/issues"); when set, the backing issue is rendered
+// as a CLICKABLE Slack hyperlink so the operator can click straight through to the
+// tracked issue (issue #58). When it is empty (unknown / unconfigured) the issue
+// degrades to the previous plain "#NNN" text, so behavior is unchanged when the URL
+// is not supplied. See [issueLink].
+func escalationText(id detect.Identity, summary, ref, mention, issueBaseURL string) string {
 	var b strings.Builder
 	b.WriteString(":rotating_light: *MaKlaude escalation*")
 	if cluster := clusterOf(id); cluster != "" {
@@ -359,11 +366,36 @@ func escalationText(id detect.Identity, summary, ref, mention string) string {
 	}
 	b.WriteString("\n")
 	b.WriteString(strings.TrimSpace(summary))
-	if r := strings.TrimSpace(ref); r != "" {
-		b.WriteString("\nBacking issue: #" + r)
+	if link := issueLink(ref, issueBaseURL); link != "" {
+		b.WriteString("\nBacking issue: " + link)
 	}
 	b.WriteString("\n_MaKlaude takes no mutating action without human approval._")
 	return b.String()
+}
+
+// issueLink renders the backing issue reference for the escalation body. ref is
+// the backing issue number (tolerating an optional leading "#"); it returns empty
+// when no reference exists so the caller omits the line entirely.
+//
+// When baseURL is set it produces a CLICKABLE Slack mrkdwn hyperlink in Slack's
+// "<url|label>" form — e.g. "<https://github.com/OWNER/REPO/issues/42|#42>" — so a
+// click opens the tracked issue (issue #58). When baseURL is empty (the issue
+// tracker's web URL is unknown, e.g. an unconfigured deployment or a unit test that
+// does not set it) it degrades to the previous plain "#42" text, keeping behavior
+// identical when the URL is not supplied. The base URL is a non-secret, constant
+// endpoint, so it is safe to embed verbatim.
+func issueLink(ref, baseURL string) string {
+	num := strings.TrimPrefix(strings.TrimSpace(ref), "#")
+	if num == "" {
+		return ""
+	}
+	label := "#" + num
+	base := strings.TrimSpace(baseURL)
+	if base == "" {
+		return label
+	}
+	url := strings.TrimRight(base, "/") + "/" + num
+	return "<" + url + "|" + label + ">"
 }
 
 // updateText renders a recurrence/update reply. When the parent thread is unknown

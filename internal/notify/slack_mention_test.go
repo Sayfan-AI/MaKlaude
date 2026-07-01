@@ -41,7 +41,7 @@ func TestSlackConfig_MentionPrefix(t *testing.T) {
 func TestEscalationText_MentionOnNeedsHuman(t *testing.T) {
 	id := detect.Identity("prod|pod.crashloop|pod/team/api")
 
-	withMention := escalationText(id, "Pod crashlooping", "42", "<@U42>")
+	withMention := escalationText(id, "Pod crashlooping", "42", "<@U42>", "")
 	if !strings.Contains(withMention, "<@U42>") {
 		t.Errorf("needs:human escalation should @-mention the operator: %q", withMention)
 	}
@@ -49,7 +49,7 @@ func TestEscalationText_MentionOnNeedsHuman(t *testing.T) {
 		t.Errorf("needs:human escalation should label itself: %q", withMention)
 	}
 
-	noMention := escalationText(id, "Pod crashlooping", "42", "")
+	noMention := escalationText(id, "Pod crashlooping", "42", "", "")
 	if strings.Contains(noMention, "<@") || strings.Contains(noMention, "needs:human") {
 		t.Errorf("non-needs:human escalation must not @-mention: %q", noMention)
 	}

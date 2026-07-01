@@ -34,6 +34,49 @@ func TestGitHubConfig_Configured(t *testing.T) {
 	}
 }
 
+// TestGitHubConfig_IssueBaseURL is the derivation test behind issue #58: the web
+// URL of the issues path is derived from owner/repo (github.com by default) and
+// from the API host for GitHub Enterprise, and is empty when owner/repo is unknown
+// so the comms layer degrades to a non-linked reference.
+func TestGitHubConfig_IssueBaseURL(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  GitHubConfig
+		want string
+	}{
+		{
+			name: "public github default web host",
+			cfg:  GitHubConfig{Owner: "acme", Repo: "clusters"},
+			want: "https://github.com/acme/clusters/issues",
+		},
+		{
+			name: "GHE derives web host from API base",
+			cfg:  GitHubConfig{Owner: "acme", Repo: "clusters", APIBase: "https://github.acme.example/api/v3"},
+			want: "https://github.acme.example/acme/clusters/issues",
+		},
+		{
+			name: "GHE API base with trailing slash",
+			cfg:  GitHubConfig{Owner: "acme", Repo: "clusters", APIBase: "https://github.acme.example/api/v3/"},
+			want: "https://github.acme.example/acme/clusters/issues",
+		},
+		{
+			name: "unparseable API base falls back to github.com",
+			cfg:  GitHubConfig{Owner: "acme", Repo: "clusters", APIBase: "::not-a-url::"},
+			want: "https://github.com/acme/clusters/issues",
+		},
+		{"missing owner yields empty", GitHubConfig{Repo: "clusters"}, ""},
+		{"missing repo yields empty", GitHubConfig{Owner: "acme"}, ""},
+		{"empty config yields empty", GitHubConfig{}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.cfg.IssueBaseURL(); got != c.want {
+				t.Errorf("IssueBaseURL() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestGitHubConfigFromEnv(t *testing.T) {
 	env := map[string]string{
 		"MAKLAUDE_GITHUB_REPO":  "acme/clusters",

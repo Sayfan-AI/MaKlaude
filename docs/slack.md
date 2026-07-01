@@ -38,7 +38,7 @@ MaKlaude models each problem as a conversation, keyed by the same stable
 
 | Lifecycle step | `Notifier` method | What the live backend does |
 | -------------- | ----------------- | ----------------------------- |
-| Problem first escalated | `NotifyEscalation` | Post a top-level message — the thread root — linking back to the GitHub issue, and return its `thread_ts`. A **needs:human** escalation also @-mentions the configured operator so a mobile push fires |
+| Problem first escalated | `NotifyEscalation` | Post a top-level message — the thread root — with a **clickable link** to the backing GitHub issue, and return its `thread_ts`. A **needs:human** escalation also @-mentions the configured operator so a mobile push fires |
 | Problem recurs / changes | `NotifyUpdate` | Reply into the same thread (using the recovered `thread_ts`) |
 | Problem clears | `NotifyResolution` | Post a closing reply into the same thread |
 
@@ -52,6 +52,30 @@ a direct mention as a notification, so the operator gets a real ping — includi
 escalations are recorded without a mention. When no operator is configured the
 post simply carries no mention (no behavior change). The mention is purely a
 notification; it triggers **no** action.
+
+### Backing issue rendered as a clickable link
+
+So an operator can click straight through from a Slack escalation to the tracked
+GitHub issue (issue #58), the backing issue is rendered as a **clickable Slack
+hyperlink** — Slack's `<url|label>` mrkdwn form, e.g.
+`<https://github.com/OWNER/REPO/issues/42|#42>`, which shows as `#42` and opens the
+issue on click — rather than the plain, non-clickable `#42` text Slack would
+otherwise leave inert.
+
+The web URL is derived at the wiring layer from the **GitHub config**
+(`GitHubConfig.IssueBaseURL`), the only config that knows owner/repo, and threaded
+into the notifier via `notify.NotifierFromEnvWithIssueBaseURL`, so `notify` never
+imports `escalate`. For **GitHub Enterprise**, the web host is derived from
+`MAKLAUDE_GITHUB_API`'s host (`https://HOST`); otherwise it defaults to
+`https://github.com`. No new environment variable is introduced — the link is a
+non-secret, derived value. When the web URL is unknown (GitHub unconfigured), the
+escalation **degrades gracefully** to the previous plain `#NNN` text, so behavior is
+unchanged for a credential-less deployment.
+
+> The **GitHub-side** trail is already clickable: GitHub natively auto-links a
+> `#NNN` reference to an issue in the same repo, and MaKlaude opens its issues in
+> that same repo, so no change is needed there. The gap this closes is Slack, where
+> `#NNN` is inert text unless rendered as an explicit link.
 
 ## Inbound: replies understood in context
 

@@ -301,6 +301,101 @@ func TestSlackNotifier_NoTokenInPayloadBody(t *testing.T) {
 	}
 }
 
+// TestEscalationText_ClickableIssueLink proves the issue #58 behavior at the text
+// layer: when an IssueBaseURL is known the backing issue renders as a CLICKABLE
+// Slack mrkdwn hyperlink (<url/NNN|#NNN>) so an operator clicks straight through,
+// and when it is empty the text degrades to the previous plain "#NNN" (no behavior
+// change). An absent ref renders no backing-issue line in either case.
+func TestEscalationText_ClickableIssueLink(t *testing.T) {
+	id := detect.Identity("prod|pod.crashloop|pod/team/api")
+
+	// With a base URL: a clickable <url|#NNN> link that opens the tracked issue.
+	linked := escalationText(id, "Pod crashlooping", "42", "", "https://github.com/acme/clusters/issues")
+	if want := "<https://github.com/acme/clusters/issues/42|#42>"; !strings.Contains(linked, want) {
+		t.Errorf("escalation text should carry a clickable issue link %q; got %q", want, linked)
+	}
+
+	// Without a base URL: the previous plain "#NNN" text (graceful degradation), and
+	// crucially NOT a link.
+	plain := escalationText(id, "Pod crashlooping", "42", "", "")
+	if !strings.Contains(plain, "Backing issue: #42") {
+		t.Errorf("unlinked escalation should keep plain #42 text; got %q", plain)
+	}
+	if strings.Contains(plain, "<http") || strings.Contains(plain, "|#42>") {
+		t.Errorf("unlinked escalation must not render a Slack link; got %q", plain)
+	}
+
+	// A trailing slash on the base URL must not double up before the number.
+	trimmed := escalationText(id, "Pod crashlooping", "7", "", "https://github.com/acme/clusters/issues/")
+	if want := "<https://github.com/acme/clusters/issues/7|#7>"; !strings.Contains(trimmed, want) {
+		t.Errorf("trailing slash on base URL should be normalized; got %q", trimmed)
+	}
+
+	// No ref => no backing-issue line at all, with or without a base URL.
+	for _, base := range []string{"", "https://github.com/acme/clusters/issues"} {
+		if txt := escalationText(id, "Pod crashlooping", "", "", base); strings.Contains(txt, "Backing issue") {
+			t.Errorf("empty ref must render no backing-issue line (base=%q); got %q", base, txt)
+		}
+	}
+}
+
+// TestSlackNotifier_PostsClickableIssueLink proves the clickable link travels all
+// the way into the posted chat.postMessage payload when the notifier is configured
+// with an IssueBaseURL, exercising the whole notifier with zero network.
+func TestSlackNotifier_PostsClickableIssueLink(t *testing.T) {
+	ctx := context.Background()
+
+	cfg := testConfig()
+	cfg.IssueBaseURL = "https://github.com/acme/clusters/issues"
+	fake := &fakeSlack{tsQueue: []string{"111.000001"}}
+	sn, ok := NewSlackNotifier(cfg, fake)
+	if !ok {
+		t.Fatal("configured SlackConfig must yield a notifier")
+	}
+
+	id := detect.Identity("prod|pod.crashloop|pod/team/api")
+	if _, err := sn.NotifyEscalation(ctx, id, "Pod crashlooping", "42", false); err != nil {
+		t.Fatalf("NotifyEscalation: %v", err)
+	}
+
+	rootText, _ := fake.requests[0].body["text"].(string)
+	if want := "<https://github.com/acme/clusters/issues/42|#42>"; !strings.Contains(rootText, want) {
+		t.Errorf("posted root should carry the clickable issue link %q; got %q", want, rootText)
+	}
+
+	// With no IssueBaseURL configured the posted payload keeps the plain #NNN text.
+	fake2 := &fakeSlack{tsQueue: []string{"222.000002"}}
+	sn2, _ := NewSlackNotifier(testConfig(), fake2) // testConfig() sets no IssueBaseURL
+	if _, err := sn2.NotifyEscalation(ctx, id, "Pod crashlooping", "42", false); err != nil {
+		t.Fatalf("NotifyEscalation (no base URL): %v", err)
+	}
+	plainText, _ := fake2.requests[0].body["text"].(string)
+	if !strings.Contains(plainText, "Backing issue: #42") || strings.Contains(plainText, "|#42>") {
+		t.Errorf("unconfigured base URL should post plain #42; got %q", plainText)
+	}
+}
+
+// TestNotifierFromEnvWithIssueBaseURL proves the wiring seam threads the issue base
+// URL onto the live notifier's config (so escalate can pass a GitHub-derived URL in
+// without notify importing escalate), and that an empty URL is a no-op.
+func TestNotifierFromEnvWithIssueBaseURL(t *testing.T) {
+	t.Setenv("MAKLAUDE_SLACK_BOT_TOKEN", "xoxb-test")
+	t.Setenv("MAKLAUDE_SLACK_APP_TOKEN", "xapp-test")
+	t.Setenv("MAKLAUDE_SLACK_CHANNEL", "C0123456789")
+
+	notifier, live := NotifierFromEnvWithIssueBaseURL("https://github.com/acme/clusters/issues")
+	if !live {
+		t.Fatal("configured Slack env must yield a live notifier")
+	}
+	sn, ok := notifier.(*SlackNotifier)
+	if !ok {
+		t.Fatalf("expected a *SlackNotifier, got %T", notifier)
+	}
+	if got := sn.cfg.IssueBaseURL; got != "https://github.com/acme/clusters/issues" {
+		t.Errorf("issue base URL not threaded onto config; got %q", got)
+	}
+}
+
 // TestNewSlackNotifier_GracefulDegradation proves the construction seam: an
 // unconfigured config yields no notifier (caller falls back to no-op), a
 // configured one yields a live notifier.
