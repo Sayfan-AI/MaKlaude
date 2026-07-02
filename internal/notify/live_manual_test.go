@@ -20,6 +20,10 @@ func TestLiveSlackManual(t *testing.T) {
 	}
 
 	cfg := SlackConfigFromEnv(os.Getenv)
+	// Production wires the repo's issue base URL through escalate/wire.go so the
+	// backing issue renders as a clickable <url|#NNN> link. SlackConfigFromEnv can't
+	// know it, so set it here to exercise that path (unset falls back to plain #NNN).
+	cfg.IssueBaseURL = "https://github.com/Sayfan-AI/MaKlaude/issues"
 	if !cfg.Configured() {
 		t.Fatalf("slack not configured: %s", cfg)
 	}
@@ -35,7 +39,7 @@ func TestLiveSlackManual(t *testing.T) {
 
 	ts, err := sn.NotifyEscalation(ctx, id,
 		"demo: pod web-7c9 CrashLoopBackOff in ns demo (4 restarts)",
-		"https://github.com/Sayfan-AI/MaKlaude/issues/50", true /* needsHuman → @-mention */)
+		"#50", true /* needsHuman → @-mention */)
 	if err != nil {
 		t.Fatalf("NotifyEscalation: %v", err)
 	}
