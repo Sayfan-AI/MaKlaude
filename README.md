@@ -14,6 +14,10 @@ Important boundary: humans configure which clusters MaKlaude monitors and operat
 
 Treat the well-known "multi-agent Kubernetes DevOps" pattern (a coordinator delegating to specialized analyze / remediate / communicate roles) as inspiration only — feel free to surpass it. Aim higher than a minimal demo: build something an operator would actually trust with real clusters.
 
+## Documentation
+
+Full operator and architecture docs live in [`docs/`](docs/index.md). Start with [`docs/index.md`](docs/index.md) for the doc map and a suggested reading order.
+
 
 ## Setup
 
