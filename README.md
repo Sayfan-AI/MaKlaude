@@ -19,6 +19,17 @@ Treat the well-known "multi-agent Kubernetes DevOps" pattern (a coordinator dele
 Full operator and architecture docs live in [`docs/`](docs/index.md). Start with [`docs/index.md`](docs/index.md) for the doc map and a suggested reading order.
 
 
+## Architecture posture — deterministic product, AI dev system
+
+MaKlaude is two layers, and it's worth being explicit about which is which:
+
+- **The running product is deterministic Go.** The operational path — collect a read-only snapshot, `detect` findings, `correlate` them into incidents, `diagnose` ranked root causes, `escalate` to the comms trail — is rule-based code with no model in it. The same code runs in unit tests, the `kind` e2e, and production.
+- **The AI is the dev system that builds and evolves MaKlaude, not MaKlaude itself.** An orchestrator, workers, an evolver, and a human-interaction agent (Claude Code, via GitHub Actions) plan the milestones, write the code, review it behind quality gates, and improve the system over time. That's where the LLMs live.
+- **One optional, gated exception at runtime:** `internal/aidiagnose` (see below) can call a model to *refine* a diagnosis, but it's off by default, bounded, and redacted, and it degrades to the deterministic result — so even with it enabled, an LLM can only *inform* a diagnosis, never act on a cluster.
+
+The practical upshot for an operator: what runs against your clusters is deterministic and auditable. The intelligence was spent at build time, not wired into the hot path.
+
+
 ## Setup
 
 This repo runs autonomously via GitHub Actions, but **genesis ships those workflows disabled and with no secrets**. They authenticate as the Genesis GitHub App and call the Anthropic API, so running them before the credentials exist would just fail on every trigger. The repo and issue #1 already exist; the autonomous loop stays dormant until you activate it.
