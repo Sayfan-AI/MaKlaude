@@ -18,8 +18,9 @@ ClusterRole (`maklaude-readonly`). That role grants the **read triad**
 
 | API group | Resources | Verbs | Why MaKlaude reads it |
 | --------- | --------- | ----- | --------------------- |
-| `""` (core/v1) | `nodes` | get, list, watch | Node Ready / memory / disk / PID pressure & schedulability |
-| `""` (core/v1) | `pods` | get, list, watch | Pod phase, restart counts, CrashLoopBackOff detection |
+| `""` (core/v1) | `nodes` | get, list, watch | Node Ready / memory / disk / PID pressure & schedulability; allocatable cpu/memory |
+| `""` (core/v1) | `pods` | get, list, watch | Pod phase, restart counts, CrashLoopBackOff detection, node assignment, ownerReferences, per-container waiting/termination facts, resource requests; single-pod `get` before fetching that pod's logs |
+| `""` (core/v1) | `pods/log` | get | Recent, bounded container logs — fetched **lazily**, only for pods already implicated in a finding (never cluster-wide) |
 | `""` (core/v1) | `events` | get, list, watch | Recent Warning events (scheduling/image/probe failures) |
 | `""` (core/v1) | `namespaces` | get, list, watch | Namespace enumeration exposed by the read-only client |
 | `apps` (apps/v1) | `deployments` | get, list, watch | Desired / ready / available / updated replica counts |
@@ -34,7 +35,15 @@ cluster-scoped `ClusterRole` (rather than a namespaced `Role`) is required.
 
 The ClusterRole contains **no mutating verbs**. There is no `create`, `update`,
 `patch`, `delete`, or `deletecollection` anywhere in it — only `get`, `list`,
-and `watch`. It also grants **no access to `secrets` or `configmaps`**.
+and `watch` (and a `get` on the `pods/log` subresource, which is itself
+read-only: logs can only be fetched, never written). It also grants **no access
+to `secrets` or `configmaps`**.
+
+Pod logs are read **lazily and bounded**: MaKlaude only fetches a container's
+recent logs (default ~50 tailed lines, plus previous-instance logs for a
+crashlooping container) for a pod already implicated in a finding — never
+cluster-wide and never during the eager health scan. This is why `pods/log`
+carries only `get`, not `list`/`watch`.
 
 `watch` is granted even though the current collector re-`list`s each cycle. It is
 included so MaKlaude can later move to efficient informer/watch-based collection
@@ -136,6 +145,7 @@ kubectl auth can-i --list --as="$SA"
 
 # Reads MaKlaude relies on — each should print "yes".
 kubectl auth can-i list pods        --as="$SA" -A
+kubectl auth can-i get  pods/log    --as="$SA" -A
 kubectl auth can-i list nodes       --as="$SA"
 kubectl auth can-i list events      --as="$SA" -A
 kubectl auth can-i list deployments.apps --as="$SA" -A

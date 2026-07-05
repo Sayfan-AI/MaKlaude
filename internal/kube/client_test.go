@@ -14,7 +14,9 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/cluster"
 )
@@ -202,6 +204,94 @@ func TestClient_ListReadsAgainstFakeClientset(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].Reason != "BackOff" {
 		t.Fatalf("unexpected events: %+v", events)
+	}
+}
+
+// TestClient_GetPod proves the single-pod read returns the named pod from the
+// API server, exercised against a fake clientset.
+func TestClient_GetPod(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset(
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "web"}},
+	)
+	client := NewClientWithInterface("fixture", fakeClient)
+
+	pod, err := client.GetPod(context.Background(), "team", "web")
+	if err != nil {
+		t.Fatalf("GetPod failed: %v", err)
+	}
+	if pod.Namespace != "team" || pod.Name != "web" {
+		t.Fatalf("unexpected pod: %+v", pod)
+	}
+
+	_, err = client.GetPod(context.Background(), "team", "absent")
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("expected wrapped ErrUnreachable for a missing pod, got: %v", err)
+	}
+}
+
+// TestClient_PodLogs proves the log read issues a GET on the pods/log subresource
+// with the container, previous, and tail bound plumbed through, and returns the
+// (bounded) body. It asserts on the plumbing, not exact cluster output — the fake
+// clientset serves a canned body.
+func TestClient_PodLogs(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset(
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "web"}},
+	)
+	var gotOpts *corev1.PodLogOptions
+	fakeClient.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "log" {
+			return false, nil, nil
+		}
+		gotOpts, _ = action.(k8stesting.GenericAction).GetValue().(*corev1.PodLogOptions)
+		return true, &corev1.Pod{}, nil
+	})
+	client := NewClientWithInterface("fixture", fakeClient)
+
+	data, err := client.PodLogs(context.Background(), "team", "web", "app", true, 25)
+	if err != nil {
+		t.Fatalf("PodLogs failed: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("expected non-empty log body from the fake clientset")
+	}
+	if gotOpts == nil {
+		t.Fatal("expected a pods/log GET to be issued")
+	}
+	if gotOpts.Container != "app" {
+		t.Fatalf("expected container %q, got %q", "app", gotOpts.Container)
+	}
+	if !gotOpts.Previous {
+		t.Fatal("expected the previous-instance flag to be plumbed through")
+	}
+	if gotOpts.TailLines == nil || *gotOpts.TailLines != 25 {
+		t.Fatalf("expected tail bound 25 to be plumbed through, got %v", gotOpts.TailLines)
+	}
+}
+
+// TestClient_PodLogsNoTail proves a non-positive tail leaves the API tail bound
+// unset (the caller declined an explicit line bound); the byte cap still applies.
+func TestClient_PodLogsNoTail(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset(
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "web"}},
+	)
+	var gotOpts *corev1.PodLogOptions
+	fakeClient.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "log" {
+			return false, nil, nil
+		}
+		gotOpts, _ = action.(k8stesting.GenericAction).GetValue().(*corev1.PodLogOptions)
+		return true, &corev1.Pod{}, nil
+	})
+	client := NewClientWithInterface("fixture", fakeClient)
+
+	if _, err := client.PodLogs(context.Background(), "team", "web", "app", false, 0); err != nil {
+		t.Fatalf("PodLogs failed: %v", err)
+	}
+	if gotOpts == nil {
+		t.Fatal("expected a pods/log GET to be issued")
+	}
+	if gotOpts.TailLines != nil {
+		t.Fatalf("expected no tail bound for a non-positive tailLines, got %v", *gotOpts.TailLines)
 	}
 }
 

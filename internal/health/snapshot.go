@@ -110,6 +110,98 @@ type NodeSignal struct {
 	// Unschedulable reflects the node's spec: true when the node has been
 	// cordoned.
 	Unschedulable bool
+
+	// Allocatable is the node's allocatable cpu/memory as reported in its status
+	// — the resources the scheduler may hand out to pods. It is captured verbatim
+	// (as canonical quantity strings) so a downstream analyzer can compare pod
+	// requests against it when reasoning about scheduling failures. No verdict is
+	// computed here.
+	Allocatable ResourceList
+}
+
+// ResourceList captures cpu and memory quantities in canonical string form (for
+// example "500m", "256Mi"), taken directly from Kubernetes'
+// resource.Quantity.String(). Strings are used rather than parsed numbers so a
+// snapshot stays a plain, byte-comparable value; an unset quantity is the empty
+// string. It carries only facts — a request or an allocatable amount — and makes
+// no judgment about whether one fits within another.
+type ResourceList struct {
+	// CPU is the canonical cpu quantity string, empty when unset.
+	CPU string
+
+	// Memory is the canonical memory quantity string, empty when unset.
+	Memory string
+}
+
+// OwnerRef captures a single entry from a pod's ownerReferences: what controls
+// or created it. It is the backbone of correlation — it lets a downstream step
+// walk a failing pod back to its ReplicaSet, Deployment, Job, or StatefulSet
+// without re-reading the API.
+type OwnerRef struct {
+	// Kind is the owner's kind (for example "ReplicaSet", "StatefulSet", "Job").
+	Kind string
+
+	// Name is the owner's name.
+	Name string
+
+	// Controller is true when this owner is the managing controller of the pod
+	// (ownerReference.controller == true), as opposed to a mere owner.
+	Controller bool
+}
+
+// TerminationSignal captures how a container instance exited: its exit code, the
+// short reason string the kubelet recorded (for example "Error", "OOMKilled",
+// "Completed"), and the signal number when the process was killed by a signal.
+// It mirrors a container's terminated state verbatim and assigns no severity.
+type TerminationSignal struct {
+	// ExitCode is the process exit code of the terminated container instance.
+	ExitCode int32
+
+	// Reason is the short reason string (for example "Error", "OOMKilled").
+	Reason string
+
+	// Signal is the signal number that terminated the process, or 0 when the
+	// container exited on its own.
+	Signal int32
+}
+
+// ContainerSignal captures the per-container facts that matter for diagnosis:
+// the current waiting reason and message (for example "ImagePullBackOff",
+// "ErrImagePull", "CreateContainerConfigError", "CrashLoopBackOff"), the restart
+// count, whether the container is crashlooping, the last and current termination
+// details, and the container's resource requests. Every field is a raw fact read
+// from the pod's spec and status; no field is an assessment.
+type ContainerSignal struct {
+	// Name is the container's name; container signals are sorted by it.
+	Name string
+
+	// Init is true when this is an init container rather than a regular one.
+	Init bool
+
+	// RestartCount is the container's own restart count.
+	RestartCount int32
+
+	// CrashLooping reports whether this container is crashlooping, using the same
+	// oscillation-robust rule the collector applies elsewhere (instantaneous
+	// CrashLoopBackOff, or repeated restarts with a most-recent non-zero exit).
+	CrashLooping bool
+
+	// WaitingReason and WaitingMessage mirror the container's waiting state when
+	// it is waiting (for example reason "ImagePullBackOff"), otherwise empty.
+	WaitingReason  string
+	WaitingMessage string
+
+	// LastTermination describes how the previous instance of the container exited,
+	// when one exists; it is nil otherwise. It is the key evidence for a container
+	// that has already been replaced by a restart.
+	LastTermination *TerminationSignal
+
+	// CurrentTermination describes the current terminated state when the container
+	// is presently terminated; it is nil otherwise.
+	CurrentTermination *TerminationSignal
+
+	// Requests is the container's cpu/memory resource requests, captured verbatim.
+	Requests ResourceList
 }
 
 // PodSignal captures the lifecycle phase and per-container restart facts of a
@@ -142,6 +234,27 @@ type PodSignal struct {
 
 	// Failed is true when the pod's phase is "Failed".
 	Failed bool
+
+	// Node is the name of the node the pod is assigned to (spec.nodeName), or
+	// empty when the pod has not been scheduled yet. Together with [OwnerRef]s it
+	// is the backbone of correlation: it ties a failing pod to a node and to its
+	// controllers.
+	Node string
+
+	// Owners lists the pod's ownerReferences, sorted by (kind, name). It lets a
+	// downstream step walk a pod back to its ReplicaSet/Deployment/Job/StatefulSet.
+	Owners []OwnerRef
+
+	// Containers holds one entry per container (init and regular), sorted by name,
+	// capturing per-container waiting reasons, termination details, restart counts,
+	// crashloop state, and resource requests.
+	Containers []ContainerSignal
+
+	// Requests is the pod's aggregate cpu/memory requests — the sum of its regular
+	// containers' requests — captured as canonical quantity strings. Per-container
+	// requests (including init containers) are in [PodSignal.Containers]; this
+	// aggregate is provided for convenience. No scheduling verdict is computed.
+	Requests ResourceList
 }
 
 // DeploymentSignal captures the desired and observed replica counts of a single
