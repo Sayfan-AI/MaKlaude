@@ -539,3 +539,39 @@ func TestDiagnose_RefinerSeam(t *testing.T) {
 		}
 	}
 }
+
+// TestNewRefinedHypothesis proves the public refined-hypothesis constructor stamps
+// SourceRefined, derives the same stable identity a deterministic hypothesis for
+// that cause would have, inherits the incident's cluster and time, and copies the
+// evidence defensively so the caller cannot alias the incident's findings.
+func TestNewRefinedHypothesis(t *testing.T) {
+	s := baseSnapshot()
+	s.Nodes = []health.NodeSignal{{Name: "node-a", Ready: false}}
+	incidents := correlate.Correlate(s, detect.Analyze(s))
+	in := incidents[0]
+
+	evidence := in.Findings()
+	h := NewRefinedHypothesis(in, "customcause", ConfidenceMedium, "Custom", "explanation", evidence)
+
+	if h.Source != SourceRefined {
+		t.Fatalf("source = %q, want refined", h.Source)
+	}
+	if h.Cluster != in.Cluster || !h.DetectedAt.Equal(in.DetectedAt) {
+		t.Fatalf("did not inherit incident cluster/time")
+	}
+	if h.Identity != newHypothesisIdentity("customcause", in.Identity) {
+		t.Fatalf("identity = %q, not derived from cause+incident", h.Identity)
+	}
+	if h.Confidence != ConfidenceMedium || h.Title != "Custom" || h.Message != "explanation" {
+		t.Fatalf("fields not carried through: %+v", h)
+	}
+	// The evidence must be a defensive copy: mutating the returned slice must not
+	// reach back into the source slice.
+	if len(h.Evidence) == 0 {
+		t.Fatalf("expected evidence to be copied through")
+	}
+	h.Evidence[0] = detect.Finding{}
+	if evidence[0] == (detect.Finding{}) {
+		t.Fatalf("evidence was aliased, not copied")
+	}
+}

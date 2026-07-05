@@ -17,9 +17,26 @@ import (
 	clienttesting "k8s.io/client-go/testing"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/cluster"
+	"github.com/Sayfan-AI/MaKlaude/internal/correlate"
+	"github.com/Sayfan-AI/MaKlaude/internal/diagnose"
 	"github.com/Sayfan-AI/MaKlaude/internal/escalate"
+	"github.com/Sayfan-AI/MaKlaude/internal/health"
 	"github.com/Sayfan-AI/MaKlaude/internal/kube"
 )
+
+// markRefiner is a stub diagnose.Refiner used to prove the pipeline threads the
+// optional (T5) refiner through diagnosis: it re-stamps every hypothesis
+// SourceRefined without otherwise changing it.
+type markRefiner struct{}
+
+func (markRefiner) Refine(_ health.Snapshot, _ correlate.Incident, base []diagnose.Hypothesis) []diagnose.Hypothesis {
+	out := make([]diagnose.Hypothesis, len(base))
+	copy(out, base)
+	for i := range out {
+		out[i].Source = diagnose.SourceRefined
+	}
+	return out
+}
 
 // fixedTime is the pinned clock used so report output is reproducible.
 var fixedTime = time.Date(2026, 6, 17, 12, 0, 0, 0, time.UTC)
@@ -320,6 +337,51 @@ func TestRun_ClientBuildError_RecordedPerCluster(t *testing.T) {
 	}
 	if cr.Reachable {
 		t.Errorf("cluster should not be reachable on build error")
+	}
+}
+
+// TestRun_RefinerWiredIntoDiagnosis proves the pipeline builds a per-cycle refiner
+// and threads it into diagnosis: with a refiner supplied, the report's hypotheses
+// are stamped refined; without one (the default), they stay deterministic.
+func TestRun_RefinerWiredIntoDiagnosis(t *testing.T) {
+	sink := escalate.NewMemorySink()
+	esc := escalate.NewEscalator(sink)
+	builder := func(h *cluster.Handle) (*kube.Client, error) {
+		cs := fake.NewSimpleClientset(crashloopingPod("default", "crasher"))
+		return kube.NewClientWithInterface(h.Name(), cs), nil
+	}
+	build := func(context.Context) diagnose.Refiner { return markRefiner{} }
+	p := NewPipelineForTest(builder, esc, false, func() time.Time { return fixedTime }, build)
+
+	report, err := p.Run(context.Background(), singleClusterRegistry(t, "with-refiner"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var sawHypothesis bool
+	for _, in := range report.Clusters[0].Incidents {
+		for _, h := range in.Hypotheses {
+			sawHypothesis = true
+			if h.Source != string(diagnose.SourceRefined) {
+				t.Errorf("hypothesis source = %q, want refined (refiner should have run)", h.Source)
+			}
+		}
+	}
+	if !sawHypothesis {
+		t.Fatal("expected at least one hypothesis in the report")
+	}
+
+	// Without a refiner, the same scan yields deterministic hypotheses.
+	pPlain, _ := newFakePipeline(t, crashloopingPod("default", "crasher"))
+	plain, err := pPlain.Run(context.Background(), singleClusterRegistry(t, "no-refiner"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, in := range plain.Clusters[0].Incidents {
+		for _, h := range in.Hypotheses {
+			if h.Source != string(diagnose.SourceDeterministic) {
+				t.Errorf("without a refiner, source = %q, want deterministic", h.Source)
+			}
+		}
 	}
 }
 

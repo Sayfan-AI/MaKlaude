@@ -27,6 +27,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/Sayfan-AI/MaKlaude/internal/aidiagnose"
 	"github.com/Sayfan-AI/MaKlaude/internal/cluster"
 	"github.com/Sayfan-AI/MaKlaude/internal/correlate"
 	"github.com/Sayfan-AI/MaKlaude/internal/detect"
@@ -58,6 +59,13 @@ type Pipeline struct {
 	live bool
 	// now stamps the report; injectable so tests get reproducible output.
 	now func() time.Time
+	// newRefiner, when non-nil, mints a fresh per-cycle
+	// [github.com/Sayfan-AI/MaKlaude/internal/diagnose.Refiner] for the optional,
+	// gated LLM-assisted diagnosis layer (T5). It is nil by default — the layer is
+	// off unless a human explicitly configures it — in which case diagnosis runs
+	// the deterministic core alone, exactly as before. A fresh refiner per Run
+	// gives each scan cycle its own cost budget.
+	newRefiner aidiagnose.Builder
 }
 
 // NewPipeline builds the production pipeline: real read-only clients (with the
@@ -67,27 +75,36 @@ type Pipeline struct {
 // performs an unexpected external write.
 func NewPipeline() *Pipeline {
 	esc, live := escalate.EscalatorFromEnv()
+	refiner, _ := aidiagnose.RefinerFromEnv()
 	return &Pipeline{
-		newClient: kube.NewClient,
-		escalator: esc,
-		live:      live,
-		now:       time.Now,
+		newClient:  kube.NewClient,
+		escalator:  esc,
+		live:       live,
+		now:        time.Now,
+		newRefiner: refiner,
 	}
 }
 
 // NewPipelineForTest builds a pipeline with explicit seams for unit tests: a
 // caller-supplied client builder (typically wrapping a client-go fake clientset)
-// and escalator. now may be nil, in which case time.Now is used.
-func NewPipelineForTest(newClient clientBuilder, esc *escalate.Escalator, live bool, now func() time.Time) *Pipeline {
+// and escalator. now may be nil, in which case time.Now is used. An optional
+// [aidiagnose.Builder] wires the gated LLM-assisted diagnosis layer (T5) so its
+// end-to-end effect on the report can be exercised without a network; omit it (the
+// common case) to run the deterministic diagnosis alone.
+func NewPipelineForTest(newClient clientBuilder, esc *escalate.Escalator, live bool, now func() time.Time, refiner ...aidiagnose.Builder) *Pipeline {
 	if now == nil {
 		now = time.Now
 	}
-	return &Pipeline{
+	p := &Pipeline{
 		newClient: newClient,
 		escalator: esc,
 		live:      live,
 		now:       now,
 	}
+	if len(refiner) > 0 {
+		p.newRefiner = refiner[0]
+	}
+	return p
 }
 
 // Run scans every cluster in the registry once and returns a combined [Report].
@@ -109,8 +126,17 @@ func (p *Pipeline) Run(ctx context.Context, reg *cluster.Registry) (*Report, err
 		Live:        p.live,
 	}
 
+	// Mint one refiner for this whole scan cycle (nil when the optional T5 layer is
+	// not configured), so the cycle shares a single cost budget across every
+	// cluster and incident. It is read-only and degrades to the deterministic
+	// hypotheses on any failure, so it can never disturb a scan.
+	var refiner diagnose.Refiner
+	if p.newRefiner != nil {
+		refiner = p.newRefiner(ctx)
+	}
+
 	for _, h := range reg.Handles() {
-		report.Clusters = append(report.Clusters, p.scanCluster(ctx, h))
+		report.Clusters = append(report.Clusters, p.scanCluster(ctx, h, refiner))
 	}
 
 	report.finalize()
@@ -120,7 +146,7 @@ func (p *Pipeline) Run(ctx context.Context, reg *cluster.Registry) (*Report, err
 // scanCluster runs the full pipeline for a single cluster, never panicking and
 // always returning a populated [ClusterReport] — including on failure, where the
 // Error field explains what went wrong and the rest stays zero.
-func (p *Pipeline) scanCluster(ctx context.Context, h *cluster.Handle) ClusterReport {
+func (p *Pipeline) scanCluster(ctx context.Context, h *cluster.Handle, refiner diagnose.Refiner) ClusterReport {
 	cr := ClusterReport{Cluster: h.Name()}
 
 	client, err := p.newClient(h)
@@ -146,11 +172,18 @@ func (p *Pipeline) scanCluster(ctx context.Context, h *cluster.Handle) ClusterRe
 	cr.Findings = toFindingReports(findings)
 
 	incidents := correlate.Correlate(snap, findings)
+	// When the gated LLM layer is configured, pass the refiner so it can sharpen
+	// the deterministic hypotheses; otherwise diagnosis runs the byte-stable core
+	// alone. Either way every hypothesis carries its [diagnose.Source] marker.
+	var refiners []diagnose.Refiner
+	if refiner != nil {
+		refiners = append(refiners, refiner)
+	}
 	subjects := make([]escalate.Subject, 0, len(incidents))
 	for i := range incidents {
 		subjects = append(subjects, escalate.Subject{
 			Incident:   incidents[i],
-			Hypotheses: diagnose.Diagnose(snap, incidents[i]),
+			Hypotheses: diagnose.Diagnose(snap, incidents[i], refiners...),
 		})
 	}
 	cr.Incidents = toIncidentReports(subjects)

@@ -17,3 +17,31 @@ clusters:
   - name: staging
     kubeconfig: ~/.kube/config   # a leading "~" is expanded to your home directory
     context: staging
+
+# ---------------------------------------------------------------------------
+# OPTIONAL: LLM-assisted diagnosis (Milestone 3 / T5) — OFF BY DEFAULT.
+#
+# MaKlaude's root-cause diagnosis is deterministic and fully functional on its
+# own. You can OPTIONALLY let a Claude model *refine* those hypotheses for cases
+# the rules handle poorly. This is the one place cluster-derived data could leave
+# the process, so it is strictly gated and configured via ENVIRONMENT VARIABLES,
+# never this file — this config is secret-safe by design and must never hold an
+# API key. The layer is:
+#   - read-only          the model can only propose explanations, never actions;
+#   - redacted           secret values, tokens, and PII are stripped BEFORE egress;
+#   - cost-bounded        size/token caps, a per-cycle call budget, and timeouts;
+#   - gracefully degrading unconfigured/erroring/over-budget ⇒ deterministic output;
+#   - audited            every call's purpose and outcome is logged.
+#
+# Enable it by setting BOTH the feature flag and an API key (double opt-in):
+#   export MAKLAUDE_LLM_DIAGNOSIS=true        # explicit feature flag (off unless set)
+#   export MAKLAUDE_LLM_API_KEY=sk-ant-...    # Claude API key (or ANTHROPIC_API_KEY)
+# Optional tuning (sensible, conservative defaults apply when unset):
+#   export MAKLAUDE_LLM_MODEL=claude-sonnet-5 # model id (default: claude-sonnet-5)
+#   export MAKLAUDE_LLM_API_BASE=https://...  # API base override (proxy/gateway)
+#   export MAKLAUDE_LLM_MAX_EVIDENCE=8000     # max redacted evidence bytes per call
+#   export MAKLAUDE_LLM_MAX_TOKENS=1024       # max response tokens per call
+#   export MAKLAUDE_LLM_CALL_BUDGET=8         # max provider calls per scan cycle
+#   export MAKLAUDE_LLM_TIMEOUT=20s           # per-call timeout (Go duration)
+# With the flag unset (the default), diagnosis behaves exactly as without T5.
+# ---------------------------------------------------------------------------
