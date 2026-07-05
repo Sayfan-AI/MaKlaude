@@ -21,4 +21,6 @@ This is the map of the operator and architecture docs. If you just want to get M
 3. **[escalation.md](escalation.md)** - how MaKlaude tells you what it found and keeps that trail honest as problems recur and clear.
 4. **[slack.md](slack.md)** - only if you want a real-time, team-visible channel on top of the GitHub trail.
 
-For the code itself, the escalation model lives in [`internal/escalate`](../internal/escalate) and the notification seam in [`internal/notify`](../internal/notify).
+The optional, gated **LLM-assisted diagnosis** layer (read-only, redacted, cost-bounded, off by default) is documented in the [README](../README.md#llm-assisted-diagnosis-optional-gated); its safety posture is summarized in [no-writes.md](no-writes.md).
+
+For the code itself, the escalation model lives in [`internal/escalate`](../internal/escalate), the notification seam in [`internal/notify`](../internal/notify), deterministic diagnosis in [`internal/diagnose`](../internal/diagnose), and the optional LLM refinement in [`internal/aidiagnose`](../internal/aidiagnose).

@@ -2,6 +2,7 @@ package diagnose
 
 import (
 	"github.com/Sayfan-AI/MaKlaude/internal/correlate"
+	"github.com/Sayfan-AI/MaKlaude/internal/detect"
 	"github.com/Sayfan-AI/MaKlaude/internal/health"
 )
 
@@ -41,4 +42,44 @@ type NopRefiner struct{}
 // Refine returns base unchanged.
 func (NopRefiner) Refine(_ health.Snapshot, _ correlate.Incident, base []Hypothesis) []Hypothesis {
 	return base
+}
+
+// NewRefinedHypothesis constructs a [Hypothesis] attributed to the optional
+// fuzzy/LLM [Refiner] layer (Milestone 3 T5), for a cause the deterministic rules
+// could not themselves express. It is the public counterpart to this package's
+// internal rule constructor: it fills in the same stable identity (derived from
+// cause + the incident's already-stable identity), inherits the incident's
+// cluster and detection time (so a refined hypothesis never reads its own clock),
+// and — crucially — stamps the hypothesis [SourceRefined] so a consumer can always
+// tell it apart from a reproducible deterministic result.
+//
+// A Refiner uses it so a refined hypothesis is indistinguishable in SHAPE from a
+// deterministic one — same identity discipline, same cluster/time inheritance,
+// same evidence citation — differing only in its [Source] marker and in not being
+// guaranteed reproducible. Because identity is keyed on (cause, incident), a
+// refined hypothesis whose cause matches an existing deterministic one shares its
+// identity; a Refiner that means to ADD a distinct hypothesis should therefore use
+// a cause not already present, and one that means to REWRITE an existing one
+// should reuse that hypothesis's own identity (see the [Refiner] contract).
+//
+// The evidence slice is copied defensively so the caller cannot alias — or later
+// mutate — the incident's own findings through the returned hypothesis.
+func NewRefinedHypothesis(incident correlate.Incident, cause Cause, conf Confidence, title, message string, evidence []detect.Finding) Hypothesis {
+	var ev []detect.Finding
+	if len(evidence) > 0 {
+		ev = make([]detect.Finding, len(evidence))
+		copy(ev, evidence)
+	}
+	return Hypothesis{
+		Identity:   newHypothesisIdentity(cause, incident.Identity),
+		Incident:   incident.Identity,
+		Cluster:    incident.Cluster,
+		Cause:      cause,
+		Confidence: conf,
+		Title:      title,
+		Message:    message,
+		Evidence:   ev,
+		Source:     SourceRefined,
+		DetectedAt: incident.DetectedAt,
+	}
 }

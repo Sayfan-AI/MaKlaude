@@ -58,6 +58,9 @@ internal/          # private packages
   kube/            #   read-only Kubernetes client/transport
   health/          #   judgment-free snapshot collection (read-only)
   detect/          #   deterministic findings from a snapshot
+  correlate/       #   groups findings into incidents (root cause + effects)
+  diagnose/        #   deterministic ranked root-cause hypotheses per incident
+  aidiagnose/      #   OPTIONAL, gated LLM refinement of hypotheses (see below)
   escalate/        #   human comms trail: issue-per-problem (see below)
   scan/            #   one-shot pipeline wiring (collect -> detect -> escalate)
 test/e2e/          # end-to-end test on kind (build tag `e2e`) + seed manifests
@@ -83,6 +86,53 @@ The JSON report carries, per cluster, the reachability, the raw findings
 correlated **incidents** (each with its primary object, affected objects, and
 ranked root-cause hypotheses), and the escalation outcome (opened / updated /
 closed), plus cross-cluster totals.
+
+## LLM-assisted diagnosis (optional, gated)
+
+MaKlaude's root-cause diagnosis (`internal/diagnose`) is **deterministic** and
+ships fully functional on its own. Since M3/T5 you can **optionally** let a Claude
+model *refine* those hypotheses for cases the rules handle poorly — sharpening a
+low-confidence hypothesis, or proposing a cause the deterministic rules cannot
+express. This lives in `internal/aidiagnose` and is the **one place** where
+cluster-derived data could leave the process, so it is built as a strict,
+isolated **safety boundary** and is **off by default**:
+
+- **Read-only by construction.** The provider interface exposes exactly one
+  capability — turn a redacted text prompt into text suggestions. It holds no
+  cluster client and no mutating capability, so an LLM can *inform* a diagnosis
+  but can never act on a cluster.
+- **Redaction before egress.** Evidence is assembled from the snapshot/incident
+  and passed through a redactor at the egress boundary, stripping secret values,
+  tokens, credentials, and obvious PII **before** anything reaches the provider.
+  This is proven against seeded secrets in unit tests.
+- **Cost-bounded.** Evidence is size-capped, the response token count is capped,
+  each call is deadline-bounded, and a per-cycle call budget caps how many calls
+  one scan can make.
+- **Graceful degradation.** Unconfigured, disabled, over budget, erroring, or
+  timing out all resolve to the same safe outcome: the deterministic hypotheses,
+  unchanged. The refiner never panics and never fails a scan.
+- **Audited.** Every provider call's purpose and outcome is recorded (cluster,
+  incident, model, evidence size, outcome), and every refined hypothesis carries a
+  `refined` source marker distinct from `deterministic`, so the comms trail always
+  shows what came from a rule versus a model.
+
+It requires an explicit **double opt-in** — the feature flag *and* an API key —
+so a stray key alone does nothing. Configuration is entirely via environment
+(never the cluster config file, which stays secret-free):
+
+| Variable                   | Description                                                              |
+| -------------------------- | ------------------------------------------------------------------------ |
+| `MAKLAUDE_LLM_DIAGNOSIS`   | Feature flag; must be truthy (`true`/`1`/`yes`/…) to enable the layer.   |
+| `MAKLAUDE_LLM_API_KEY`     | Claude API key (falls back to `ANTHROPIC_API_KEY`). Never logged.        |
+| `MAKLAUDE_LLM_MODEL`       | Optional model id override (default `claude-sonnet-5`).                  |
+| `MAKLAUDE_LLM_API_BASE`    | Optional API base override (proxy / compatible gateway).                 |
+| `MAKLAUDE_LLM_MAX_EVIDENCE`| Optional cap on redacted evidence bytes per call (default 8000).         |
+| `MAKLAUDE_LLM_MAX_TOKENS`  | Optional response-token cap per call (default 1024).                     |
+| `MAKLAUDE_LLM_CALL_BUDGET` | Optional per-scan-cycle provider-call budget (default 8).                |
+| `MAKLAUDE_LLM_TIMEOUT`     | Optional per-call timeout as a Go duration (default `20s`).              |
+
+With `MAKLAUDE_LLM_DIAGNOSIS` unset (the default), diagnosis runs the byte-stable
+deterministic core alone, exactly as if T5 were absent.
 
 ## Comms trail & escalation
 

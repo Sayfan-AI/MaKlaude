@@ -12,6 +12,17 @@ exact code and tests that back each layer** so the guarantee stays verifiable
 rather than aspirational. The design is belt-and-suspenders: four independent
 layers would all have to fail before MaKlaude could mutate a cluster.
 
+> **The optional LLM-assisted diagnosis layer (T5) does not weaken this promise.**
+> When enabled (see the [README](../README.md#llm-assisted-diagnosis-optional-gated)),
+> the layer in [`internal/aidiagnose`](../internal/aidiagnose) is **read-only by
+> construction**: its provider interface can only turn a redacted text prompt into
+> text suggestions — it holds no cluster client and exposes no mutating capability,
+> so it cannot create, patch, or delete anything. It does introduce a *separate*
+> concern — the first time cluster-derived data could leave the process — which is
+> handled by its own boundary (redaction before egress, cost caps, graceful
+> degradation, and audit), documented in the README. That egress boundary is
+> orthogonal to the four no-writes layers below, which continue to hold unchanged.
+
 ## The layers
 
 | # | Layer | What it guarantees | Where it lives | What proves it |
