@@ -66,37 +66,46 @@ func NewEscalatorWithNotifier(sink IssueSink, notifier notify.Notifier) *Escalat
 	return &Escalator{sink: sink, notifier: notifier}
 }
 
-// Reconcile brings the comms trail in line with findings for one reconciliation
-// pass and reports what it did.
+// Reconcile brings the comms trail in line with the current incidents for one
+// reconciliation pass and reports what it did.
 //
-// findings should be the full current finding set the caller wants reflected in
-// the trail (typically one cluster's [detect.Analyze] output, but the function
-// is cluster-agnostic — identities already encode their cluster, so a caller may
-// pass several clusters' findings at once and isolation still holds). The
-// escalator only ever closes issues whose identity is absent from findings, so
-// passing a single cluster's findings will NOT close another cluster's issues
-// ONLY IF the caller scopes the sink per cluster or passes all clusters'
-// findings together; see [Escalator] callers for the recommended pattern.
+// subjects should be the full current set of incidents (each with its ranked
+// diagnosis) the caller wants reflected in the trail — typically one cluster's
+// [correlate.Correlate] output, each diagnosed via [diagnose.Diagnose]. The
+// function is cluster-agnostic: incident identities already encode their cluster,
+// so a caller may pass several clusters' subjects at once and isolation still
+// holds. The escalator only ever closes issues whose identity is absent from
+// subjects, so passing a single cluster's subjects will NOT close another
+// cluster's issues ONLY IF the caller scopes the sink per cluster or passes all
+// clusters' subjects together; see [Escalator] callers for the recommended
+// pattern.
 //
 // The pass is best-effort and continues past per-issue errors so one transient
 // failure does not strand the rest of the trail; all errors are aggregated and
 // returned together, with the [Outcome] still reporting the actions that
 // succeeded.
-func (e *Escalator) Reconcile(ctx context.Context, findings []detect.Finding) (Outcome, error) {
+func (e *Escalator) Reconcile(ctx context.Context, subjects []Subject) (Outcome, error) {
 	tracked, err := e.sink.ListOpen(ctx)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("escalate: listing open issues: %w", err)
 	}
 
-	plan := Reconcile(findings, tracked)
+	plan := Reconcile(subjects, tracked)
 
 	var out Outcome
 	var errs []error
 
 	for _, a := range plan {
+		// The notifier is keyed on detect.Identity (the M2 chat seam); an incident
+		// identity is an equally-opaque, equally-stable key, so it is threaded through
+		// unchanged as the notifier's dedup handle. This keeps the chat lifecycle
+		// (root/update/resolution) mapped to exactly one thread per incident without
+		// widening the notify interface.
+		notifyID := detect.Identity(a.Identity)
+
 		switch a.Kind {
 		case ActionOpen:
-			ref, err := e.sink.Create(ctx, Title(a.Finding), Body(a.Finding), LabelsFor(a.Finding))
+			ref, err := e.sink.Create(ctx, Title(a.Subject), Body(a.Subject), LabelsFor(a.Subject))
 			if err != nil {
 				errs = append(errs, fmt.Errorf("opening issue for %q: %w", a.Identity, err))
 				continue
@@ -107,35 +116,35 @@ func (e *Escalator) Reconcile(ctx context.Context, findings []detect.Finding) (O
 			// handle into the issue body so a future reconcile (even after a restart)
 			// can reply into this same thread. Both are best-effort: a chat or
 			// persistence hiccup is recorded but never strands the GitHub trail.
-			threadTS, nerr := e.notifier.NotifyEscalation(ctx, a.Identity, Title(a.Finding), string(ref), wantsHuman(a.Finding))
+			threadTS, nerr := e.notifier.NotifyEscalation(ctx, notifyID, Title(a.Subject), string(ref), wantsHuman(a.Subject))
 			if nerr != nil {
 				errs = append(errs, fmt.Errorf("notifying escalation for %q: %w", a.Identity, nerr))
 				continue
 			}
 			if threadTS != "" {
-				body := withThreadMarker(Body(a.Finding), threadTS)
-				if uerr := e.sink.Update(ctx, ref, Title(a.Finding), body, LabelsFor(a.Finding)); uerr != nil {
+				body := withThreadMarker(Body(a.Subject), threadTS)
+				if uerr := e.sink.Update(ctx, ref, Title(a.Subject), body, LabelsFor(a.Subject)); uerr != nil {
 					errs = append(errs, fmt.Errorf("persisting thread marker on %q for %q: %w", ref, a.Identity, uerr))
 				}
 			}
 
 		case ActionUpdate:
-			// Refresh the body/labels to the latest state, preserving the durable
+			// Refresh the body/labels to the latest diagnosis, preserving the durable
 			// thread marker so continuity is not lost, then record the recurrence in
 			// a comment so the timeline shows it persisting.
-			body := withThreadMarker(Body(a.Finding), a.ThreadTS)
-			if err := e.sink.Update(ctx, a.Ref, Title(a.Finding), body, LabelsFor(a.Finding)); err != nil {
+			body := withThreadMarker(Body(a.Subject), a.ThreadTS)
+			if err := e.sink.Update(ctx, a.Ref, Title(a.Subject), body, LabelsFor(a.Subject)); err != nil {
 				errs = append(errs, fmt.Errorf("updating issue %q for %q: %w", a.Ref, a.Identity, err))
 				continue
 			}
-			if err := e.sink.Comment(ctx, a.Ref, RecurrenceComment(a.Finding)); err != nil {
+			if err := e.sink.Comment(ctx, a.Ref, RecurrenceComment(a.Subject)); err != nil {
 				errs = append(errs, fmt.Errorf("commenting recurrence on %q for %q: %w", a.Ref, a.Identity, err))
 				continue
 			}
 			out.Updated++
 
 			// Mirror the recurrence into the original chat thread (recovered ts).
-			if nerr := e.notifier.NotifyUpdate(ctx, a.Identity, a.ThreadTS, RecurrenceComment(a.Finding)); nerr != nil {
+			if nerr := e.notifier.NotifyUpdate(ctx, notifyID, a.ThreadTS, RecurrenceComment(a.Subject)); nerr != nil {
 				errs = append(errs, fmt.Errorf("notifying update for %q: %w", a.Identity, nerr))
 			}
 
@@ -152,7 +161,7 @@ func (e *Escalator) Reconcile(ctx context.Context, findings []detect.Finding) (O
 			out.Closed++
 
 			// Mirror the resolution into the original chat thread (recovered ts).
-			if nerr := e.notifier.NotifyResolution(ctx, a.Identity, a.ThreadTS, ClosingComment(a.Identity)); nerr != nil {
+			if nerr := e.notifier.NotifyResolution(ctx, notifyID, a.ThreadTS, ClosingComment(a.Identity)); nerr != nil {
 				errs = append(errs, fmt.Errorf("notifying resolution for %q: %w", a.Identity, nerr))
 			}
 

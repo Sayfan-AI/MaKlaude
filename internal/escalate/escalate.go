@@ -60,27 +60,27 @@
 package escalate
 
 import (
-	"github.com/Sayfan-AI/MaKlaude/internal/detect"
+	"github.com/Sayfan-AI/MaKlaude/internal/correlate"
 )
 
 // ActionKind enumerates the three things reconciliation can decide to do to the
 // external comms trail. The set is intentionally closed and minimal: every
-// difference between "the problems that exist now" and "the issues that exist
+// difference between "the incidents that exist now" and "the issues that exist
 // now" reduces to opening, updating, or closing exactly one tracked issue.
 type ActionKind int
 
 const (
-	// ActionOpen creates a brand-new issue for a finding whose identity is not
+	// ActionOpen creates a brand-new issue for an incident whose identity is not
 	// yet tracked by any open issue.
 	ActionOpen ActionKind = iota
 
-	// ActionUpdate refreshes an already-open issue for a recurring finding: its
-	// body is rewritten to the latest state and a recurrence comment is added.
+	// ActionUpdate refreshes an already-open issue for a recurring incident: its
+	// body is rewritten to the latest diagnosis and a recurrence comment is added.
 	// This is what makes recurrence an update instead of a duplicate.
 	ActionUpdate
 
 	// ActionClose closes a tracked issue whose identity is no longer present in
-	// the current findings — the problem has cleared — leaving a closing comment
+	// the current incidents — the problem has cleared — leaving a closing comment
 	// so the trail remains auditable.
 	ActionClose
 )
@@ -102,16 +102,16 @@ func (k ActionKind) String() string {
 
 // TrackedIssue is the escalator's view of one open, MaKlaude-managed issue in
 // the external comms system. It is a plain value carrying just enough to drive
-// reconciliation: the identity it represents (parsed from the issue's hidden
-// marker) and the sink-specific handle used to comment on or close it.
+// reconciliation: the incident identity it represents (parsed from the issue's
+// hidden marker) and the sink-specific handle used to comment on or close it.
 //
 // It deliberately does NOT carry the issue's full body or history — reconcile
 // decides what to do from the identity alone, and the body it would write is
-// derived freshly from the current finding.
+// derived freshly from the current incident and its diagnosis.
 type TrackedIssue struct {
-	// Identity is the problem this issue represents, recovered from the issue's
-	// embedded marker. It is the join key against current findings.
-	Identity detect.Identity
+	// Identity is the incident this issue represents, recovered from the issue's
+	// embedded marker. It is the join key against current subjects.
+	Identity correlate.IncidentIdentity
 
 	// Ref is the sink-specific reference to the live issue (for example its
 	// number). The reconcile core treats it as an opaque value; only the sink
@@ -134,20 +134,21 @@ type TrackedIssue struct {
 type IssueRef string
 
 // Action is one unit of work the [Escalator] should perform against the sink to
-// bring the comms trail in line with the current findings. It is produced only
+// bring the comms trail in line with the current incidents. It is produced only
 // by [Reconcile] and consumed only by the escalator; it is a pure description,
 // not the side effect itself.
 type Action struct {
 	// Kind is what to do (open, update, or close).
 	Kind ActionKind
 
-	// Identity is the problem this action concerns. Present for every kind so
+	// Identity is the incident this action concerns. Present for every kind so
 	// callers and tests can key on it uniformly.
-	Identity detect.Identity
+	Identity correlate.IncidentIdentity
 
-	// Finding is the current finding driving an open or update. It is the zero
-	// value for [ActionClose], which is driven by absence rather than a finding.
-	Finding detect.Finding
+	// Subject is the current incident (plus its ranked diagnosis) driving an open
+	// or update. It is the zero value for [ActionClose], which is driven by absence
+	// rather than a present incident.
+	Subject Subject
 
 	// Ref is the existing issue to act on for update/close. It is empty for
 	// [ActionOpen], where no issue exists yet.

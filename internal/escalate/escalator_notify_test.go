@@ -74,11 +74,11 @@ func TestEscalator_ChatLifecycleOneThread(t *testing.T) {
 	id := detect.Identity("prod|pod.crashloop|pod/team/api")
 
 	// Open.
-	if _, err := esc.Reconcile(ctx, []detect.Finding{crashFinding(id, "1 restart")}); err != nil {
+	if _, err := esc.Reconcile(ctx, []Subject{subjectFor(crashFinding(id, "1 restart"))}); err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	// Recurrence (update).
-	if _, err := esc.Reconcile(ctx, []detect.Finding{crashFinding(id, "12 restarts")}); err != nil {
+	if _, err := esc.Reconcile(ctx, []Subject{subjectFor(crashFinding(id, "12 restarts"))}); err != nil {
 		t.Fatalf("recur: %v", err)
 	}
 	// Clearance (resolution).
@@ -115,7 +115,7 @@ func TestEscalator_ThreadMarkerPersistedOnOpen(t *testing.T) {
 	esc := NewEscalatorWithNotifier(sink, notifier)
 
 	id := detect.Identity("prod|pod.crashloop|pod/team/api")
-	if _, err := esc.Reconcile(ctx, []detect.Finding{crashFinding(id, "x")}); err != nil {
+	if _, err := esc.Reconcile(ctx, []Subject{subjectFor(crashFinding(id, "x"))}); err != nil {
 		t.Fatalf("open: %v", err)
 	}
 
@@ -125,7 +125,7 @@ func TestEscalator_ThreadMarkerPersistedOnOpen(t *testing.T) {
 	}
 	// Both markers must coexist in the body.
 	gotID, ok := ParseIdentityMarker(view.Body)
-	if !ok || gotID != id {
+	if !ok || gotID != incidentID(id) {
 		t.Errorf("identity marker lost: got %q ok=%v", gotID, ok)
 	}
 	gotTS, ok := ParseThreadMarker(view.Body)
@@ -146,14 +146,14 @@ func TestEscalator_DurableThreadAcrossRestart(t *testing.T) {
 
 	// Process 1 opens the issue and posts the root.
 	n1 := &fakeNotifier{tsQueue: []string{"2100.0001"}}
-	if _, err := NewEscalatorWithNotifier(sink, n1).Reconcile(ctx, []detect.Finding{crashFinding(id, "1 restart")}); err != nil {
+	if _, err := NewEscalatorWithNotifier(sink, n1).Reconcile(ctx, []Subject{subjectFor(crashFinding(id, "1 restart"))}); err != nil {
 		t.Fatalf("process1 open: %v", err)
 	}
 
 	// Process 2 (restart): brand-new escalator AND notifier — no in-memory thread
 	// state anywhere. Recurrence must recover the persisted ts from the issue.
 	n2 := &fakeNotifier{tsQueue: []string{"SHOULD-NOT-BE-USED"}}
-	out, err := NewEscalatorWithNotifier(sink, n2).Reconcile(ctx, []detect.Finding{crashFinding(id, "12 restarts")})
+	out, err := NewEscalatorWithNotifier(sink, n2).Reconcile(ctx, []Subject{subjectFor(crashFinding(id, "12 restarts"))})
 	if err != nil {
 		t.Fatalf("process2 recur: %v", err)
 	}
@@ -199,14 +199,14 @@ func TestEscalator_ThreadMarkerSurvivesRecurrence(t *testing.T) {
 	id := detect.Identity("prod|pod.crashloop|pod/team/api")
 
 	if _, err := NewEscalatorWithNotifier(sink, &fakeNotifier{tsQueue: []string{"2200.0002"}}).
-		Reconcile(ctx, []detect.Finding{crashFinding(id, "a")}); err != nil {
+		Reconcile(ctx, []Subject{subjectFor(crashFinding(id, "a"))}); err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	// Two more recurrences, each from a fresh escalator (restart) so the marker is
 	// the only carrier of continuity.
 	for i, msg := range []string{"b", "c"} {
 		if _, err := NewEscalatorWithNotifier(sink, &fakeNotifier{}).
-			Reconcile(ctx, []detect.Finding{crashFinding(id, msg)}); err != nil {
+			Reconcile(ctx, []Subject{subjectFor(crashFinding(id, msg))}); err != nil {
 			t.Fatalf("recur %d: %v", i, err)
 		}
 		view, _ := sink.Snapshot(IssueRef("1"))
@@ -231,7 +231,7 @@ func TestEscalator_NopNotifierZeroChatCalls(t *testing.T) {
 	esc := NewEscalator(sink) // no notifier => NopNotifier
 
 	id := detect.Identity("prod|pod.crashloop|pod/team/api")
-	if _, err := esc.Reconcile(ctx, []detect.Finding{crashFinding(id, "x")}); err != nil {
+	if _, err := esc.Reconcile(ctx, []Subject{subjectFor(crashFinding(id, "x"))}); err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	view, _ := sink.Snapshot(IssueRef("1"))
@@ -240,8 +240,8 @@ func TestEscalator_NopNotifierZeroChatCalls(t *testing.T) {
 	if _, ok := ParseThreadMarker(view.Body); ok {
 		t.Errorf("no-op notifier must not cause a thread marker to be written:\n%s", view.Body)
 	}
-	if view.Body != Body(crashFinding(id, "x")) {
-		t.Errorf("no-op body must equal the plain M1 body, got:\n%s", view.Body)
+	if view.Body != Body(subjectFor(crashFinding(id, "x"))) {
+		t.Errorf("no-op body must equal the plain diagnostic body, got:\n%s", view.Body)
 	}
 	// Lifecycle still completes against GitHub.
 	if _, err := esc.Reconcile(ctx, nil); err != nil {

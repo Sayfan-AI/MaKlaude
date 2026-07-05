@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Sayfan-AI/MaKlaude/internal/detect"
+	"github.com/Sayfan-AI/MaKlaude/internal/correlate"
 )
 
 func TestGitHubConfig_Configured(t *testing.T) {
@@ -122,7 +122,7 @@ func TestGitHubSink_AgainstFakeAPI(t *testing.T) {
 		closed        bool
 	)
 
-	id := detect.Identity("prod|pod.crashloop|pod/team/api")
+	id := correlate.IncidentIdentity("incident|prod|pod.crashloop|pod/team/api")
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok" {
