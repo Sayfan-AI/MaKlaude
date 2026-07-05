@@ -419,12 +419,19 @@ func resolutionText(note string, threaded bool) string {
 	return body
 }
 
-// clusterOf recovers the cluster name from a [detect.Identity], which is the
-// "cluster|rule|object" form composed in the detect package. It returns empty for
-// an unrecognized shape so callers simply omit the cluster line rather than render
-// garbage.
+// clusterOf recovers the cluster name from the stable identity a notification is
+// keyed on. A raw finding identity is the "cluster|rule|object" form composed in
+// the detect package, so the cluster is its first segment. An INCIDENT identity —
+// the key the escalator uses for the incident lifecycle (T7) — wraps that form as
+// "incident|cluster|rule|object" (see correlate's incident identity); the literal
+// "incident" prefix is stripped first so the real cluster is recovered rather than
+// the word "incident". It returns empty for an unrecognized shape so callers simply
+// omit the cluster line rather than render garbage.
 func clusterOf(id detect.Identity) string {
-	parts := strings.SplitN(string(id), "|", 2)
+	// Unwrap the incident-identity prefix so incident notifications name the true
+	// cluster; a plain finding identity has no such prefix and is unaffected.
+	s := strings.TrimPrefix(strings.TrimSpace(string(id)), "incident|")
+	parts := strings.SplitN(s, "|", 2)
 	if len(parts) == 0 {
 		return ""
 	}
