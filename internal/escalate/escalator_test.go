@@ -9,25 +9,27 @@ import (
 )
 
 // TestEscalator_OpenThenRecurThenClear walks the full lifecycle through the
-// public Escalator API against a MemorySink, proving the three done-criteria:
-// a detected problem opens a well-formed issue; recurrence updates rather than
-// duplicates; clearance closes the trail with a comment.
+// public Escalator API against a MemorySink, proving the three done-criteria at
+// incident granularity: a detected incident opens a well-formed diagnostic issue;
+// recurrence updates rather than duplicates; clearance closes the trail with a
+// comment.
 func TestEscalator_OpenThenRecurThenClear(t *testing.T) {
 	ctx := context.Background()
 	sink := NewMemorySink()
 	esc := NewEscalator(sink)
 
-	id := detect.Identity("prod|pod.crashloop|pod/team/api")
+	fid := detect.Identity("prod|pod.crashloop|pod/team/api")
+	incID := incidentID(fid)
 	f := func(sev detect.Severity, msg string) detect.Finding {
 		return detect.Finding{
-			Identity: id, Severity: sev, Cluster: "prod",
+			Identity: fid, Severity: sev, Cluster: "prod",
 			Object: detect.Object{Kind: "pod", Namespace: "team", Name: "api"},
 			Title:  "Pod crashlooping", Message: msg, DetectedAt: ts,
 		}
 	}
 
-	// Cycle 1: problem first detected -> one issue opened.
-	out, err := esc.Reconcile(ctx, []detect.Finding{f(detect.SeverityWarning, "1 restart")})
+	// Cycle 1: incident first detected -> one issue opened.
+	out, err := esc.Reconcile(ctx, []Subject{subjectFor(f(detect.SeverityWarning, "1 restart"))})
 	if err != nil {
 		t.Fatalf("cycle1: %v", err)
 	}
@@ -48,15 +50,15 @@ func TestEscalator_OpenThenRecurThenClear(t *testing.T) {
 		t.Errorf("title not well-formed: %q", view.Title)
 	}
 	gotID, ok := ParseIdentityMarker(view.Body)
-	if !ok || gotID != id {
-		t.Errorf("body marker = %q ok=%v, want %q", gotID, ok, id)
+	if !ok || gotID != incID {
+		t.Errorf("body marker = %q ok=%v, want %q", gotID, ok, incID)
 	}
 	if !hasLabel(view.Labels, ManagedLabel) || !hasLabel(view.Labels, NeedsHumanLabel) {
 		t.Errorf("labels = %v, want both %q and %q", view.Labels, ManagedLabel, NeedsHumanLabel)
 	}
 
-	// Cycle 2: SAME problem, worsened -> update + recurrence comment, NO new issue.
-	out, err = esc.Reconcile(ctx, []detect.Finding{f(detect.SeverityCritical, "12 restarts")})
+	// Cycle 2: SAME incident, worsened -> update + recurrence comment, NO new issue.
+	out, err = esc.Reconcile(ctx, []Subject{subjectFor(f(detect.SeverityCritical, "12 restarts"))})
 	if err != nil {
 		t.Fatalf("cycle2: %v", err)
 	}
@@ -74,7 +76,7 @@ func TestEscalator_OpenThenRecurThenClear(t *testing.T) {
 		t.Errorf("cycle2: body should refresh to latest message, got %q", view.Body)
 	}
 
-	// Cycle 3: problem cleared (no findings) -> close with a closing comment.
+	// Cycle 3: incident cleared (no subjects) -> close with a closing comment.
 	out, err = esc.Reconcile(ctx, nil)
 	if err != nil {
 		t.Fatalf("cycle3: %v", err)
@@ -83,7 +85,7 @@ func TestEscalator_OpenThenRecurThenClear(t *testing.T) {
 		t.Fatalf("cycle3 outcome = %v, want closed=1", out)
 	}
 	if sink.OpenCount() != 0 {
-		t.Fatalf("cycle3: cleared problem must close; got %d open", sink.OpenCount())
+		t.Fatalf("cycle3: cleared incident must close; got %d open", sink.OpenCount())
 	}
 	view, _ = sink.Snapshot(ref)
 	if view.Open {
@@ -110,19 +112,18 @@ func TestEscalator_RediscoversAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	sink := NewMemorySink()
 
-	id := detect.Identity("prod|node.notready|node/n1")
 	f := detect.Finding{
-		Identity: id, Severity: detect.SeverityCritical, Cluster: "prod",
+		Identity: "prod|node.notready|node/n1", Severity: detect.SeverityCritical, Cluster: "prod",
 		Object: detect.Object{Kind: "node", Name: "n1"}, Title: "Node NotReady",
 		Message: "node n1 not ready", DetectedAt: ts,
 	}
 
 	// First "process" opens the issue.
-	if _, err := NewEscalator(sink).Reconcile(ctx, []detect.Finding{f}); err != nil {
+	if _, err := NewEscalator(sink).Reconcile(ctx, []Subject{subjectFor(f)}); err != nil {
 		t.Fatal(err)
 	}
-	// A brand-new escalator (simulating a restart) sees the same finding.
-	out, err := NewEscalator(sink).Reconcile(ctx, []detect.Finding{f})
+	// A brand-new escalator (simulating a restart) sees the same incident.
+	out, err := NewEscalator(sink).Reconcile(ctx, []Subject{subjectFor(f)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,9 +135,9 @@ func TestEscalator_RediscoversAcrossRestart(t *testing.T) {
 	}
 }
 
-// TestEscalator_InfoFindingNotFlaggedForHuman proves info findings are tracked
-// but not labelled needs:human.
-func TestEscalator_InfoFindingNotFlaggedForHuman(t *testing.T) {
+// TestEscalator_InfoIncidentNotFlaggedForHuman proves info-severity incidents are
+// tracked but not labelled needs:human.
+func TestEscalator_InfoIncidentNotFlaggedForHuman(t *testing.T) {
 	ctx := context.Background()
 	sink := NewMemorySink()
 	f := detect.Finding{
@@ -144,7 +145,7 @@ func TestEscalator_InfoFindingNotFlaggedForHuman(t *testing.T) {
 		Object: detect.Object{Kind: "pod", Namespace: "ns", Name: "x"}, Title: "Warning event",
 		Message: "something", DetectedAt: ts,
 	}
-	if _, err := NewEscalator(sink).Reconcile(ctx, []detect.Finding{f}); err != nil {
+	if _, err := NewEscalator(sink).Reconcile(ctx, []Subject{subjectFor(f)}); err != nil {
 		t.Fatal(err)
 	}
 	view, _ := sink.Snapshot("1")
@@ -156,25 +157,25 @@ func TestEscalator_InfoFindingNotFlaggedForHuman(t *testing.T) {
 	}
 }
 
-// TestEscalator_MultiClusterIsolation proves two clusters' problems live in
-// separate issues and one cluster's reconcile (when all findings are passed
+// TestEscalator_MultiClusterIsolation proves two clusters' incidents live in
+// separate issues and one cluster's reconcile (when all subjects are passed
 // together) never disturbs the other's.
 func TestEscalator_MultiClusterIsolation(t *testing.T) {
 	ctx := context.Background()
 	sink := NewMemorySink()
 	esc := NewEscalator(sink)
 
-	mk := func(cluster string) detect.Finding {
+	mk := func(cluster string) Subject {
 		id := detect.Identity(cluster + "|pod.crashloop|pod/ns/a")
-		return detect.Finding{
+		return subjectFor(detect.Finding{
 			Identity: id, Severity: detect.SeverityCritical, Cluster: cluster,
 			Object: detect.Object{Kind: "pod", Namespace: "ns", Name: "a"},
 			Title:  "Pod crashlooping", Message: "x", DetectedAt: ts,
-		}
+		})
 	}
 
-	// Both clusters have the problem.
-	if _, err := esc.Reconcile(ctx, []detect.Finding{mk("prod"), mk("staging")}); err != nil {
+	// Both clusters have the incident.
+	if _, err := esc.Reconcile(ctx, []Subject{mk("prod"), mk("staging")}); err != nil {
 		t.Fatal(err)
 	}
 	if sink.OpenCount() != 2 {
@@ -182,7 +183,7 @@ func TestEscalator_MultiClusterIsolation(t *testing.T) {
 	}
 
 	// prod clears, staging persists (both passed together so isolation holds).
-	out, err := esc.Reconcile(ctx, []detect.Finding{mk("staging")})
+	out, err := esc.Reconcile(ctx, []Subject{mk("staging")})
 	if err != nil {
 		t.Fatal(err)
 	}

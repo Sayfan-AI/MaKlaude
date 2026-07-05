@@ -51,8 +51,11 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Sayfan-AI/MaKlaude/internal/correlate"
 	"github.com/Sayfan-AI/MaKlaude/internal/detect"
+	"github.com/Sayfan-AI/MaKlaude/internal/diagnose"
 	"github.com/Sayfan-AI/MaKlaude/internal/escalate"
+	"github.com/Sayfan-AI/MaKlaude/internal/health"
 	"github.com/Sayfan-AI/MaKlaude/internal/notify"
 )
 
@@ -193,6 +196,17 @@ func e2eFinding(id detect.Identity, msg string) detect.Finding {
 	}
 }
 
+// e2eSubject wraps the e2e crashloop finding into the incident-granularity subject
+// the escalator reconciles since T4, driving the SAME correlate+diagnose path the
+// real scan uses (a lone finding becomes a singleton incident with the fallback
+// hypothesis) so this leg exercises production wiring, just without a cluster.
+func e2eSubject(id detect.Identity, msg string) escalate.Subject {
+	f := e2eFinding(id, msg)
+	snap := health.Snapshot{Cluster: f.Cluster}
+	incidents := correlate.Correlate(snap, []detect.Finding{f})
+	return escalate.Subject{Incident: incidents[0], Hypotheses: diagnose.Diagnose(snap, incidents[0])}
+}
+
 // TestE2E_SlackThreadDeliveryAndContinuity proves M2 DoD assertions (1) and (2)
 // end to end against the REAL SlackNotifier and a mocked Slack API:
 //
@@ -230,12 +244,12 @@ func TestE2E_SlackThreadDeliveryAndContinuity(t *testing.T) {
 	}
 
 	// --- Process 1: the problem is detected and escalated (thread ROOT posted). ---
-	if _, err := newProcess(t).Reconcile(ctx, []detect.Finding{e2eFinding(id, "1 restart")}); err != nil {
+	if _, err := newProcess(t).Reconcile(ctx, []escalate.Subject{e2eSubject(id, "1 restart")}); err != nil {
 		t.Fatalf("process1 open: %v", err)
 	}
 
 	// --- Process 2 (restart): the problem recurs (REPLY into the original thread). ---
-	out2, err := newProcess(t).Reconcile(ctx, []detect.Finding{e2eFinding(id, "12 restarts")})
+	out2, err := newProcess(t).Reconcile(ctx, []escalate.Subject{e2eSubject(id, "12 restarts")})
 	if err != nil {
 		t.Fatalf("process2 recur: %v", err)
 	}
@@ -363,10 +377,10 @@ func TestE2E_SlackUnconfiguredDegradesToGitHubOnly(t *testing.T) {
 	id := detect.Identity("maklaude-e2e|pod.crashloop|pod/" + e2eNamespace + "/" + crashloopPod)
 
 	// Full lifecycle: open -> recurrence -> clear, all against the GitHub trail.
-	if _, err := esc.Reconcile(ctx, []detect.Finding{e2eFinding(id, "1 restart")}); err != nil {
+	if _, err := esc.Reconcile(ctx, []escalate.Subject{e2eSubject(id, "1 restart")}); err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if _, err := esc.Reconcile(ctx, []detect.Finding{e2eFinding(id, "9 restarts")}); err != nil {
+	if _, err := esc.Reconcile(ctx, []escalate.Subject{e2eSubject(id, "9 restarts")}); err != nil {
 		t.Fatalf("recur: %v", err)
 	}
 	if _, err := esc.Reconcile(ctx, nil); err != nil {

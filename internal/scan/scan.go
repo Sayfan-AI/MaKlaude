@@ -6,8 +6,12 @@
 //
 // The package is the runnable seam between the (independently tested) pipeline
 // packages and the `maklaude scan` command. It deliberately holds no opinions of
-// its own beyond orchestration order: collection, detection, and escalation each
-// keep their own contracts. Crucially, every step is read-only with respect to
+// its own beyond orchestration order: collection, detection, correlation,
+// diagnosis, and escalation each keep their own contracts. The findings are
+// correlated into incidents and each incident is diagnosed into ranked root-cause
+// hypotheses, so escalation happens at incident granularity — one auditable issue
+// per correlated problem, carrying its whole diagnosis. Crucially, every step is
+// read-only with respect to
 // the cluster — the only writes the pipeline can perform are to the comms trail
 // (issues), never to a cluster, and even those are gated behind the
 // human-in-the-loop escalator.
@@ -24,7 +28,9 @@ import (
 	"time"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/cluster"
+	"github.com/Sayfan-AI/MaKlaude/internal/correlate"
 	"github.com/Sayfan-AI/MaKlaude/internal/detect"
+	"github.com/Sayfan-AI/MaKlaude/internal/diagnose"
 	"github.com/Sayfan-AI/MaKlaude/internal/escalate"
 	"github.com/Sayfan-AI/MaKlaude/internal/health"
 	"github.com/Sayfan-AI/MaKlaude/internal/kube"
@@ -132,15 +138,29 @@ func (p *Pipeline) scanCluster(ctx context.Context, h *cluster.Handle) ClusterRe
 	cr.Reachable = snap.Reachability.Reachable
 	cr.ServerVersion = snap.Reachability.ServerVersion
 
+	// The read-only interpretation pipeline: raw findings, correlated into
+	// incidents, then diagnosed into ranked root-cause hypotheses. Escalation
+	// happens at INCIDENT granularity (one issue per correlated problem carrying
+	// its whole diagnosis), not per raw finding — see the escalate package.
 	findings := detect.Analyze(snap)
 	cr.Findings = toFindingReports(findings)
 
-	outcome, err := p.escalator.Reconcile(ctx, findings)
+	incidents := correlate.Correlate(snap, findings)
+	subjects := make([]escalate.Subject, 0, len(incidents))
+	for i := range incidents {
+		subjects = append(subjects, escalate.Subject{
+			Incident:   incidents[i],
+			Hypotheses: diagnose.Diagnose(snap, incidents[i]),
+		})
+	}
+	cr.Incidents = toIncidentReports(subjects)
+
+	outcome, err := p.escalator.Reconcile(ctx, subjects)
 	if err != nil {
 		// Escalation is best-effort; record the error but keep the findings and
 		// whatever the outcome counted as succeeded, so a partial comms failure
 		// does not hide what MaKlaude observed.
-		cr.Error = fmt.Sprintf("escalating findings: %v", err)
+		cr.Error = fmt.Sprintf("escalating incidents: %v", err)
 	}
 	cr.Escalation = EscalationReport{
 		Opened:  outcome.Opened,
@@ -164,6 +184,46 @@ func toFindingReports(findings []detect.Finding) []FindingReport {
 			Object:   f.Object.String(),
 			Title:    f.Title,
 			Message:  f.Message,
+		})
+	}
+	return out
+}
+
+// toIncidentReports converts the escalation subjects (correlated incidents plus
+// their ranked diagnosis) into the report's serializable incident shape,
+// preserving correlation's most-urgent-first incident order and diagnosis's
+// most-confident-first hypothesis order.
+func toIncidentReports(subjects []escalate.Subject) []IncidentReport {
+	out := make([]IncidentReport, 0, len(subjects))
+	for i := range subjects {
+		s := subjects[i]
+		affected := make([]string, 0, len(s.Incident.Findings()))
+		for _, f := range s.Incident.Findings() {
+			affected = append(affected, f.Object.String())
+		}
+		hyps := make([]HypothesisReport, 0, len(s.Hypotheses))
+		for _, h := range s.Hypotheses {
+			evidence := make([]string, 0, len(h.Evidence))
+			for _, e := range h.Evidence {
+				evidence = append(evidence, e.Object.String())
+			}
+			hyps = append(hyps, HypothesisReport{
+				Cause:      string(h.Cause),
+				Confidence: h.Confidence.String(),
+				Title:      h.Title,
+				Message:    h.Message,
+				Source:     string(h.Source),
+				Evidence:   evidence,
+			})
+		}
+		out = append(out, IncidentReport{
+			Identity:      string(s.Identity()),
+			Cluster:       s.Cluster(),
+			Severity:      s.Severity().String(),
+			PrimaryObject: s.Incident.Primary.Object.String(),
+			PrimaryTitle:  s.Incident.Primary.Title,
+			Affected:      affected,
+			Hypotheses:    hyps,
 		})
 	}
 	return out

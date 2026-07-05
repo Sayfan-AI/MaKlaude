@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -121,10 +122,30 @@ func TestRun_DetectsAndEscalates(t *testing.T) {
 		t.Errorf("expected critical finding first, got %q", cr.Findings[0].Severity)
 	}
 
-	// (b) An escalation was produced: one issue opened per finding.
-	wantOpened := len(cr.Findings)
+	// (a2) The findings correlate into incidents, each carrying at least one ranked
+	// hypothesis. The two unrelated pods form two singleton incidents.
+	if len(cr.Incidents) != 2 {
+		t.Fatalf("expected 2 incidents (one per unrelated pod), got %d: %+v", len(cr.Incidents), cr.Incidents)
+	}
+	for _, in := range cr.Incidents {
+		if len(in.Hypotheses) == 0 {
+			t.Errorf("incident %q should carry at least one hypothesis", in.Identity)
+		}
+		if in.PrimaryObject == "" || in.Severity == "" {
+			t.Errorf("incident report not well-formed: %+v", in)
+		}
+	}
+	// Incidents are ranked most-urgent-first: the critical crashloop before the
+	// warning pending.
+	if cr.Incidents[0].Severity != "critical" {
+		t.Errorf("expected the critical incident first, got %q", cr.Incidents[0].Severity)
+	}
+
+	// (b) An escalation was produced: one issue opened per INCIDENT (not per raw
+	// finding). This is the T4 incident-granularity contract.
+	wantOpened := len(cr.Incidents)
 	if cr.Escalation.Opened != wantOpened {
-		t.Errorf("expected %d issues opened, got %d", wantOpened, cr.Escalation.Opened)
+		t.Errorf("expected %d issues opened (one per incident), got %d", wantOpened, cr.Escalation.Opened)
 	}
 	if sink.OpenCount() != wantOpened {
 		t.Errorf("expected %d open issues in sink, got %d", wantOpened, sink.OpenCount())
@@ -134,10 +155,74 @@ func TestRun_DetectsAndEscalates(t *testing.T) {
 	if report.Totals.Findings != len(cr.Findings) {
 		t.Errorf("totals.findings = %d, want %d", report.Totals.Findings, len(cr.Findings))
 	}
+	if report.Totals.Incidents != len(cr.Incidents) {
+		t.Errorf("totals.incidents = %d, want %d", report.Totals.Incidents, len(cr.Incidents))
+	}
 	if !report.HasSeverity("critical") {
 		t.Errorf("report should report a critical severity present")
 	}
 }
+
+// TestRun_CorrelatesCascadeIntoOneIncident proves the incident-granularity payoff:
+// a bad-image cascade (a Deployment, its ReplicaSet, and its pod all failing) is
+// escalated as ONE diagnostic issue, not three, and the diagnosis names the bad
+// image as the leading root cause.
+func TestRun_CorrelatesCascadeIntoOneIncident(t *testing.T) {
+	// A pod owned (via its ReplicaSet) by deployment "web", stuck on ImagePullBackOff,
+	// plus the failing ReplicaSet and unavailable Deployment it belongs to.
+	badPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "team", Name: "web-abc-1",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "web-abc"}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "app", RestartCount: 0,
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"}},
+			}},
+		},
+	}
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "web-abc"},
+		Spec:       appsv1.ReplicaSetSpec{Replicas: ptrInt32(3)},
+		Status:     appsv1.ReplicaSetStatus{Replicas: 3, ReadyReplicas: 0, AvailableReplicas: 0},
+	}
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "web"},
+		Spec:       appsv1.DeploymentSpec{Replicas: ptrInt32(3)},
+		Status:     appsv1.DeploymentStatus{Replicas: 3, ReadyReplicas: 0, AvailableReplicas: 0},
+	}
+
+	p, sink := newFakePipeline(t, badPod, rs, dep)
+	reg := singleClusterRegistry(t, "cascade")
+
+	report, err := p.Run(context.Background(), reg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	cr := report.Clusters[0]
+
+	// Several raw findings, but they collapse into ONE incident.
+	if len(cr.Findings) < 2 {
+		t.Fatalf("expected multiple raw findings for the cascade, got %+v", cr.Findings)
+	}
+	if len(cr.Incidents) != 1 {
+		t.Fatalf("cascade should correlate into exactly ONE incident, got %d: %+v", len(cr.Incidents), cr.Incidents)
+	}
+	// And exactly one issue opened for that one incident.
+	if cr.Escalation.Opened != 1 || sink.OpenCount() != 1 {
+		t.Errorf("cascade should open exactly one issue, got opened=%d sinkOpen=%d", cr.Escalation.Opened, sink.OpenCount())
+	}
+	// The diagnosis names the bad image as the leading (most-confident) cause.
+	hyps := cr.Incidents[0].Hypotheses
+	if len(hyps) == 0 || hyps[0].Cause != "badimage" {
+		t.Errorf("expected the leading hypothesis to be badimage, got %+v", hyps)
+	}
+}
+
+// ptrInt32 returns a pointer to v, for the fake replica-count specs above.
+func ptrInt32(v int32) *int32 { return &v }
 
 func TestRun_NoFindings_NoEscalation(t *testing.T) {
 	// A single healthy running pod produces no findings.

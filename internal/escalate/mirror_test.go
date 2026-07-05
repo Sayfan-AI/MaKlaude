@@ -18,7 +18,7 @@ func seedThreadedIssue(t *testing.T, id detect.Identity, rootTS string) (*Memory
 	sink := NewMemorySink()
 	notifier := &fakeNotifier{tsQueue: []string{rootTS}}
 	if _, err := NewEscalatorWithNotifier(sink, notifier).
-		Reconcile(context.Background(), []detect.Finding{crashFinding(id, "x")}); err != nil {
+		Reconcile(context.Background(), []Subject{subjectFor(crashFinding(id, "x"))}); err != nil {
 		t.Fatalf("seed open: %v", err)
 	}
 	return sink, IssueRef("1")

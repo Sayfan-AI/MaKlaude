@@ -67,49 +67,64 @@ test/e2e/          # end-to-end test on kind (build tag `e2e`) + seed manifests
 
 `maklaude scan` runs the full read-only pipeline once across every registered
 cluster: for each cluster it collects health signals, detects problems
-deterministically, and reconciles the findings into the comms trail, then prints
-a report. It performs **no mutating action** against any cluster — its only
-writes are to the escalation trail, and those degrade to an in-memory dry-run
-unless GitHub is configured (see below).
+deterministically, **correlates** the findings into incidents, **diagnoses** each
+incident into ranked root-cause hypotheses, and reconciles those incidents into
+the comms trail, then prints a report. It performs **no mutating action** against
+any cluster — its only writes are to the escalation trail, and those degrade to an
+in-memory dry-run unless GitHub is configured (see below).
 
 ```bash
 maklaude scan --config config.yaml        # human-readable report
 maklaude scan --config config.yaml --json # machine-readable report (used by e2e)
 ```
 
-The JSON report carries, per cluster, the reachability, the findings
-(identity / severity / object / title / message, most-urgent-first), and the
-escalation outcome (opened / updated / closed), plus cross-cluster totals.
+The JSON report carries, per cluster, the reachability, the raw findings
+(identity / severity / object / title / message, most-urgent-first), the
+correlated **incidents** (each with its primary object, affected objects, and
+ranked root-cause hypotheses), and the escalation outcome (opened / updated /
+closed), plus cross-cluster totals.
 
 ## Comms trail & escalation
 
 MaKlaude keeps humans informed through an **auditable comms trail** rather than
-a stream of alerts. The `internal/escalate` package turns the deterministic
-[`detect.Finding`](internal/detect/finding.go)s into exactly **one tracked
-GitHub issue per active problem**, and keeps that issue in sync as the problem
-recurs and clears.
+a stream of alerts. Since M3/T4 the `internal/escalate` package escalates at
+**incident granularity**: it turns each correlated
+[`correlate.Incident`](internal/correlate/incident.go) — plus its ranked
+[`diagnose.Hypothesis`](internal/diagnose/hypothesis.go)es — into exactly **one
+tracked GitHub issue per active incident**, and keeps that issue in sync as the
+incident recurs and clears. This carries the *diagnosis* (a correlated incident +
+ranked root-cause hypotheses + the exact evidence) into the trail, not just a raw
+symptom, so one real cause no longer fans out into a pile of separate issues.
 
-The whole model hangs off the stable `detect.Identity` key (the same ongoing
-problem yields the same identity every cycle):
+The whole model hangs off the stable `correlate.IncidentIdentity` key (the same
+ongoing incident yields the same identity every cycle):
 
-- **One issue per problem.** A newly seen identity opens a single, well-formed
-  issue: severity, cluster, the affected object, the human-readable message, and
-  the detection time. The cluster is named in the title so multi-cluster setups
-  stay legible at a glance.
-- **Recurrence updates, never duplicates.** When the same problem is detected
+- **One diagnostic issue per incident.** A newly seen incident opens a single,
+  well-formed issue: the incident summary (cluster, severity, primary object),
+  the **ranked root-cause hypotheses** each with its confidence, explanation, and
+  the specific evidence findings grouped under it, the affected objects, and
+  **manual, read-only next steps** (kubectl describe/logs/get/top, inspect image,
+  check quotas). When the leading hypothesis is low-confidence, the body honestly
+  surfaces the competing hypotheses rather than overcommitting. The cluster is
+  named in the title so multi-cluster setups stay legible at a glance.
+- **Read-only by construction.** M3 diagnoses; it does not remediate. The issue
+  body **never** claims MaKlaude will run, apply, delete, scale, or otherwise
+  mutate anything — every suggested step is an investigation for a human to run.
+  This is asserted in unit tests.
+- **Recurrence updates, never duplicates.** When the same incident is diagnosed
   again on a later cycle, MaKlaude refreshes the existing issue's body and adds a
   recurrence comment — it does **not** open a second issue. This dedup is the
   core guarantee, and it is unit-tested without any network.
-- **Clearance closes the trail.** When a previously-active problem is no longer
-  in the current findings, its issue is closed with a closing comment, so the
-  record stays complete and self-explanatory.
-- **`needs:human` gating.** Warnings and criticals are labelled `needs:human`
-  (in addition to the `maklaude` management label) to flag that a decision is
-  wanted. Info-level findings are recorded but not gated. MaKlaude never takes a
-  mutating action on a cluster — escalation is purely informational.
-- **Restart-safe.** Each issue embeds its identity in a hidden marker
+- **Clearance closes the trail.** When a previously-active incident is no longer
+  present, its issue is closed with a closing comment, so the record stays
+  complete and self-explanatory.
+- **`needs:human` gating.** Warning- and critical-severity incidents are labelled
+  `needs:human` (in addition to the `maklaude` management label) to flag that a
+  decision is wanted. Info-level incidents are recorded but not gated. MaKlaude
+  never takes a mutating action on a cluster — escalation is purely informational.
+- **Restart-safe.** Each issue embeds its incident identity in a hidden marker
   (`<!-- maklaude:identity=… -->`). The escalator rediscovers which open issue
-  maps to which problem by listing issues, so it stays correct even if the
+  maps to which incident by listing issues, so it stays correct even if the
   monitor process restarts — it never relies solely on in-memory state.
 
 ### Email notifications (M1)
@@ -134,7 +149,8 @@ so unit tests and the e2e harness run without real credentials.
 | `MAKLAUDE_GITHUB_API`   | Optional REST API base override (for GitHub Enterprise).         |
 
 The reconcile core (`escalate.Reconcile`) is a **pure function** of
-`(findings, tracked issues)` — no I/O, no clock — and the GitHub interaction
+`(subjects, tracked issues)` — where each subject is an incident plus its ranked
+diagnosis; no I/O, no clock — and the GitHub interaction
 sits behind the small `escalate.IssueSink` interface, so the interesting logic
 is exhaustively unit-tested with a fake in-memory sink. The package touches
 GitHub and **never** a Kubernetes cluster, keeping MaKlaude's read-only safety
@@ -226,7 +242,7 @@ RBAC bundle, seeds two failure scenarios — a **crashlooping** pod and an
 least-privilege ServiceAccount** and asserts:
 
 1. **Findings** — a critical `pod.crashloop` and a warning `pod.pending` are detected.
-2. **Escalation** — an issue is opened for each (in-memory dry-run, no external writes).
+2. **Escalation** — the findings correlate into incidents and a diagnostic issue is opened per incident (in-memory dry-run, no external writes).
 3. **Zero writes** — proven four ways, belt-and-suspenders:
    - RBAC: the SA has only `get`/`list`/`watch` (verified with `kubectl auth can-i`);
    - state invariance: the seeded objects' `resourceVersion`/`generation`/`managedFields` are unchanged across the scan;

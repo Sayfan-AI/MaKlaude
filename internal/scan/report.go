@@ -44,10 +44,19 @@ type ClusterReport struct {
 	// ServerVersion is the API server version reported on a successful probe.
 	ServerVersion string `json:"serverVersion,omitempty"`
 
-	// Findings are the detector's findings for this cluster, most-urgent-first.
+	// Findings are the detector's raw findings for this cluster, most-urgent-first.
+	// They are the unfolded symptom-level view; Incidents is the correlated,
+	// diagnosed view the comms trail escalates on.
 	Findings []FindingReport `json:"findings"`
 
-	// Escalation summarizes the reconcile actions taken for this cluster.
+	// Incidents are the correlated incidents for this cluster, each with its ranked
+	// root-cause hypotheses, most-urgent-first. Escalation happens at this
+	// granularity: one issue per incident. It is the diagnostic view an operator
+	// (and the e2e harness) reads to see WHY, not just what.
+	Incidents []IncidentReport `json:"incidents"`
+
+	// Escalation summarizes the reconcile actions taken for this cluster (counted
+	// at incident granularity: opened/updated/closed issues, one per incident).
 	Escalation EscalationReport `json:"escalation"`
 
 	// Error, when non-empty, explains a per-cluster failure (client build,
@@ -67,6 +76,34 @@ type FindingReport struct {
 	Message  string `json:"message"`
 }
 
+// IncidentReport is the serializable projection of one correlated, diagnosed
+// incident: the incident's stable identity and severity, its primary object, the
+// full set of affected objects, and its ranked root-cause hypotheses. It is the
+// report's diagnostic unit — the same granularity the comms trail escalates on.
+type IncidentReport struct {
+	Identity      string             `json:"identity"`
+	Cluster       string             `json:"cluster"`
+	Severity      string             `json:"severity"`
+	PrimaryObject string             `json:"primaryObject"`
+	PrimaryTitle  string             `json:"primaryTitle"`
+	Affected      []string           `json:"affected"`
+	Hypotheses    []HypothesisReport `json:"hypotheses"`
+}
+
+// HypothesisReport is the serializable projection of one ranked root-cause
+// hypothesis: its cause class, coarse confidence, human-readable title/message,
+// provenance (deterministic vs. refined), and the object strings of the evidence
+// findings that support it. It drops the wall-clock (which equals the snapshot
+// time) in favour of a flat, stable shape.
+type HypothesisReport struct {
+	Cause      string   `json:"cause"`
+	Confidence string   `json:"confidence"`
+	Title      string   `json:"title"`
+	Message    string   `json:"message"`
+	Source     string   `json:"source"`
+	Evidence   []string `json:"evidence"`
+}
+
 // EscalationReport mirrors escalate.Outcome in a JSON-tagged form.
 type EscalationReport struct {
 	Opened  int `json:"opened"`
@@ -78,8 +115,11 @@ type EscalationReport struct {
 type Totals struct {
 	// Clusters is the number of clusters scanned.
 	Clusters int `json:"clusters"`
-	// Findings is the total number of findings across all clusters.
+	// Findings is the total number of raw findings across all clusters.
 	Findings int `json:"findings"`
+	// Incidents is the total number of correlated incidents across all clusters —
+	// the granularity escalation operates at.
+	Incidents int `json:"incidents"`
 	// BySeverity counts findings by their severity token ("critical", "warning",
 	// "info"). Absent severities are omitted.
 	BySeverity map[string]int `json:"bySeverity,omitempty"`
@@ -95,6 +135,7 @@ func (r *Report) finalize() {
 	for i := range r.Clusters {
 		c := &r.Clusters[i]
 		t.Findings += len(c.Findings)
+		t.Incidents += len(c.Incidents)
 		for j := range c.Findings {
 			t.BySeverity[c.Findings[j].Severity]++
 		}
@@ -158,12 +199,26 @@ func (r *Report) WriteText(w io.Writer) error {
 				fmt.Fprintf(&b, "    - [%s] %s — %s\n", strings.ToUpper(f.Severity), f.Object, f.Title)
 			}
 		}
+		if len(c.Incidents) == 0 {
+			b.WriteString("  incidents: none\n")
+		} else {
+			fmt.Fprintf(&b, "  incidents (%d):\n", len(c.Incidents))
+			for j := range c.Incidents {
+				in := &c.Incidents[j]
+				fmt.Fprintf(&b, "    - [%s] %s — %s (%d affected)\n",
+					strings.ToUpper(in.Severity), in.PrimaryObject, in.PrimaryTitle, len(in.Affected))
+				for k := range in.Hypotheses {
+					h := &in.Hypotheses[k]
+					fmt.Fprintf(&b, "        * hypothesis: %s [confidence: %s]\n", h.Title, h.Confidence)
+				}
+			}
+		}
 		fmt.Fprintf(&b, "  escalation: opened=%d updated=%d closed=%d\n",
 			c.Escalation.Opened, c.Escalation.Updated, c.Escalation.Closed)
 	}
 
 	b.WriteString("\nTotals: ")
-	fmt.Fprintf(&b, "%d cluster(s), %d finding(s)", r.Totals.Clusters, r.Totals.Findings)
+	fmt.Fprintf(&b, "%d cluster(s), %d finding(s), %d incident(s)", r.Totals.Clusters, r.Totals.Findings, r.Totals.Incidents)
 	if len(r.Totals.BySeverity) > 0 {
 		keys := make([]string, 0, len(r.Totals.BySeverity))
 		for k := range r.Totals.BySeverity {
