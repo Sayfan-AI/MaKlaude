@@ -21,13 +21,9 @@ Full operator and architecture docs live in [`docs/`](docs/index.md). Start with
 
 ## Architecture posture — deterministic product, AI dev system
 
-MaKlaude is two layers, and it's worth being explicit about which is which:
+MaKlaude is two layers: the running product is **deterministic Go** — the read-only `collect → detect → correlate → diagnose → escalate` path has no model in it and runs the same in tests, the `kind` e2e, and production — and the AI is the **dev system that builds and evolves it** (an orchestrator, workers, an evolver, and a human-interaction agent). The one runtime exception is the optional, gated `aidiagnose` seam, off by default (see below). The upshot: what runs against your clusters is deterministic and auditable; the intelligence was spent at build time, not wired into the hot path.
 
-- **The running product is deterministic Go.** The operational path — collect a read-only snapshot, `detect` findings, `correlate` them into incidents, `diagnose` ranked root causes, `escalate` to the comms trail — is rule-based code with no model in it. The same code runs in unit tests, the `kind` e2e, and production.
-- **The AI is the dev system that builds and evolves MaKlaude, not MaKlaude itself.** An orchestrator, workers, an evolver, and a human-interaction agent (Claude Code, via GitHub Actions) plan the milestones, write the code, review it behind quality gates, and improve the system over time. That's where the LLMs live.
-- **One optional, gated exception at runtime:** `internal/aidiagnose` (see below) can call a model to *refine* a diagnosis, but it's off by default, bounded, and redacted, and it degrades to the deterministic result — so even with it enabled, an LLM can only *inform* a diagnosis, never act on a cluster.
-
-The practical upshot for an operator: what runs against your clusters is deterministic and auditable. The intelligence was spent at build time, not wired into the hot path.
+Full detail: **[docs/architecture.md](docs/architecture.md)**.
 
 
 ## Setup

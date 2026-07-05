@@ -8,7 +8,8 @@ This is the map of the operator and architecture docs. If you just want to get M
 
 | Doc | What it covers |
 | --- | -------------- |
-| [quickstart.md](quickstart.md) | Operator setup end to end: grant read-only access, register a cluster, run the monitor, and optionally route escalations to GitHub. **Start here.** |
+| [architecture.md](architecture.md) | The two-layer posture: a deterministic Go product built and evolved by an AI dev system, with one optional gated LLM seam. Read this for the mental model. |
+| [quickstart.md](quickstart.md) | Operator setup end to end: grant read-only access, register a cluster, run the monitor, and optionally route escalations to GitHub. **Start here to run it.** |
 | [rbac.md](rbac.md) | The read-only access model, and how to grant and verify a least-privilege ServiceAccount for MaKlaude. |
 | [no-writes.md](no-writes.md) | The four-layer guarantee that MaKlaude never mutates a cluster, and how to re-verify it yourself. |
 | [escalation.md](escalation.md) | How detected problems become a comms trail: one GitHub issue per problem, keyed by identity, with escalation, recurrence, and resolution. |
@@ -16,11 +17,12 @@ This is the map of the operator and architecture docs. If you just want to get M
 
 ## Suggested reading order
 
-1. **[quickstart.md](quickstart.md)** - get MaKlaude watching a cluster.
-2. **[rbac.md](rbac.md)** and **[no-writes.md](no-writes.md)** - the safety model the quickstart leans on: least privilege going in, and the proof that nothing goes out.
-3. **[escalation.md](escalation.md)** - how MaKlaude tells you what it found and keeps that trail honest as problems recur and clear.
-4. **[slack.md](slack.md)** - only if you want a real-time, team-visible channel on top of the GitHub trail.
+1. **[architecture.md](architecture.md)** - the two-layer shape (deterministic product, AI dev system) and where the one optional LLM seam sits.
+2. **[quickstart.md](quickstart.md)** - get MaKlaude watching a cluster.
+3. **[rbac.md](rbac.md)** and **[no-writes.md](no-writes.md)** - the safety model the quickstart leans on: least privilege going in, and the proof that nothing goes out.
+4. **[escalation.md](escalation.md)** - how MaKlaude tells you what it found and keeps that trail honest as problems recur and clear.
+5. **[slack.md](slack.md)** - only if you want a real-time, team-visible channel on top of the GitHub trail.
 
-The optional, gated **LLM-assisted diagnosis** layer (read-only, redacted, cost-bounded, off by default) is documented in the [README](../README.md#llm-assisted-diagnosis-optional-gated); its safety posture is summarized in [no-writes.md](no-writes.md).
+The optional, gated **LLM-assisted diagnosis** layer (read-only, redacted, cost-bounded, off by default) is documented in [architecture.md](architecture.md#the-one-optional-ai-seam) and the [README](../README.md#llm-assisted-diagnosis-optional-gated); its safety posture is summarized in [no-writes.md](no-writes.md).
 
 For the code itself, the escalation model lives in [`internal/escalate`](../internal/escalate), the notification seam in [`internal/notify`](../internal/notify), deterministic diagnosis in [`internal/diagnose`](../internal/diagnose), and the optional LLM refinement in [`internal/aidiagnose`](../internal/aidiagnose).
