@@ -283,7 +283,7 @@ func writeNextSteps(b *strings.Builder, s Subject) {
 	b.WriteString("_These are investigative steps for a human operator. MaKlaude will not run, apply, or execute any of them; it neither remediates nor mutates the cluster._\n\n")
 
 	seen := make(map[diagnose.Cause]bool, len(s.Hypotheses))
-	any := false
+	wrote := false
 	for _, h := range s.Hypotheses {
 		if seen[h.Cause] {
 			continue
@@ -291,10 +291,10 @@ func writeNextSteps(b *strings.Builder, s Subject) {
 		seen[h.Cause] = true
 		for _, step := range nextSteps(h.Cause) {
 			fmt.Fprintf(b, "- %s\n", step)
-			any = true
+			wrote = true
 		}
 	}
-	if !any {
+	if !wrote {
 		for _, step := range nextSteps(diagnose.CauseUnknown) {
 			fmt.Fprintf(b, "- %s\n", step)
 		}
