@@ -115,8 +115,11 @@ func (e *Escalator) Reconcile(ctx context.Context, subjects []Subject) (Outcome,
 			// Mirror to chat as the thread ROOT, then persist the returned thread
 			// handle into the issue body so a future reconcile (even after a restart)
 			// can reply into this same thread. Both are best-effort: a chat or
-			// persistence hiccup is recorded but never strands the GitHub trail.
-			threadTS, nerr := e.notifier.NotifyEscalation(ctx, notifyID, Title(a.Subject), string(ref), wantsHuman(a.Subject))
+			// persistence hiccup is recorded but never strands the GitHub trail. The
+			// root carries the incident summary AND its top-ranked root cause +
+			// confidence (see EscalationSummary), so the thread opens with the diagnosis,
+			// not just the symptom.
+			threadTS, nerr := e.notifier.NotifyEscalation(ctx, notifyID, EscalationSummary(a.Subject), string(ref), wantsHuman(a.Subject))
 			if nerr != nil {
 				errs = append(errs, fmt.Errorf("notifying escalation for %q: %w", a.Identity, nerr))
 				continue

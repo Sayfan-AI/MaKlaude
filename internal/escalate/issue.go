@@ -167,6 +167,30 @@ func Title(s Subject) string {
 	return fmt.Sprintf("[%s][%s] %s", strings.ToUpper(s.Severity().String()), s.Cluster(), p.Title)
 }
 
+// EscalationSummary renders the text posted as the ROOT of the chat (Slack) thread
+// when an incident is first escalated. Where [Title] is the terse one-line issue
+// title (severity, cluster, primary object), the chat root additionally leads with
+// the incident's TOP-RANKED root-cause hypothesis and its confidence, so an
+// operator glancing at the channel sees not just *what* broke but MaKlaude's leading
+// *why* — the same diagnostic context the backing issue body carries, condensed to a
+// headline. Recurrence and resolution replies already carry the leading hypothesis
+// (see [RecurrenceComment]) and the closing note, so opening with it here keeps the
+// whole thread diagnostic from its first message.
+//
+// It stays strictly content-only and comms-only: it composes human-facing text and
+// nothing else. The notify layer wraps this with the cluster/severity banner, the
+// backing-issue link, and the "no mutating action without approval" footer; keeping
+// the diagnosis wording here (not in notify) is why notify never has to import the
+// diagnose types. A real incident always has a top hypothesis; the ok=false branch
+// is only the degenerate empty case, in which the summary is exactly [Title].
+func EscalationSummary(s Subject) string {
+	summary := Title(s)
+	if top, ok := s.TopHypothesis(); ok {
+		summary += fmt.Sprintf("\nLeading hypothesis: %s (confidence %s)", top.Title, top.Confidence.String())
+	}
+	return summary
+}
+
 // Body renders the full diagnostic issue body for an incident: the incident
 // summary (cluster, severity, primary object, time), the ranked root-cause
 // hypotheses — each with its confidence, explanation, and the specific evidence

@@ -301,6 +301,30 @@ func TestSlackNotifier_NoTokenInPayloadBody(t *testing.T) {
 	}
 }
 
+// TestEscalationText_IncidentIdentityCluster proves the escalation banner names the
+// REAL cluster when keyed on an INCIDENT identity — the key the escalator uses for
+// the incident lifecycle (T7). An incident identity wraps the finding identity as
+// "incident|cluster|...", so clusterOf must strip the "incident" prefix and surface
+// the true cluster rather than the literal word "incident". A plain finding identity
+// (no prefix) must still resolve to its first segment unchanged.
+func TestEscalationText_IncidentIdentityCluster(t *testing.T) {
+	incident := escalationText(detect.Identity("incident|prod|pod.crashloop|pod/team/api"),
+		"Pod crashlooping", "42", "", "")
+	if !strings.Contains(incident, "on cluster `prod`") {
+		t.Errorf("incident-keyed root should name cluster `prod`; got %q", incident)
+	}
+	if strings.Contains(incident, "cluster `incident`") {
+		t.Errorf("incident-keyed root must not render the literal identity prefix as the cluster; got %q", incident)
+	}
+
+	// A raw finding identity is unaffected by the prefix stripping.
+	finding := escalationText(detect.Identity("staging|node.notready|node/node-a"),
+		"Node NotReady", "7", "", "")
+	if !strings.Contains(finding, "on cluster `staging`") {
+		t.Errorf("finding-keyed root should name cluster `staging`; got %q", finding)
+	}
+}
+
 // TestEscalationText_ClickableIssueLink proves the issue #58 behavior at the text
 // layer: when an IssueBaseURL is known the backing issue renders as a CLICKABLE
 // Slack mrkdwn hyperlink (<url/NNN|#NNN>) so an operator clicks straight through,
