@@ -120,6 +120,7 @@ jobs:
           set -euo pipefail
           kubectl apply -f test/e2e/manifests/crashloop-pod.yaml
           kubectl apply -f test/e2e/manifests/pending-pod.yaml
+          kubectl apply -f test/e2e/manifests/badimage-deploy.yaml
 
       - name: Wait for crashloop pod to enter CrashLoopBackOff
         run: |
@@ -166,6 +167,36 @@ jobs:
             if [ "$(date +%s)" -ge "$deadline" ]; then
               echo "::error::pending pod did not become Unschedulable in time"
               kubectl -n "$ns" describe pod pending || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Wait for bad-image deployment to enter ImagePullBackOff
+        run: |
+          set -euo pipefail
+          ns=maklaude-e2e
+          deadline=$(( $(date +%s) + 180 ))
+          while :; do
+            # Match the deployment's pod by its scenario label; the pull failure
+            # surfaces as the container's waiting reason.
+            reason=$(kubectl -n "$ns" get pod -l scenario=badimage \
+              -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)
+            avail=$(kubectl -n "$ns" get deployment badimage \
+              -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo 0)
+            echo "badimage: reason='${reason}' availableReplicas='${avail:-0}'"
+            # ImagePullBackOff (the settled state) or ErrImagePull (its transient
+            # precursor) both prove the pull failed; the deployment must also have
+            # 0 available replicas, i.e. the cascade has fully materialized.
+            if { [ "$reason" = "ImagePullBackOff" ] || [ "$reason" = "ErrImagePull" ]; } \
+               && [ -z "${avail:-}" -o "${avail:-0}" = "0" ]; then
+              echo "badimage deployment reached an image-pull failure with 0 available replicas."
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::badimage deployment did not enter ImagePullBackOff in time"
+              kubectl -n "$ns" describe deployment badimage || true
+              kubectl -n "$ns" describe pod -l scenario=badimage || true
               exit 1
             fi
             sleep 5
