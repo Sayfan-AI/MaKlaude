@@ -34,8 +34,11 @@ metadata:
     app.kubernetes.io/component: rbac
 rules:
   # core/v1 (apiGroup "") — nodes, pods, events.
-  #   nodes  : ListNodes  (collector reads node Ready/pressure conditions)
-  #   pods   : ListPods   (collector reads phase, restarts, crashloop state)
+  #   nodes  : ListNodes (node Ready/pressure conditions + allocatable cpu/memory)
+  #   pods   : ListPods  (phase, restarts, crashloop, node assignment, ownerRefs,
+  #            per-container waiting/termination facts, resource requests) and
+  #            GetPod (internal/kube/client.go; single-pod read before fetching
+  #            that pod's logs in internal/health/collector.go CollectPodLogs)
   #   events : ListEvents (collector reads recent Warning events)
   - apiGroups: [""]
     resources:
@@ -43,6 +46,18 @@ rules:
       - pods
       - events
     verbs: ["get", "list", "watch"]
+
+  # core/v1 pods/log subresource — get only.
+  #   internal/kube/client.go PodLogs reads recent, bounded container logs via a
+  #   GET on the pods/log subresource (clientset.CoreV1().Pods(ns).GetLogs(...)),
+  #   called lazily by internal/health/collector.go CollectPodLogs for pods
+  #   already implicated in a finding — never cluster-wide, never during the eager
+  #   Collect. Logs are only readable (GET); the subresource has no list/watch and
+  #   cannot be written, so this stays strictly read-only.
+  - apiGroups: [""]
+    resources:
+      - pods/log
+    verbs: ["get"]
 
   # apps/v1 (apiGroup "apps") — deployments, replicasets.
   #   deployments  : ListDeployments (desired/ready/available/updated replicas)

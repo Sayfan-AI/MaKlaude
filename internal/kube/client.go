@@ -30,6 +30,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -195,6 +196,67 @@ func (c *Client) ListPods(ctx context.Context, namespace string) ([]corev1.Pod, 
 			ErrUnreachable, c.clusterName, namespace, err)
 	}
 	return list.Items, nil
+}
+
+// GetPod returns a single pod by namespace and name. It is a read-only (get)
+// operation; failures surface as an error wrapping [ErrUnreachable] naming the
+// cluster (this includes the API server's "not found" response).
+//
+// It exists to support lazy, per-pod evidence gathering (for example fetching a
+// pod's containers before reading their logs) without listing pods cluster-wide.
+func (c *Client) GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
+	pod, err := c.clientset.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("%w %q: getting pod %q: %w",
+			ErrUnreachable, c.clusterName, namespace+"/"+name, err)
+	}
+	return pod, nil
+}
+
+// maxPodLogBytes caps how many bytes [Client.PodLogs] will read from a single
+// container log stream. It is a hard safety net on top of the caller's line-based
+// tail bound so that a pathological single log line can never pull an unbounded
+// volume into memory.
+const maxPodLogBytes int64 = 1 << 20 // 1 MiB
+
+// PodLogs reads the recent logs of a single container in one pod. It is a
+// read-only operation: it issues a GET on the pods/log subresource
+// (clientset.CoreV1().Pods(ns).GetLogs(...).Stream(ctx)), which the read-only
+// transport guard permits.
+//
+// previous selects the previous (crashed) container instance's logs instead of
+// the running one — essential evidence for a crashlooping container that has
+// already been replaced. tailLines bounds how many trailing lines the API server
+// returns; a non-positive value applies no explicit line bound (callers are
+// expected to pass a sane bound). Regardless, the read is additionally capped at
+// [maxPodLogBytes] as a safety net. This method is deliberately scoped to one
+// named container of one named pod; it is never called cluster-wide and is not
+// part of the eager collection path.
+//
+// Connectivity or read failures surface as an error wrapping [ErrUnreachable]
+// naming the cluster.
+func (c *Client) PodLogs(ctx context.Context, namespace, pod, container string, previous bool, tailLines int64) ([]byte, error) {
+	opts := &corev1.PodLogOptions{
+		Container: container,
+		Previous:  previous,
+	}
+	if tailLines > 0 {
+		opts.TailLines = &tailLines
+	}
+
+	stream, err := c.clientset.CoreV1().Pods(namespace).GetLogs(pod, opts).Stream(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w %q: streaming logs for pod %q container %q: %w",
+			ErrUnreachable, c.clusterName, namespace+"/"+pod, container, err)
+	}
+	defer func() { _ = stream.Close() }()
+
+	data, err := io.ReadAll(io.LimitReader(stream, maxPodLogBytes))
+	if err != nil {
+		return nil, fmt.Errorf("%w %q: reading logs for pod %q container %q: %w",
+			ErrUnreachable, c.clusterName, namespace+"/"+pod, container, err)
+	}
+	return data, nil
 }
 
 // ListNodes returns every node in the cluster. It is a read-only (list)

@@ -11,6 +11,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -188,6 +189,12 @@ func TestCollect_Pods(t *testing.T) {
 			Phase:                  "Running",
 			RestartCount:           10, // 7 + 1 + 2
 			CrashLoopingContainers: []string{"app"},
+			// Containers are sorted by name: app, init, sidecar.
+			Containers: []ContainerSignal{
+				{Name: "app", RestartCount: 7, CrashLooping: true, WaitingReason: "CrashLoopBackOff"},
+				{Name: "init", Init: true, RestartCount: 2},
+				{Name: "sidecar", RestartCount: 1},
+			},
 		},
 		{Namespace: "team", Name: "pending", Phase: "Pending", Pending: true},
 	}
@@ -242,6 +249,178 @@ func TestCollect_CrashLoopMidCycle(t *testing.T) {
 	}
 	if got := snap.Pods[0].CrashLoopingContainers; !reflect.DeepEqual(got, []string{"app"}) {
 		t.Fatalf("expected only app flagged crashlooping mid-cycle, got %+v", got)
+	}
+}
+
+// TestCollect_PodEvidence proves the deepened per-pod evidence is captured:
+// node assignment, ownerReferences (with the controller flag), per-container
+// waiting reason/message, last-termination exit code/reason, per-container and
+// pod-level resource requests, and node allocatable. It asserts the full
+// structured signal and re-collects to confirm the new fields stay deterministic.
+func TestCollect_PodEvidence(t *testing.T) {
+	controller := true
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "team", Name: "web-abc",
+			OwnerReferences: []metav1.OwnerReference{
+				{Kind: "ReplicaSet", Name: "web", Controller: &controller},
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-a",
+			InitContainers: []corev1.Container{{
+				Name: "setup",
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("50m"),
+					corev1.ResourceMemory: resource.MustParse("32Mi"),
+				}},
+			}},
+			Containers: []corev1.Container{
+				{
+					Name: "app",
+					Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("250m"),
+						corev1.ResourceMemory: resource.MustParse("128Mi"),
+					}},
+				},
+				{Name: "puller"}, // no requests
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			InitContainerStatuses: []corev1.ContainerStatus{{
+				Name: "setup",
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Reason: "Completed"},
+				},
+			}},
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name:         "app",
+					RestartCount: 3,
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff", Message: "back-off"},
+					},
+					LastTerminationState: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "OOMKilled", Signal: 9},
+					},
+				},
+				{
+					Name: "puller",
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: "Back-off pulling image"},
+					},
+				},
+			},
+		},
+	}
+	nodeA := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}},
+			Allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("2"),
+				corev1.ResourceMemory: resource.MustParse("4Gi"),
+			},
+		},
+	}
+
+	col := newTestCollector(t, pod, nodeA)
+
+	snap, err := col.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+
+	wantPod := PodSignal{
+		Namespace:              "team",
+		Name:                   "web-abc",
+		Phase:                  "Pending",
+		RestartCount:           3,
+		CrashLoopingContainers: []string{"app"},
+		Pending:                true,
+		Node:                   "node-a",
+		Owners:                 []OwnerRef{{Kind: "ReplicaSet", Name: "web", Controller: true}},
+		Requests:               ResourceList{CPU: "250m", Memory: "128Mi"},
+		// Containers sorted by name: app, puller, setup.
+		Containers: []ContainerSignal{
+			{
+				Name:            "app",
+				RestartCount:    3,
+				CrashLooping:    true,
+				WaitingReason:   "CrashLoopBackOff",
+				WaitingMessage:  "back-off",
+				LastTermination: &TerminationSignal{ExitCode: 137, Reason: "OOMKilled", Signal: 9},
+				Requests:        ResourceList{CPU: "250m", Memory: "128Mi"},
+			},
+			{
+				Name:           "puller",
+				WaitingReason:  "ImagePullBackOff",
+				WaitingMessage: "Back-off pulling image",
+			},
+			{
+				Name:               "setup",
+				Init:               true,
+				CurrentTermination: &TerminationSignal{ExitCode: 0, Reason: "Completed"},
+				Requests:           ResourceList{CPU: "50m", Memory: "32Mi"},
+			},
+		},
+	}
+	if len(snap.Pods) != 1 {
+		t.Fatalf("expected 1 pod signal, got %d", len(snap.Pods))
+	}
+	if !reflect.DeepEqual(snap.Pods[0], wantPod) {
+		t.Fatalf("pod evidence mismatch:\n got %+v\nwant %+v", snap.Pods[0], wantPod)
+	}
+
+	wantNode := NodeSignal{
+		Name:        "node-a",
+		Ready:       true,
+		Allocatable: ResourceList{CPU: "2", Memory: "4Gi"},
+	}
+	if len(snap.Nodes) != 1 || !reflect.DeepEqual(snap.Nodes[0], wantNode) {
+		t.Fatalf("node allocatable mismatch:\n got %+v\nwant %+v", snap.Nodes, wantNode)
+	}
+
+	// The new evidence fields must stay deterministic across collections.
+	second, err := col.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("second Collect failed: %v", err)
+	}
+	if !reflect.DeepEqual(snap, second) {
+		t.Fatalf("collection with deep evidence is not deterministic:\nfirst:  %+v\nsecond: %+v", snap, second)
+	}
+}
+
+// TestCollect_ContainerWaitingReasons proves the range of waiting reasons a
+// downstream analyzer relies on are captured verbatim per container.
+func TestCollect_ContainerWaitingReasons(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "waiters"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "a"}, {Name: "b"}, {Name: "c"}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "a", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ErrImagePull"}}},
+				{Name: "b", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CreateContainerConfigError"}}},
+				{Name: "c", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"}}},
+			},
+		},
+	}
+	col := newTestCollector(t, pod)
+	snap, err := col.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+	got := map[string]string{}
+	for _, cs := range snap.Pods[0].Containers {
+		got[cs.Name] = cs.WaitingReason
+	}
+	want := map[string]string{"a": "ErrImagePull", "b": "CreateContainerConfigError", "c": "ImagePullBackOff"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("waiting reasons mismatch:\n got %+v\nwant %+v", got, want)
 	}
 }
 
@@ -487,12 +666,206 @@ func TestCollect_Reachability_AllSignalTypes(t *testing.T) {
 	}
 }
 
+// logCall records the PodLogOptions a GetLogs (pods/log GET) call carried, so a
+// test can assert the bounding and previous-instance flags reached the API.
+type logCall struct {
+	container string
+	previous  bool
+	tail      int64
+}
+
+// logCapturingClient wraps a fake clientset seeded with pod, recording every
+// pods/log GET's options into *calls while still returning the fake's canned
+// "fake logs" body. It also lets tests inspect the raw action stream.
+func logCapturingClient(t *testing.T, pod *corev1.Pod, calls *[]logCall) (*kube.Client, *fake.Clientset) {
+	t.Helper()
+	cs := fake.NewSimpleClientset(pod)
+	cs.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "log" {
+			// Not a log read (e.g. the GetPod enumeration): let the tracker serve it.
+			return false, nil, nil
+		}
+		opts, ok := action.(k8stesting.GenericAction).GetValue().(*corev1.PodLogOptions)
+		if !ok {
+			t.Fatalf("pods/log action carried unexpected value %T", action.(k8stesting.GenericAction).GetValue())
+		}
+		var tail int64
+		if opts.TailLines != nil {
+			tail = *opts.TailLines
+		}
+		*calls = append(*calls, logCall{container: opts.Container, previous: opts.Previous, tail: tail})
+		return true, &corev1.Pod{}, nil
+	})
+	return kube.NewClientWithInterface("fixture", cs), cs
+}
+
+// TestCollectPodLogs_TailAndPrevious proves the lazy log path bounds the tail to
+// the default, fetches previous-instance logs for a crashlooping container (and
+// only current logs for a healthy one), and targets a single named pod rather
+// than listing pods cluster-wide.
+func TestCollectPodLogs_TailAndPrevious(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "crash"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app"}, {Name: "sidecar"}},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "app", RestartCount: 5, State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+				}},
+				{Name: "sidecar"},
+			},
+		},
+	}
+	var calls []logCall
+	client, cs := logCapturingClient(t, pod, &calls)
+	col := NewCollector(client, WithClock(fixedClock()))
+
+	ev, err := col.CollectPodLogs(context.Background(), "team", "crash", LogOptions{})
+	if err != nil {
+		t.Fatalf("CollectPodLogs failed: %v", err)
+	}
+	if ev.Namespace != "team" || ev.Name != "crash" {
+		t.Fatalf("evidence scoped to wrong pod: %+v", ev)
+	}
+
+	// app (current), app (previous — crashlooping), sidecar (current).
+	want := []ContainerLogEvidence{
+		{Container: "app", Previous: false, TailLines: DefaultLogTailLines, Logs: "fake logs"},
+		{Container: "app", Previous: true, TailLines: DefaultLogTailLines, Logs: "fake logs"},
+		{Container: "sidecar", Previous: false, TailLines: DefaultLogTailLines, Logs: "fake logs"},
+	}
+	if !reflect.DeepEqual(ev.Containers, want) {
+		t.Fatalf("log evidence mismatch:\n got %+v\nwant %+v", ev.Containers, want)
+	}
+
+	// The bounding and previous flags must have reached the API verbatim.
+	wantCalls := []logCall{
+		{container: "app", previous: false, tail: DefaultLogTailLines},
+		{container: "app", previous: true, tail: DefaultLogTailLines},
+		{container: "sidecar", previous: false, tail: DefaultLogTailLines},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("pods/log calls mismatch:\n got %+v\nwant %+v", calls, wantCalls)
+	}
+
+	// Single-pod targeting: the pod was read by name (get), never listed.
+	var sawGetByName, sawList bool
+	for _, a := range cs.Actions() {
+		if a.GetResource().Resource != "pods" {
+			continue
+		}
+		switch a.GetVerb() {
+		case "list":
+			sawList = true
+		case "get":
+			if ga, ok := a.(k8stesting.GetAction); ok && a.GetSubresource() == "" && ga.GetName() == "crash" {
+				sawGetByName = true
+			}
+		}
+	}
+	if sawList {
+		t.Fatal("CollectPodLogs must not list pods cluster-wide")
+	}
+	if !sawGetByName {
+		t.Fatal("expected the pod to be read by name before fetching its logs")
+	}
+}
+
+// TestCollectPodLogs_ContainerFilterAndTail proves an explicit container
+// selection and tail bound are honoured, and that a non-crashlooping container
+// yields only current logs.
+func TestCollectPodLogs_ContainerFilterAndTail(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "web"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app"}, {Name: "sidecar"}},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{Name: "app"}, {Name: "sidecar"}},
+		},
+	}
+	var calls []logCall
+	client, _ := logCapturingClient(t, pod, &calls)
+	col := NewCollector(client, WithClock(fixedClock()))
+
+	ev, err := col.CollectPodLogs(context.Background(), "team", "web", LogOptions{
+		TailLines:  10,
+		Containers: []string{"sidecar"},
+	})
+	if err != nil {
+		t.Fatalf("CollectPodLogs failed: %v", err)
+	}
+
+	want := []ContainerLogEvidence{
+		{Container: "sidecar", Previous: false, TailLines: 10, Logs: "fake logs"},
+	}
+	if !reflect.DeepEqual(ev.Containers, want) {
+		t.Fatalf("filtered log evidence mismatch:\n got %+v\nwant %+v", ev.Containers, want)
+	}
+	if len(calls) != 1 || calls[0].container != "sidecar" || calls[0].tail != 10 {
+		t.Fatalf("expected a single sidecar log read tailed to 10, got %+v", calls)
+	}
+}
+
+// TestCollectPodLogs_GetPodError proves a failure to read the implicated pod is
+// surfaced (logs cannot be gathered for a pod that cannot be read).
+func TestCollectPodLogs_GetPodError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("get", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("boom")
+	})
+	col := NewCollector(kube.NewClientWithInterface("fixture", cs), WithClock(fixedClock()))
+
+	_, err := col.CollectPodLogs(context.Background(), "team", "missing", LogOptions{})
+	if err == nil {
+		t.Fatal("expected an error when the implicated pod cannot be read")
+	}
+	if !errors.Is(err, kube.ErrUnreachable) {
+		t.Fatalf("expected wrapped ErrUnreachable, got: %v", err)
+	}
+}
+
+// TestCollect_DoesNotFetchLogs is the regression guard for the safety-critical
+// invariant that the eager Collect never fetches pod logs — logs are read only
+// by the explicit, lazy CollectPodLogs path.
+func TestCollect_DoesNotFetchLogs(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "crash"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: "app", RestartCount: 5, State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+				}},
+			},
+		},
+	}
+	cs := fake.NewSimpleClientset(pod)
+	var logFetched bool
+	cs.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() == "log" {
+			logFetched = true
+		}
+		return false, nil, nil
+	})
+	col := NewCollector(kube.NewClientWithInterface("fixture", cs), WithClock(fixedClock()))
+
+	if _, err := col.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+	if logFetched {
+		t.Fatal("Collect must never fetch pod logs (logs are lazy, per implicated pod only)")
+	}
+}
+
 // fakeReactor wires a list error into the fake clientset so a mid-collection
 // read failure can be exercised.
-func failingListClient(t *testing.T, resource string) *kube.Client {
+func failingListClient(t *testing.T, res string) *kube.Client {
 	t.Helper()
 	cs := fake.NewSimpleClientset()
-	cs.PrependReactor("list", resource, func(k8stesting.Action) (bool, runtime.Object, error) {
+	cs.PrependReactor("list", res, func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New("boom")
 	})
 	return kube.NewClientWithInterface("fixture", cs)

@@ -84,7 +84,9 @@ production pipeline calls it.
 The bundle in [`deploy/rbac/`](../deploy/rbac/) binds MaKlaude's ServiceAccount
 (`maklaude` in namespace `maklaude`) to a single ClusterRole
 (`maklaude-readonly`) that grants only the read triad — `get`, `list`, `watch` —
-on a small, fixed set of resources, and **no mutating verbs** (no `create`,
+on a small, fixed set of resources (plus a `get` on the `pods/log` subresource,
+used to lazily read a bounded tail of an implicated pod's container logs; logs
+can only be fetched, never written), and **no mutating verbs** (no `create`,
 `update`, `patch`, `delete`, `deletecollection`) and no access to `secrets` or
 `configmaps`. This is the outermost boundary: even if layer 1 were somehow
 bypassed, the API server itself would reject the write.

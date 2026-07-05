@@ -9,6 +9,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/kube"
 )
@@ -144,6 +145,158 @@ func (c *Collector) Collect(ctx context.Context) (Snapshot, error) {
 	return snap, nil
 }
 
+// DefaultLogTailLines is the default number of trailing log lines
+// [Collector.CollectPodLogs] requests per container. It bounds the read so
+// gathering evidence for a single implicated pod can never pull an unbounded
+// volume of logs.
+const DefaultLogTailLines int64 = 50
+
+// LogOptions configures a single [Collector.CollectPodLogs] call.
+type LogOptions struct {
+	// TailLines bounds how many trailing lines are read per container. A
+	// non-positive value falls back to [DefaultLogTailLines].
+	TailLines int64
+
+	// Containers restricts which of the pod's containers to gather logs for. An
+	// empty slice means all of the pod's containers (init and regular).
+	Containers []string
+}
+
+// PodLogEvidence is the bounded log evidence gathered for a single implicated
+// pod. It is deliberately scoped to one named pod: logs are fetched lazily, only
+// for pods already implicated in a finding, never cluster-wide and never during
+// the eager [Collector.Collect].
+type PodLogEvidence struct {
+	// Namespace and Name identify the pod the evidence was gathered for.
+	Namespace string
+	Name      string
+
+	// Containers holds the per-container log reads, ordered deterministically by
+	// container name and, within a container, current logs before previous-instance
+	// logs.
+	Containers []ContainerLogEvidence
+}
+
+// ContainerLogEvidence is the bounded log read for one container instance.
+type ContainerLogEvidence struct {
+	// Container is the container the logs came from.
+	Container string
+
+	// Previous is true when these are the logs of the previous (crashed) instance
+	// of the container rather than the current one — the key evidence for a
+	// crashlooping container that has already been restarted.
+	Previous bool
+
+	// TailLines is the tail bound that was applied to this read.
+	TailLines int64
+
+	// Logs is the bounded log content that was read. It is empty when the read
+	// produced no output or failed (see Error).
+	Logs string
+
+	// Error is the text of a per-container fetch failure, if any, otherwise empty.
+	// A failure to read one container's logs (for example, previous-instance logs
+	// that do not exist) is recorded as a fact rather than failing the whole
+	// collection, mirroring how unreachability is recorded elsewhere.
+	Error string
+}
+
+// CollectPodLogs gathers bounded, recent logs for a single named pod that a
+// downstream diagnosis step has already implicated. It is the lazy counterpart to
+// [Collector.Collect]: it is never called cluster-wide, and Collect never fetches
+// logs itself. Fetching logs is a GET on the pods/log subresource, which the
+// read-only client permits and which is the one read requiring the pods/log RBAC
+// grant.
+//
+// It reads the pod once to enumerate its containers and detect which are
+// crashlooping, then, for each targeted container, reads the current logs bounded
+// to opts.TailLines (defaulting to [DefaultLogTailLines]); for a crashlooping
+// container it additionally reads the previous instance's logs. Per-container read
+// failures are recorded on the entry rather than aborting the collection. The
+// returned evidence is deterministic: containers are ordered by name and, within a
+// container, current logs precede previous logs.
+func (c *Collector) CollectPodLogs(ctx context.Context, namespace, podName string, opts LogOptions) (PodLogEvidence, error) {
+	tail := opts.TailLines
+	if tail <= 0 {
+		tail = DefaultLogTailLines
+	}
+
+	pod, err := c.client.GetPod(ctx, namespace, podName)
+	if err != nil {
+		return PodLogEvidence{}, fmt.Errorf("collecting logs for pod %s/%s: %w", namespace, podName, err)
+	}
+
+	// Which containers is the caller interested in? An empty selection means all.
+	var wanted map[string]bool
+	if len(opts.Containers) > 0 {
+		wanted = make(map[string]bool, len(opts.Containers))
+		for _, name := range opts.Containers {
+			wanted[name] = true
+		}
+	}
+
+	// Crashloop is read from status; the set of containers is read from spec, so a
+	// pod that has not produced statuses yet is still enumerated.
+	crashlooping := crashLoopingSet(pod)
+	names := containerNames(pod)
+
+	ev := PodLogEvidence{Namespace: namespace, Name: podName}
+	for _, name := range names {
+		if wanted != nil && !wanted[name] {
+			continue
+		}
+		ev.Containers = append(ev.Containers, c.readContainerLog(ctx, namespace, podName, name, false, tail))
+		if crashlooping[name] {
+			ev.Containers = append(ev.Containers, c.readContainerLog(ctx, namespace, podName, name, true, tail))
+		}
+	}
+	return ev, nil
+}
+
+// readContainerLog performs one bounded log read for a container instance,
+// capturing a failure as a fact on the returned entry rather than propagating it.
+func (c *Collector) readContainerLog(ctx context.Context, namespace, pod, container string, previous bool, tail int64) ContainerLogEvidence {
+	entry := ContainerLogEvidence{Container: container, Previous: previous, TailLines: tail}
+	data, err := c.client.PodLogs(ctx, namespace, pod, container, previous, tail)
+	if err != nil {
+		entry.Error = err.Error()
+		return entry
+	}
+	entry.Logs = string(data)
+	return entry
+}
+
+// crashLoopingSet returns the set of container names in the pod currently
+// considered crashlooping, using the same oscillation-robust rule as the rest of
+// the collector.
+func crashLoopingSet(p *corev1.Pod) map[string]bool {
+	out := make(map[string]bool)
+	mark := func(statuses []corev1.ContainerStatus) {
+		for i := range statuses {
+			if containerCrashLooping(&statuses[i]) {
+				out[statuses[i].Name] = true
+			}
+		}
+	}
+	mark(p.Status.InitContainerStatuses)
+	mark(p.Status.ContainerStatuses)
+	return out
+}
+
+// containerNames returns the pod's container names (init and regular) sorted for
+// a deterministic iteration order.
+func containerNames(p *corev1.Pod) []string {
+	names := make([]string, 0, len(p.Spec.InitContainers)+len(p.Spec.Containers))
+	for i := range p.Spec.InitContainers {
+		names = append(names, p.Spec.InitContainers[i].Name)
+	}
+	for i := range p.Spec.Containers {
+		names = append(names, p.Spec.Containers[i].Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // nodeSignals transforms raw nodes into sorted [NodeSignal]s, reading each
 // node's standard conditions verbatim.
 func nodeSignals(nodes []corev1.Node) []NodeSignal {
@@ -157,6 +310,7 @@ func nodeSignals(nodes []corev1.Node) []NodeSignal {
 			DiskPressure:   nodeConditionTrue(n, corev1.NodeDiskPressure),
 			PIDPressure:    nodeConditionTrue(n, corev1.NodePIDPressure),
 			Unschedulable:  n.Spec.Unschedulable,
+			Allocatable:    resourceListFrom(n.Status.Allocatable),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -214,20 +368,29 @@ func podSignals(pods []corev1.Pod) []PodSignal {
 		p := &pods[i]
 		phase := string(p.Status.Phase)
 
+		// Requests come from the pod spec (keyed by container name); crashloop,
+		// restart, waiting, and termination facts come from the pod status. Names
+		// are unique across a pod's init and regular containers, so a single map
+		// correlates the two.
+		requestsByName := containerRequestsByName(p)
+
 		var restarts int32
 		var crashlooping []string
-		statuses := make([]corev1.ContainerStatus, 0,
-			len(p.Status.InitContainerStatuses)+len(p.Status.ContainerStatuses))
-		statuses = append(statuses, p.Status.InitContainerStatuses...)
-		statuses = append(statuses, p.Status.ContainerStatuses...)
-		for j := range statuses {
-			cs := &statuses[j]
-			restarts += cs.RestartCount
-			if containerCrashLooping(cs) {
-				crashlooping = append(crashlooping, cs.Name)
+		var containers []ContainerSignal
+		appendContainers := func(statuses []corev1.ContainerStatus, init bool) {
+			for j := range statuses {
+				cs := &statuses[j]
+				restarts += cs.RestartCount
+				if containerCrashLooping(cs) {
+					crashlooping = append(crashlooping, cs.Name)
+				}
+				containers = append(containers, containerSignal(cs, init, requestsByName[cs.Name]))
 			}
 		}
+		appendContainers(p.Status.InitContainerStatuses, true)
+		appendContainers(p.Status.ContainerStatuses, false)
 		sort.Strings(crashlooping)
+		sort.Slice(containers, func(i, j int) bool { return containers[i].Name < containers[j].Name })
 
 		out = append(out, PodSignal{
 			Namespace:              p.Namespace,
@@ -238,9 +401,123 @@ func podSignals(pods []corev1.Pod) []PodSignal {
 			CrashLoopingContainers: crashlooping,
 			Pending:                p.Status.Phase == corev1.PodPending,
 			Failed:                 p.Status.Phase == corev1.PodFailed,
+			Node:                   p.Spec.NodeName,
+			Owners:                 ownerRefs(p),
+			Containers:             containers,
+			Requests:               sumRequests(p.Spec.Containers),
 		})
 	}
 	sortByNamespaceName(out, func(s PodSignal) (string, string) { return s.Namespace, s.Name })
+	return out
+}
+
+// ownerRefs transforms a pod's ownerReferences into sorted [OwnerRef]s. It
+// returns nil (not an empty slice) when the pod is unowned, matching the
+// collector's convention for absent repeated signals.
+func ownerRefs(p *corev1.Pod) []OwnerRef {
+	if len(p.OwnerReferences) == 0 {
+		return nil
+	}
+	out := make([]OwnerRef, 0, len(p.OwnerReferences))
+	for i := range p.OwnerReferences {
+		o := &p.OwnerReferences[i]
+		out = append(out, OwnerRef{
+			Kind:       o.Kind,
+			Name:       o.Name,
+			Controller: o.Controller != nil && *o.Controller,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Kind != out[j].Kind {
+			return out[i].Kind < out[j].Kind
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+// containerSignal transforms a single container status (plus its spec requests)
+// into a [ContainerSignal], reading waiting/termination state verbatim.
+func containerSignal(cs *corev1.ContainerStatus, init bool, requests corev1.ResourceList) ContainerSignal {
+	sig := ContainerSignal{
+		Name:         cs.Name,
+		Init:         init,
+		RestartCount: cs.RestartCount,
+		CrashLooping: containerCrashLooping(cs),
+		Requests:     resourceListFrom(requests),
+	}
+	if w := cs.State.Waiting; w != nil {
+		sig.WaitingReason = w.Reason
+		sig.WaitingMessage = w.Message
+	}
+	if t := cs.LastTerminationState.Terminated; t != nil {
+		sig.LastTermination = terminationSignal(t)
+	}
+	if t := cs.State.Terminated; t != nil {
+		sig.CurrentTermination = terminationSignal(t)
+	}
+	return sig
+}
+
+// terminationSignal captures a terminated container state as a [TerminationSignal].
+func terminationSignal(t *corev1.ContainerStateTerminated) *TerminationSignal {
+	return &TerminationSignal{
+		ExitCode: t.ExitCode,
+		Reason:   t.Reason,
+		Signal:   t.Signal,
+	}
+}
+
+// containerRequestsByName indexes a pod's container resource requests by
+// container name, covering both init and regular containers.
+func containerRequestsByName(p *corev1.Pod) map[string]corev1.ResourceList {
+	out := make(map[string]corev1.ResourceList, len(p.Spec.InitContainers)+len(p.Spec.Containers))
+	for i := range p.Spec.InitContainers {
+		out[p.Spec.InitContainers[i].Name] = p.Spec.InitContainers[i].Resources.Requests
+	}
+	for i := range p.Spec.Containers {
+		out[p.Spec.Containers[i].Name] = p.Spec.Containers[i].Resources.Requests
+	}
+	return out
+}
+
+// sumRequests aggregates the cpu/memory requests across the given containers into
+// a single [ResourceList]. It is used for the pod-level convenience aggregate over
+// regular containers; per-container requests are captured separately.
+func sumRequests(containers []corev1.Container) ResourceList {
+	var cpu, mem resource.Quantity
+	var haveCPU, haveMem bool
+	for i := range containers {
+		req := containers[i].Resources.Requests
+		if q, ok := req[corev1.ResourceCPU]; ok {
+			cpu.Add(q)
+			haveCPU = true
+		}
+		if q, ok := req[corev1.ResourceMemory]; ok {
+			mem.Add(q)
+			haveMem = true
+		}
+	}
+	out := ResourceList{}
+	if haveCPU {
+		out.CPU = cpu.String()
+	}
+	if haveMem {
+		out.Memory = mem.String()
+	}
+	return out
+}
+
+// resourceListFrom extracts cpu/memory from a Kubernetes resource list into a
+// canonical-string [ResourceList], leaving unset quantities as empty strings.
+func resourceListFrom(rl corev1.ResourceList) ResourceList {
+	out := ResourceList{}
+	if q, ok := rl[corev1.ResourceCPU]; ok {
+		out.CPU = q.String()
+	}
+	if q, ok := rl[corev1.ResourceMemory]; ok {
+		out.Memory = q.String()
+	}
 	return out
 }
 
