@@ -23,6 +23,14 @@
 //     audit log, the test asserts no mutating verb was ever attributed to
 //     MaKlaude's user — the strongest external corroboration.
 //
+// A second test, TestE2E_DiagnosisCascade, drives the SAME real pipeline against
+// the same live cluster to prove the diagnosis half end-to-end: a Deployment on
+// an unpullable image fans out into ImagePullBackOff + an unavailable ReplicaSet
+// + an unavailable Deployment + a Pending pod, and the pipeline must correlate
+// that whole family into ONE incident, rank the correct root cause (a bad image)
+// on top, and carry that diagnosis into the escalated unit — all while the M1
+// zero-writes guarantee still holds.
+//
 // The test is gated behind the `e2e` build tag so it never runs in the unit
 // suite; the CI `e2e` job (and `task e2e`) sets the tag and the environment.
 package e2e
@@ -47,6 +55,7 @@ const (
 	e2eNamespace   = "maklaude-e2e"
 	crashloopPod   = "crashloop"
 	pendingPod     = "pending"
+	badImageDeploy = "badimage"
 	clusterName    = "maklaude-e2e"
 	collectTimeout = 60 * time.Second
 )
@@ -208,6 +217,146 @@ func TestE2E_ReadOnlyScan(t *testing.T) {
 
 	// --- (c) ZERO writes: audit-log corroboration (optional). ---
 	assertNoMutatingAudit(t)
+}
+
+// TestE2E_DiagnosisCascade proves the diagnosis pipeline end-to-end on the bad-image
+// scenario: the unpullable-image Deployment fans out into a family of symptoms
+// (ImagePullBackOff pod, unavailable ReplicaSet, unavailable Deployment) that the
+// pipeline must (1) correlate into ONE incident rooted at the Deployment, (2)
+// diagnose with the correct root cause on top, and (3) escalate as that single
+// diagnosed unit — while (4) still writing nothing to the cluster.
+//
+// It runs the SAME read-only pipeline as TestE2E_ReadOnlyScan; the bare crashloop
+// and pending pods (no owners) stay their own singleton incidents and never merge
+// with the cascade, so the run yields three incidents in total.
+func TestE2E_DiagnosisCascade(t *testing.T) {
+	reg := buildRegistry(t)
+	h := handle(t, reg)
+
+	// Run the real pipeline once, in-memory escalation (no external writes). As in
+	// the read-only scan, MAKLAUDE_GITHUB_* is intentionally unset so the escalator
+	// uses the safe in-memory sink: escalation is produced and counted, but nothing
+	// is written to GitHub or the cluster.
+	report, err := scan.NewPipeline().Run(context.Background(), reg)
+	if err != nil {
+		t.Fatalf("pipeline run: %v", err)
+	}
+	logReport(t, report)
+	if len(report.Clusters) != 1 {
+		t.Fatalf("expected 1 cluster report, got %d", len(report.Clusters))
+	}
+	cr := report.Clusters[0]
+	if cr.Error != "" {
+		t.Fatalf("cluster scan error: %s", cr.Error)
+	}
+
+	// Object strings the cascade correlates over (see detect.Object.String).
+	deployObj := "deployment/" + e2eNamespace + "/" + badImageDeploy
+	rsPrefix := "replicaset/" + e2eNamespace + "/" + badImageDeploy + "-"
+	podPrefix := "pod/" + e2eNamespace + "/" + badImageDeploy + "-"
+
+	// --- (1) Correlation: exactly ONE incident rooted at the Deployment. ---
+	incident := findIncidentByPrimary(t, cr.Incidents, deployObj)
+	if incident.Severity != "critical" {
+		t.Errorf("expected the cascade incident to be critical, got %q", incident.Severity)
+	}
+	// The unpullable-image Deployment fans out: its Affected set must span the
+	// Deployment, its ReplicaSet, and at least one pod — proof the pod, ReplicaSet,
+	// and Deployment findings unioned into a single incident rather than staying
+	// three separate symptoms.
+	if !containsExact(incident.Affected, deployObj) {
+		t.Errorf("cascade incident Affected %v is missing the deployment %q", incident.Affected, deployObj)
+	}
+	if !containsPrefix(incident.Affected, rsPrefix) {
+		t.Errorf("cascade incident Affected %v is missing a replicaset with prefix %q", incident.Affected, rsPrefix)
+	}
+	if !containsPrefix(incident.Affected, podPrefix) {
+		t.Errorf("cascade incident Affected %v is missing a pod with prefix %q", incident.Affected, podPrefix)
+	}
+
+	// --- (2) Root cause: the correct diagnosis is ranked on top. ---
+	if len(incident.Hypotheses) == 0 {
+		t.Fatalf("cascade incident has no hypotheses; expected a bad-image root cause")
+	}
+	top := incident.Hypotheses[0]
+	if top.Cause != "badimage" {
+		t.Errorf("expected top hypothesis cause %q, got %q", "badimage", top.Cause)
+	}
+	if top.Confidence != "high" {
+		t.Errorf("expected top hypothesis confidence %q, got %q", "high", top.Confidence)
+	}
+	if top.Source != "deterministic" {
+		t.Errorf("expected top hypothesis source %q, got %q", "deterministic", top.Source)
+	}
+	// The diagnosis must cite the cascade's own evidence: the Deployment object is
+	// among the findings the bad-image rule ranks as its proof.
+	if !containsExact(top.Evidence, deployObj) {
+		t.Errorf("expected top hypothesis Evidence %v to reference the deployment %q", top.Evidence, deployObj)
+	}
+
+	// --- (3) Escalation reflects the diagnosis. ---
+	// Escalation happens at incident granularity — one issue per incident carrying
+	// its whole diagnosis — so the incident asserted above IS the escalated unit.
+	// With GitHub env unset the escalation stays an in-memory dry-run (no external
+	// writes), and all three incidents (crashloop + pending + cascade) are counted.
+	if report.Live {
+		t.Fatalf("expected dry-run escalation (live=false); GitHub env must be unset for e2e")
+	}
+	if cr.Escalation.Opened < 3 {
+		t.Errorf("expected at least 3 issues opened (crashloop + pending + cascade), got %d", cr.Escalation.Opened)
+	}
+	if report.Totals.Incidents < 3 {
+		t.Errorf("expected report totals to count >= 3 incidents, got %d", report.Totals.Incidents)
+	}
+
+	// --- (4) ZERO writes retained. ---
+	// This is the same read-only pipeline the ReadOnlyScan test exercises, so the
+	// two structural proofs suffice here without repeating the full state-invariance
+	// dance: an attempted write through the guarded transport is refused, and the
+	// audit log (when readable) shows no mutating verb attributed to the SA.
+	assertWriteRefused(t, h)
+	assertNoMutatingAudit(t)
+}
+
+// findIncidentByPrimary returns the single incident whose PrimaryObject equals
+// primary, failing the test if there is not EXACTLY one. Requiring uniqueness is
+// itself part of the correlation proof: the bad-image cascade must collapse into
+// one Deployment-rooted incident, not several.
+func findIncidentByPrimary(t *testing.T, incidents []scan.IncidentReport, primary string) scan.IncidentReport {
+	t.Helper()
+	var matches []scan.IncidentReport
+	for _, in := range incidents {
+		if in.PrimaryObject == primary {
+			matches = append(matches, in)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly 1 incident with primary %q, got %d (of %d incidents): %+v",
+			primary, len(matches), len(incidents), incidents)
+	}
+	return matches[0]
+}
+
+// containsExact reports whether values contains want verbatim.
+func containsExact(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// containsPrefix reports whether any of values starts with prefix. It is how the
+// cascade assertions match the ReplicaSet and pod, whose names carry a
+// Deployment-assigned pod-template hash suffix that is not known ahead of time.
+func containsPrefix(values []string, prefix string) bool {
+	for _, v := range values {
+		if strings.HasPrefix(v, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // assertWriteRefused builds a write-capable clientset over the SAME guarded

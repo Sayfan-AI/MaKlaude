@@ -1,0 +1,74 @@
+# Seed scenario (c): a root-cause CASCADE from one unpullable container image.
+#
+# This is the scenario T6 exists to prove end-to-end. A Deployment asks for a
+# container image tag that does not exist, so the kubelet can never pull it. The
+# single failure ripples outward into a whole family of correlated symptoms:
+#
+#   image cannot be pulled  ⇒  ImagePullBackOff on the pod
+#     ⇒  the ReplicaSet never reaches its desired 1 available replica
+#     ⇒  the Deployment reports 0/1 available (unavailable)
+#     ⇒  the pod itself sits Pending/not-Ready
+#
+# MaKlaude's collector reports the container's WaitingReason
+# (PodSignal ⇒ ImagePullBackOff), the detector turns the family into several
+# findings (critical "Deployment unavailable", critical unavailable ReplicaSet,
+# warning pending pod), and — crucially — correlate.Correlate must weave them
+# into ONE incident (the pod unions to its ReplicaSet+Deployment via ownerRefs
+# and the "<deployment>-<hash>" naming) whose primary object is the Deployment.
+# diagnose.badImageRule then ranks a single, correct root cause on top:
+# CauseBadImage at High confidence, source deterministic. The e2e asserts exactly
+# that shape — one incident, correct root cause, escalation carrying it — while
+# the M1 zero-writes guarantee still holds.
+#
+# Determinism is deliberate, mirroring the sibling scenarios:
+#   - A NONEXISTENT TAG of a well-known image (busybox:maklaude-e2e-does-not-exist-v0)
+#     is used, never a made-up registry hostname. Docker Hub answers "manifest
+#     unknown" fast, so the pull fails immediately and lands in ImagePullBackOff;
+#     a bogus hostname would instead hang on DNS resolution, making the failure
+#     mode (and its timing) nondeterministic across CI runners.
+#   - imagePullPolicy: Always forces a real pull attempt every time, so a warm
+#     node cache from an earlier run can never accidentally satisfy the image.
+#   - replicas: 1 keeps the cascade minimal and the correlation unambiguous — one
+#     Deployment, one ReplicaSet, one pod — and the pod schedules fine (small
+#     requests, no nodeSelector) so the ONLY thing wrong is the image pull.
+#
+# It shares the maklaude-e2e namespace (created by crashloop-pod.yaml) so the
+# harness can scope reads and the scenario never collides with system workloads.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: badimage
+  namespace: maklaude-e2e
+  labels:
+    app.kubernetes.io/part-of: maklaude-e2e
+    scenario: badimage
+spec:
+  # One replica: the smallest cascade that still exercises Deployment ⇒
+  # ReplicaSet ⇒ Pod correlation, and the least ambiguous to assert on.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: maklaude-e2e
+      scenario: badimage
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: maklaude-e2e
+        scenario: badimage
+    spec:
+      containers:
+        - name: app
+          # A tag that does not exist on Docker Hub: the pull fails fast with
+          # "manifest unknown" and the container settles into ImagePullBackOff.
+          image: busybox:maklaude-e2e-does-not-exist-v0
+          # Always: force a fresh pull attempt so a cached image can never mask
+          # the missing tag, keeping the failure deterministic.
+          imagePullPolicy: Always
+          command: ["/bin/sh", "-c", "sleep 3600"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
