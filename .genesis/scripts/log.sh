@@ -2,6 +2,11 @@
 # Genesis activity logger — called by CC hooks
 # Reads hook context from stdin (JSON), pushes to Grafana Loki
 # Falls back to stderr if Loki is not configured
+#
+# Credentials come from the environment only — GENESIS_LOKI_URL (host, no path),
+# GENESIS_LOKI_USER, GENESIS_LOKI_TOKEN. In GitHub Actions they arrive as repo
+# secrets that activate.sh seeded and the genesis-* workflows pass through via
+# the claude-code-action `settings` env block. Unset URL means stderr only.
 set -euo pipefail
 
 HOOK_EVENT="${1:-unknown}"
@@ -45,9 +50,9 @@ if [ -n "$STDIN_DATA" ]; then
 fi
 
 # Try to push to Loki
-LOKI_URL="${GENCTL_LOKI_URL:-}"
-LOKI_USER="${GENCTL_LOKI_USER:-}"
-LOKI_TOKEN="${GENCTL_LOKI_TOKEN:-}"
+LOKI_URL="${GENESIS_LOKI_URL:-}"
+LOKI_USER="${GENESIS_LOKI_USER:-}"
+LOKI_TOKEN="${GENESIS_LOKI_TOKEN:-}"
 
 if [ -n "$LOKI_URL" ]; then
     TIMESTAMP_NS=$(date +%s)000000000

@@ -9,7 +9,10 @@
 #   2. verifies the genesis GitHub App is actually installed on this repo,
 #   3. sets the values as THIS repo's GitHub Actions secrets
 #      (ANTHROPIC_API_KEY, GENESIS_APP_ID, GENESIS_APP_PRIVATE_KEY),
-#   4. enables the workflows genesis disabled at publish.
+#   4. seeds the OPTIONAL Loki secrets when the .env has them
+#      (GENESIS_LOKI_URL, GENESIS_LOKI_USER, GENESIS_LOKI_TOKEN) so the activity
+#      logging hooks reach Grafana from Actions runs, not just local ones,
+#   5. enables the workflows genesis disabled at publish.
 #
 # It refuses to run if any value is missing/placeholder or if the App isn't
 # installed. You can also export the three vars yourself instead of using the .env.
@@ -108,7 +111,27 @@ printf '%s' "$ANTHROPIC_API_KEY"         | gh secret set ANTHROPIC_API_KEY
 printf '%s' "$GENESIS_GITHUB_APP_ID"     | gh secret set GENESIS_APP_ID
 printf '%s' "$GENESIS_GITHUB_APP_SECRET" | gh secret set GENESIS_APP_PRIVATE_KEY
 
-# --- 4. enable the workflows genesis disabled at publish ------------------------
+# --- 4. seed the OPTIONAL Loki secrets ------------------------------------------
+# Activity logging is opt-in: without these, log.sh writes to stderr only (still
+# visible in run logs) and everything else works. All three or none — a URL with
+# no credentials would just collect 401s that curl silently swallows.
+loki_missing=()
+for v in GENESIS_LOKI_URL GENESIS_LOKI_USER GENESIS_LOKI_TOKEN; do
+    is_placeholder "${!v:-}" && loki_missing+=("$v")
+done
+if [ "${#loki_missing[@]}" -eq 0 ]; then
+    printf '%s' "$GENESIS_LOKI_URL"   | gh secret set GENESIS_LOKI_URL
+    printf '%s' "$GENESIS_LOKI_USER"  | gh secret set GENESIS_LOKI_USER
+    printf '%s' "$GENESIS_LOKI_TOKEN" | gh secret set GENESIS_LOKI_TOKEN
+    echo "Loki activity logging enabled (3 secrets seeded)."
+elif [ "${#loki_missing[@]}" -eq 3 ]; then
+    echo "Loki not configured — activity logs go to stderr in the run logs only."
+else
+    echo "WARNING: partial Loki config, skipping. Missing: ${loki_missing[*]}" >&2
+    echo "         Set all three in $ENV_FILE and re-run to enable logging." >&2
+fi
+
+# --- 5. enable the workflows genesis disabled at publish ------------------------
 echo "Enabling workflows ..."
 gh workflow list --all --json id,name,state \
     | python3 -c "
