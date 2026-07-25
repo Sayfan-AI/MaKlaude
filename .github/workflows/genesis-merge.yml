@@ -62,12 +62,26 @@ jobs:
                 "GENESIS_LOKI_TOKEN": "${{ secrets.GENESIS_LOKI_TOKEN }}"
               }
             }
+          # Bot-only merge is a DELIBERATE decision, not an oversight (#81).
+          # This repo is public, so `pull_request` events fire for fork PRs from
+          # anyone. Auto-merging "any green PR" would let an arbitrary
+          # contributor land code on main with no human in the loop — exactly the
+          # least-privilege line MaKlaude itself is built around. Restricting to
+          # PRs the dev system authored keeps the trust boundary crisp.
+          #
+          # The consequence, accepted: a HUMAN-authored PR is not auto-merged. It
+          # is merged by the orchestrator on its next run (event-triggered on the
+          # PR, or the scheduled tick) after it verifies the checks are green —
+          # see "Dev system" in CLAUDE.md for the full policy. The
+          # event-triggered path is what stalled #79 green-but-unmerged, because
+          # that run died at max-turns; that budget is now 40 (#81).
           prompt: |
             CI just passed on a PR. Check if there are any open PRs created by genesis-dev-bot
             where all CI checks have passed. If so, merge them.
 
             Rules:
-            - Only merge PRs created by genesis-dev-bot[bot]
+            - Only merge PRs created by genesis-dev-bot[bot]. Human-authored PRs are
+              intentionally out of scope here — the orchestrator merges those. Leave them alone.
             - All CI checks must be passing
             - Use squash merge
             - After merging, close the corresponding task issue if one exists
