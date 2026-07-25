@@ -40,7 +40,7 @@ This repo runs autonomously via GitHub Actions, but **genesis ships those workfl
 
    It reads the App ID, App private key, and Anthropic key from your `~/.config/genesis/.env` (shared across all your genesis projects), verifies the App is installed here, sets them as this repo's Actions secrets, and enables the workflows. It refuses to run if any value is missing/placeholder or the App isn't installed. The next trigger (an issue/PR/comment event, a push, or the cron) then wakes the orchestrator and onboarding begins on issue #1.
 
-3. **(Optional) Observability & notifications** — set Loki credentials in `.genesis/config.toml` for logs, and configure the A2H gateway if you want Slack/email instead of GitHub-issue comms.
+3. **(Optional) Observability & notifications** — to ship agent activity logs to Grafana Cloud Loki, add all three of `GENESIS_LOKI_URL` (the Loki host, no path), `GENESIS_LOKI_USER` (numeric instance ID), and `GENESIS_LOKI_TOKEN` to `~/.config/genesis/.env` **before** running `activate.sh` — it seeds them as repo secrets and the workflows pass them to the logging hooks. Without them, activity logs still appear in the Actions run logs, just not in Loki. Configure the A2H gateway if you want Slack/email instead of GitHub-issue comms.
 
 ---
 

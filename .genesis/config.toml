@@ -15,14 +15,9 @@ Important boundary: humans configure which clusters MaKlaude monitors and operat
 Treat the well-known "multi-agent Kubernetes DevOps" pattern (a coordinator delegating to specialized analyze / remediate / communicate roles) as inspiration only — feel free to surpass it. Aim higher than a minimal demo: build something an operator would actually trust with real clusters.
 "
 
-[loki]
-# Grafana Cloud Loki push endpoint
-# Set via environment: GENCTL_LOKI_URL
-endpoint = ""
-# Set via environment: GENCTL_LOKI_USER
-user = ""
-# Set via environment: GENCTL_LOKI_TOKEN
-token = ""
+# Loki activity logging is configured entirely through the environment
+# (GENESIS_LOKI_URL / GENESIS_LOKI_USER / GENESIS_LOKI_TOKEN), not from this
+# file — the token is a secret and this file is committed.
 
 [issues]
 # Backend: "github" or "linear"
@@ -30,6 +25,6 @@ backend = "github"
 
 [a2h]
 # A2H gateway endpoint
-# Set via environment: GENCTL_A2H_GATEWAY_URL
+# Set via environment: GENESIS_A2H_GATEWAY_URL
 gateway_url = ""
 
