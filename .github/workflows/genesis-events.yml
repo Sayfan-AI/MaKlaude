@@ -62,7 +62,16 @@ jobs:
             - Event: ${{ github.event_name }} / ${{ github.event.action }}
 
             Assess this event in context of the project state and take appropriate action.
-          claude_args: "--max-turns 20 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
+          # 40 matches the scheduled orchestrator: this runs the SAME agent
+          # definition (.claude/agents/orchestrator.md), just on a different
+          # trigger, and an event usually arrives with MORE attached context
+          # than a cron tick (an issue plus a PR to review, merge and close).
+          # 20 was the tightest budget of any Claude-invoking workflow here and
+          # it died `error_max_turns` at turn 21 while working #78 + PR #79 —
+          # no progress, no diagnosis, just the safety-net escalation (#80).
+          # Same failure shape as the evolver's daily stalls (#38), fixed the
+          # same way. See #81. Floor enforced by test/devsystem.
+          claude_args: "--max-turns 40 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
 
       # Escalate a real run failure to a human. Runs only on job failure — no
       # separate watcher workflow, so it adds zero skipped runs to the Actions tab.
