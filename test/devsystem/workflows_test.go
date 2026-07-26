@@ -23,27 +23,37 @@ import (
 // budget. Any workflow containing it MUST appear in minTurns below.
 const claudeActionMarker = "anthropics/claude-code-action"
 
+// orchestratorClassFloor is the minimum budget for any workflow running an
+// open-ended agent definition: assess state, read issues/PRs/diffs, dispatch
+// subagents, and complete a unit of work.
+//
+// It is 40 because every earlier fix in this class raised only the ONE runner
+// that happened to fail, leaving the class floor where it was — so the same
+// failure recurred on whichever runner was next-tightest: #38 (evolver at 20),
+// #80/#81 (events at 20), #85 (evolver at 30), #87 (scheduled orchestrator at
+// 40). 40 is the lowest budget not yet observed to fail for this shape. A
+// runner should not have to die at max-turns to earn a workable budget, so this
+// floor moves for the class and individual budgets sit at or above it.
+//
+// See #89. Raising an individual budget above the floor is always fine.
+const orchestratorClassFloor = 40
+
+// narrowScopeFloor is for a single well-specified job with a fixed procedure
+// (check green PRs, squash merge, close the issue). Small on purpose — if such a
+// job needs more turns, something is wrong and failing fast is the right
+// outcome, so this floor deliberately does NOT track the class above.
+const narrowScopeFloor = 15
+
 // minTurns is the agreed minimum `--max-turns` per Claude-invoking workflow.
 //
-// Two tiers, deliberately:
-//
-//   - Orchestrator-class (30+): runs an open-ended agent definition that
-//     assesses state, reads issues/PRs/diffs and dispatches subagents — each
-//     subagent consuming turns from the same budget. The observed floor for
-//     this shape is ~30; below it, runs die mid-task.
-//   - Narrow-scope (15): a single well-specified job with a fixed procedure
-//     (check green PRs, squash merge, close the issue). Its budget is small on
-//     purpose — if it needs more turns, something is wrong and failing fast is
-//     the correct outcome.
-//
-// Raising a budget above its minimum is always fine. Lowering one below it, or
-// adding a Claude-invoking workflow without classifying it here, fails the test.
+// Lowering a budget below its floor, or adding a Claude-invoking workflow
+// without classifying it here, fails the test.
 var minTurns = map[string]int{
-	"genesis-orchestrator.yml": 30, // scheduled orchestrator; currently 40
-	"genesis-events.yml":       30, // same agent as above, event-triggered; currently 40 (#81)
-	"genesis-evolver.yml":      30, // self-improvement agent + subagents (#38)
-	"genesis-ci-failure.yml":   30, // CI triage: read logs, classify, fix or escalate
-	"genesis-merge.yml":        15, // narrow scope by design — see tier note above
+	"genesis-orchestrator.yml": orchestratorClassFloor, // scheduled; currently 60 — assess + one unit of work (#87)
+	"genesis-events.yml":       orchestratorClassFloor, // same agent, event-triggered; currently 40 (#81)
+	"genesis-evolver.yml":      orchestratorClassFloor, // self-improvement + subagents; currently 45 (#38, #85)
+	"genesis-ci-failure.yml":   orchestratorClassFloor, // CI triage: read logs, classify, fix or escalate
+	"genesis-merge.yml":        narrowScopeFloor,       // narrow scope by design — see floor note above
 }
 
 var maxTurnsRE = regexp.MustCompile(`--max-turns\s+(\d+)`)
@@ -93,7 +103,7 @@ func TestClaudeWorkflowsMeetTurnFloor(t *testing.T) {
 	for name, body := range claudeWorkflows(t) {
 		floor, classified := minTurns[name]
 		if !classified {
-			t.Errorf("%s invokes %s but has no entry in minTurns — classify it (orchestrator-class 30+, or narrow-scope) so its budget is guarded", name, claudeActionMarker)
+			t.Errorf("%s invokes %s but has no entry in minTurns — classify it (orchestratorClassFloor or narrowScopeFloor) so its budget is guarded", name, claudeActionMarker)
 			continue
 		}
 
