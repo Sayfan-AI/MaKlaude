@@ -91,9 +91,16 @@ jobs:
       # Deterministic re-trigger: guarantees the orchestrator wakes even if the
       # merge agent above hit max-turns or errored. Runs regardless of outcome.
       # Needs actions:write (workflow_dispatch) + contents:read (ref resolution).
+      #
+      # Dispatched via dispatch.sh, which retries before failing: because this
+      # step is load-bearing its failure fails the job and trips escalate.sh, so
+      # a single transient 502 used to manufacture a needs:human gate about
+      # nothing (#88/#91). Semantics after retries are exhausted: still fail —
+      # a just-merged PR wants prompt follow-up, and a dispatch that cannot be
+      # delivered at all means only the 6-hourly tick will pick the work up.
       - name: Re-trigger orchestrator
         if: always()
-        run: gh workflow run genesis-orchestrator.yml --ref main
+        run: bash .genesis/scripts/dispatch.sh genesis-orchestrator.yml main
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_REPO: ${{ github.repository }}

@@ -9,6 +9,11 @@ jobs:
     runs-on: ubuntu-latest
     if: github.actor != 'genesis-dev-bot[bot]'
     steps:
+      # Only for .genesis/scripts/dispatch.sh — no product code is needed here.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .genesis/scripts
+
       - uses: actions/create-github-app-token@v3
         id: app-token
         with:
@@ -17,9 +22,12 @@ jobs:
           permission-actions: write
           permission-contents: read
 
-      # Pin --ref so `gh` doesn't need a default-branch lookup, which requires
-      # repo metadata the actions-only token lacks (caused a hard failure before).
-      - run: gh workflow run genesis-orchestrator.yml --ref main
+      # dispatch.sh pins --ref (so `gh` doesn't do a default-branch lookup that
+      # needs repo metadata the actions-only token lacks) and retries transient
+      # 5xx before failing. Semantics after retries are exhausted: fail, so an
+      # orchestrator that genuinely never wakes is visible rather than silent.
+      - name: Trigger orchestrator
+        run: bash .genesis/scripts/dispatch.sh genesis-orchestrator.yml main
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_REPO: ${{ github.repository }}
