@@ -62,7 +62,17 @@ jobs:
           prompt: |
             Run the orchestrator agent defined in .claude/agents/orchestrator.md.
             This is a scheduled run — assess project state and advance work.
-          claude_args: "--max-turns 40 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
+          # 60, not 40: this is the only workflow that must BOTH assess full
+          # project state AND complete a unit of work in the same run, and it is
+          # the loop's last line of defence — the tick that picks up whatever the
+          # event/evolver runners dropped. At 40 it died `error_max_turns` at
+          # turn 41 (run 30194197251, #87) having just opened PR #86: the
+          # deliverable escaped but the bookkeeping — report, close, relabel —
+          # was truncated, and that is the part a human reads. Assess → read the
+          # issue → explore → write script + CLI subcommand + regression test →
+          # test → commit → push → open PR is ~40 turns with nothing left over.
+          # See #89. Floor enforced by test/devsystem/workflows_test.go.
+          claude_args: "--max-turns 60 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
 
       # Escalate a real run failure (e.g. agent hit max-turns) to a human. Runs
       # only on job failure — no separate watcher workflow, so it adds zero

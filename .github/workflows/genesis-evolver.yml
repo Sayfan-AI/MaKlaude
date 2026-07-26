@@ -51,9 +51,16 @@ jobs:
           # curate memory) that also dispatches subagents via the Agent tool —
           # each of which consumes turns from this budget. 15 turns (tied with the
           # narrow merge agent for the lowest budget) was too tight and the run
-          # hit max-turns daily (escalations on #38, Jun 22–24). 30 matches the
-          # ci-failure tier, which has the same toolset and comparable scope.
-          claude_args: "--max-turns 30 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
+          # hit max-turns daily (escalations on #38, Jun 22–24), so it went to 30.
+          #
+          # 30 then proved too tight in turn: run 30194200792 died at turn 31
+          # having produced NO artifact at all — no branch, no PR, no issue, no
+          # comment (#85). That is the most costly failure mode in the system,
+          # because a silent evolver means the self-improvement loop has stopped
+          # and nothing says so. 45 gives the full cycle (collect signals →
+          # classify → apply a fix → escalate → curate memory) room to finish and
+          # still report. See #89; floor enforced by test/devsystem.
+          claude_args: "--max-turns 45 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
 
       # Escalate a real run failure (e.g. agent hit max-turns) to a human. Without
       # this, an evolver failure is silent — nobody learns the self-improvement
