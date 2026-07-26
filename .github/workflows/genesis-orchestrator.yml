@@ -33,6 +33,16 @@ jobs:
           permission-pull-requests: write
           permission-workflows: write
 
+      # Deterministic stale-gate check, BEFORE the agent step on purpose: an
+      # unanswered needs:human gate parks the project silently (every run
+      # correctly does nothing — see #84), and running this first means the
+      # nudge still escapes if the agent later dies at max-turns.
+      - name: Nudge stale human gates
+        run: bash .genesis/scripts/nudge-gates.sh
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
