@@ -2,9 +2,35 @@ name: Genesis Evolver
 
 on:
   schedule:
-    # Run daily at 06:00 UTC
-    - cron: '0 6 * * *'
+    # 09:00, NOT 06:00. GitHub dispatches all of a repo's crons that share the
+    # same expression together, so `0 6 * * *` here fired in the same batch as
+    # the 6-hourly orchestrator's 06:00 tick — every single day. Both were then
+    # delayed by the same 1.5–3.5h and started within 1–21 seconds of each
+    # other (15/15 days sampled; 2026-07-27 was 2s apart). A distinct hour makes
+    # them independently dispatched, so an overlap becomes coincidence rather
+    # than a guarantee. 09:00 is the midpoint of the 06:00/12:00 orchestrator
+    # ticks, i.e. maximally far from both. See the concurrency note below.
+    - cron: '0 9 * * *'
   workflow_dispatch: {}
+
+# The evolver mutates the repo exactly like the orchestrator does — it commits,
+# pushes branches, opens PRs and comments on issues — so it belongs in the same
+# serialization group as every other repo-mutating agent (scheduled, events,
+# ci-failure). It was the one left out, which meant two Claude sessions ran
+# fully in parallel on this repo every day: the very "two orchestrators
+# duplicating work" case this group was created to prevent.
+#
+# Trade-off, accepted deliberately: with `cancel-in-progress: false` GitHub
+# still cancels an *older pending* run when a newer one queues into the group,
+# so a queued evolver can be superseded by an orchestrator event run — silently,
+# since a run cancelled while pending never starts a job and so cannot trip the
+# `if: failure()` escalation below. That is why the cron moved too: staggering
+# turns "queues behind the orchestrator daily" into "queues rarely", which keeps
+# the supersession window small. Parallel execution is the worse failure, and
+# unlike supersession it was happening 100% of the time.
+concurrency:
+  group: genesis-orchestrator-${{ github.repository }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
