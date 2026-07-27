@@ -67,13 +67,13 @@ jobs:
             1. Find the PR for branch "${{ github.event.workflow_run.head_branch }}". Read the failing run's logs first (`gh run view <id> --log-failed`) — the App now has actions:read so this works (genesis #14/#17 track the remaining scaffold-YAML gap). Only if you actually hit HTTP 403 (a regression), do not retry; diagnose from readable signals (gh pr checks, statusCheckRollup, the workflow YAML, the PR diff, failure cadence). See orchestrator.md "Handling failures" step 1.
             2. Classify: transient/infra (re-run), a small well-understood defect (fix on the PR branch and push), or large/ambiguous.
             3. If you cannot fix it quickly and confidently within your turn budget, do NOT attempt a heroic inline fix. Escalate: comment a concise diagnosis on the PR's task issue, label it needs:human, and stop. Do not loop.
-          # 40 is the orchestrator-class floor (#89): this runs the same agent
-          # definition as the scheduled/events orchestrators, and reading a
-          # failing run's logs then fixing on the PR branch is not obviously
-          # cheaper than a cron tick's work. Raised from 30 with the class, not
-          # in response to a failure here — the point of a class floor is that a
-          # runner does not have to fail first to get a workable budget.
-          claude_args: "--max-turns 40 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
+          # 60 is the orchestrator-class floor (#89, raised in #96): this runs
+          # the same agent definition as the scheduled/events orchestrators, and
+          # reading a failing run's logs then fixing on the PR branch is not
+          # obviously cheaper than a cron tick's work. Raised with the class both
+          # times, not in response to a failure here — the point of a class floor
+          # is that a runner does not have to fail first to get a workable budget.
+          claude_args: "--max-turns 60 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
 
       # Escalate a real triage-run failure to a human (only on job failure).
       - name: Escalate on failure

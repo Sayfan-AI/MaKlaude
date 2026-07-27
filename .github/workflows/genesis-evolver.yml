@@ -83,10 +83,15 @@ jobs:
           # having produced NO artifact at all — no branch, no PR, no issue, no
           # comment (#85). That is the most costly failure mode in the system,
           # because a silent evolver means the self-improvement loop has stopped
-          # and nothing says so. 45 gives the full cycle (collect signals →
-          # classify → apply a fix → escalate → curate memory) room to finish and
-          # still report. See #89; floor enforced by test/devsystem.
-          claude_args: "--max-turns 45 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
+          # and nothing says so.
+          #
+          # 45 then failed the same way: run 30254684025 died at turn 46 (#96)
+          # seconds after PR #95 merged and its #81 comment posted — the full
+          # cycle (collect signals → classify → apply a fix → escalate → curate
+          # memory) fits, the wrap-up does not. 60 matches the class floor, which
+          # now sits strictly above every budget observed to fail. See #89, #96;
+          # floor enforced by test/devsystem/workflows_test.go.
+          claude_args: "--max-turns 60 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
 
       # Escalate a real run failure (e.g. agent hit max-turns) to a human. Without
       # this, an evolver failure is silent — nobody learns the self-improvement
