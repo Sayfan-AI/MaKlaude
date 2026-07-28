@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Genesis issue manager — abstraction over gh CLI
-# Supports: create, list, gates, stale-gates, close, assign, comment, label, view
+# Supports: create, list, gates, stale-gates, red-prs, close, assign, comment,
+#           label, view
 set -euo pipefail
 
 CMD="${1:-help}"
@@ -90,6 +91,64 @@ for age, i in rows:
 # All open gate issues as JSON, for format_gates to render.
 fetch_gates() {
     gh issue list --state open --label "$GATE_LABEL" --json "$FIELDS" --limit 100
+}
+
+# Open PRs with at least one failing required check, rendered with their age.
+#
+# Why this exists: `genesis-ci-failure.yml` is the wake-on-CI-failure net, and it
+# is *event-payload dependent* — it can only triage the run named in
+# `github.event.workflow_run`. Only one run per concurrency group may be pending,
+# so a burst evicts all but the newest, and the newest carries a DIFFERENT payload
+# (usually a passing check) and skips. That is not a recoverable delay, it is a
+# permanent drop: the failure's triage run never existed. It happened on the only
+# genuine CI failure in the repo's history (2026-07-05, run 28736219761) and the
+# net has 0 successes in 157 runs.
+#
+# The generalizable half: work derived from an *event payload* is lost under
+# supersession, while work derived from *repo state* self-heals — the scheduled
+# tick simply re-derives it. So "which PRs are red" is computed here from live
+# state and printed by `summary` on every tick. A dropped triage event now costs
+# at most one cycle instead of being invisible forever.
+#
+# Reads `gh pr list --json` output on stdin. Prints nothing when no PR is red, so
+# callers can treat empty output as all-clear.
+format_red_prs() {
+    python3 -c "
+import sys, json
+from datetime import datetime, timezone
+
+prs = json.load(sys.stdin)
+now = datetime.now(timezone.utc)
+
+rows = []
+for p in prs:
+    # statusCheckRollup mixes CheckRun (conclusion/name) and StatusContext
+    # (state/context) shapes; a red PR is one where either says so. PENDING is
+    # not failure — a PR mid-CI is not stuck and must not be reported as such.
+    failing = []
+    for c in p.get('statusCheckRollup') or []:
+        verdict = c.get('conclusion') or c.get('state') or ''
+        if verdict.upper() in ('FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED'):
+            failing.append(c.get('name') or c.get('context') or '?')
+    if not failing:
+        continue
+    updated = datetime.fromisoformat(p['updatedAt'].replace('Z', '+00:00'))
+    rows.append(((now - updated).days, p, failing))
+
+# Stalest first: a PR that has been red for days is the one being forgotten.
+rows.sort(key=lambda r: -r[0])
+
+for age, p, failing in rows:
+    draft = ' [draft]' if p.get('isDraft') else ''
+    print('#%d  red %dd — %s%s (%s)\n      failing: %s' % (
+        p['number'], age, p['title'], draft, p['headRefName'], ', '.join(sorted(set(failing)))))
+"
+}
+
+# Open PRs plus their check rollup, for format_red_prs to filter and render.
+fetch_prs() {
+    gh pr list --state open --limit 100 \
+        --json number,title,headRefName,isDraft,updatedAt,statusCheckRollup
 }
 
 case "$CMD" in
@@ -185,6 +244,12 @@ json.dump(filtered, sys.stdout)
         fetch_gates | format_gates "$STALE_DAYS" "$ONLY_STALE" "$FORMAT"
         ;;
 
+    red-prs)
+        # Open PRs with failing checks (empty output = all clear). State-derived,
+        # so it recovers a dropped ci-failure triage event — see format_red_prs.
+        fetch_prs | format_red_prs
+        ;;
+
     blocked)
         # Shortcut: list all blocked issues
         gh issue list --state open --label "blocked" --json "$FIELDS" --limit 100 | format_issues
@@ -213,6 +278,13 @@ json.dump(filtered, sys.stdout)
         # always in front of the run, not something it has to derive from dates.
         echo "=== Human Gates (awaiting a person, oldest first) ==="
         fetch_gates | format_gates "$DEFAULT_STALE_DAYS" "" "text"
+        echo ""
+        # Unconditional, same reasoning as the gates section: the wake-on-failure
+        # workflow is event-payload dependent and its event is routinely dropped by
+        # concurrency supersession, so a red PR must also be visible from state
+        # alone. Empty here means no PR is red.
+        echo "=== Red PRs (failing checks — triage or escalate) ==="
+        fetch_prs | format_red_prs
         echo ""
         echo "=== Blocked ==="
         gh issue list --state open --label "blocked" --json "$FIELDS" --limit 100 | format_issues
@@ -314,6 +386,7 @@ Commands:
   list      List issues with filtering
   gates       List open needs:human gates with their age (stale ones flagged)
   stale-gates List only gates past the staleness threshold (empty = all clear)
+  red-prs     List open PRs with failing checks, stalest first (empty = all clear)
   blocked   List all blocked issues
   recent    List recently updated issues (default: last 24h)
   summary   Overview of project state

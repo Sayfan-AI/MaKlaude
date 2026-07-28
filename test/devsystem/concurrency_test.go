@@ -72,6 +72,38 @@ func mapValue(node *yaml.Node, key string) *yaml.Node {
 	return nil
 }
 
+// jobNodes returns each job's (name, mapping node) in a workflow, in file order.
+func jobNodes(t *testing.T, name string) [][2]interface{} {
+	t.Helper()
+	jobs := mapValue(parseWorkflow(t, name), "jobs")
+	if jobs == nil || jobs.Kind != yaml.MappingNode {
+		t.Fatalf("%s: no `jobs:` mapping", name)
+	}
+	var out [][2]interface{}
+	for i := 0; i+1 < len(jobs.Content); i += 2 {
+		out = append(out, [2]interface{}{jobs.Content[i].Value, jobs.Content[i+1]})
+	}
+	return out
+}
+
+// concurrencyNode finds a workflow's concurrency block at EITHER level, because
+// both are legitimate and the choice is load-bearing (see
+// TestGatedWorkflowsJoinGroupBelowTheirGate). Returning them uniformly lets the
+// group-identity and no-cancel guards below stay level-agnostic: what they check
+// is that the mutex is correct, not where it is declared.
+func concurrencyNode(t *testing.T, name string) *yaml.Node {
+	t.Helper()
+	if c := mapValue(parseWorkflow(t, name), "concurrency"); c != nil {
+		return c
+	}
+	for _, j := range jobNodes(t, name) {
+		if c := mapValue(j[1].(*yaml.Node), "concurrency"); c != nil {
+			return c
+		}
+	}
+	return nil
+}
+
 // parseWorkflow returns the root mapping node of a workflow file.
 func parseWorkflow(t *testing.T, name string) *yaml.Node {
 	t.Helper()
@@ -99,9 +131,9 @@ func TestAgentWorkflowsDeclareSerializationGroup(t *testing.T) {
 			continue
 		}
 
-		conc := mapValue(parseWorkflow(t, name), "concurrency")
+		conc := concurrencyNode(t, name)
 		if conc == nil {
-			t.Errorf("%s declares no `concurrency:` block — it can run in parallel with another agent session on the same repo", name)
+			t.Errorf("%s declares no `concurrency:` block at workflow or job level — it can run in parallel with another agent session on the same repo", name)
 			continue
 		}
 		group := mapValue(conc, "group")
@@ -129,7 +161,7 @@ func TestAgentWorkflowsDoNotCancelEachOther(t *testing.T) {
 		if want != sharedGroup {
 			continue
 		}
-		conc := mapValue(parseWorkflow(t, name), "concurrency")
+		conc := concurrencyNode(t, name)
 		if conc == nil {
 			continue // already reported by the test above
 		}
@@ -140,6 +172,49 @@ func TestAgentWorkflowsDoNotCancelEachOther(t *testing.T) {
 		}
 		if cancel.Value != "false" {
 			t.Errorf("%s sets cancel-in-progress: %s in the shared group — a new tick would abort an agent mid-commit, leaving a half-pushed branch and no diagnosis", name, cancel.Value)
+		}
+	}
+}
+
+// TestGatedWorkflowsJoinGroupBelowTheirGate is the guard for the pending-slot
+// eviction bug. GitHub keeps at most ONE pending run per concurrency group and
+// cancels the older pending one when a newer arrives. A workflow-level group is
+// joined before any job's `if:` is evaluated, so a run that will skip still takes
+// the single pending slot and can evict a run that has real work to do.
+//
+// That is not hypothetical. Both of this repo's event-triggered agent workflows
+// had their group at workflow level, and both were dominated by evictions:
+// Genesis Orchestrator (Events) 132 cancelled vs 12 successful; Genesis CI
+// Failure Triage 76 cancelled and **zero** successful in 157 runs. On 2026-07-05
+// the only genuine CI failure in the repo's history (run 28736219761, 09:29:04)
+// queued a triage run that was evicted at 09:31:08 by a no-op trigger — one that
+// would have skipped in about a second. The failing PR was never triaged, and
+// because a run cancelled while *pending* starts no job, the `if: failure()`
+// escalation could not fire either: the loss left no trace anywhere.
+//
+// So: if a job is gated by `if:`, its group must be declared on the job, so the
+// gate runs first and no-op triggers never compete. Checked as membership over
+// every Claude-invoking workflow rather than per file — the same shape as the
+// turn-budget floors and the group itself, both of which failed exactly once as
+// opt-in properties.
+func TestGatedWorkflowsJoinGroupBelowTheirGate(t *testing.T) {
+	for name := range claudeWorkflows(t) {
+		root := parseWorkflow(t, name)
+		wfLevel := mapValue(root, "concurrency") != nil
+
+		for _, j := range jobNodes(t, name) {
+			jobName, node := j[0].(string), j[1].(*yaml.Node)
+			gate := mapValue(node, "if")
+			if gate == nil {
+				continue // ungated: nothing can be evaluated before the group anyway
+			}
+			if wfLevel {
+				t.Errorf("%s job %q is gated by `if:` but the concurrency group is declared at WORKFLOW level: the group is joined before the gate, so a run this gate would skip still occupies the group's single pending slot and can evict a run with real work. Move `concurrency:` onto the job.", name, jobName)
+				continue
+			}
+			if mapValue(node, "concurrency") == nil {
+				t.Errorf("%s job %q is gated by `if:` and declares no job-level `concurrency:` — with none at workflow level either it is unserialized against the other agents", name, jobName)
+			}
 		}
 	}
 }
