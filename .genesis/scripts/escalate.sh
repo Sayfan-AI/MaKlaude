@@ -16,17 +16,57 @@
 # cadence, clean triage, bounded issue count. Mirrors internal/escalate's
 # issue-per-problem design for cluster findings.
 #
+# The escalation also reports WHAT THE FAILED RUN LANDED, because "the run died"
+# is not actually the question a human has — "did anything land, or is the repo
+# where it was?" is. A run that hits max-turns has usually already produced its
+# deliverable and lost only the wrap-up: #87 died at turn 41 seconds after
+# opening PR #86, #96 died at turn 46 seconds after merging PR #95. Both
+# escalations said only "run failed", so both cost a human a manual hunt, and
+# #87's fix sat in an auto-merged PR while its escalation stayed open. CLAUDE.md
+# records "verify the artifact first" as a rule an agent must remember; this
+# makes it something the escalation just tells you (#97).
+#
 # Required env:
 #   GH_TOKEN  token with issues:write (the workflow's app token)
 #   GH_REPO   owner/repo
 #   WF_NAME   the failing workflow's name
 #   RUN_URL   URL of the failed run
+# Optional env:
+#   GENESIS_RUN_STARTED           ISO8601 UTC start of the failed run; when unset,
+#                                 falls back to a lookback window
+#   GENESIS_ARTIFACT_LOOKBACK_MIN lookback in minutes for that fallback (default 120)
 set -euo pipefail
 
 : "${GH_TOKEN:?GH_TOKEN required}"
 : "${GH_REPO:?GH_REPO required}"
 WF_NAME="${WF_NAME:-unknown workflow}"
 RUN_URL="${RUN_URL:-(run url unavailable)}"
+LOOKBACK_MIN="${GENESIS_ARTIFACT_LOOKBACK_MIN:-120}"
+
+# The window this run could plausibly have written in. A lookback can only
+# over-report (an artifact from an adjacent run), which is a bounded and honest
+# error — every repo-mutating agent shares one concurrency group, so overlap is
+# rare — whereas under-reporting recreates the exact "run failed, nothing else
+# said" triage cost this section exists to remove.
+since="${GENESIS_RUN_STARTED:-$(date -u -d "-${LOOKBACK_MIN} minutes" +%Y-%m-%dT%H:%M:%SZ)}"
+
+# REST issues endpoint, NOT `gh issue list --search`: search is index-lagged by
+# up to a minute or two and the artifacts that matter here were created seconds
+# before the run died, so search would routinely miss precisely the ones worth
+# reporting. `since` + `sort=updated` is served from the primary and is exact.
+# The endpoint returns pull requests as well as issues (a PR is an issue with a
+# `pull_request` key), so one call covers both; an issue comment bumps
+# `updated_at`, so a posted diagnosis shows up too.
+artifacts=$(gh api --method GET "repos/${GH_REPO}/issues" \
+  -f state=all -f sort=updated -f direction=desc -f per_page=30 -f since="$since" \
+  --jq '.[] | "- \(if .pull_request then "PR" else "Issue" end) #\(.number) (\(.state)) — \(.title)\n  \(.html_url)"' \
+  2>/dev/null || true)
+
+if [ -n "$artifacts" ]; then
+  landed=$(printf 'Touched since %s — **triage these before assuming the run achieved nothing**:\n\n%s\n\nIf the deliverable is already here (a green PR, a posted diagnosis), the run lost only its wrap-up: finish the bookkeeping and close this issue rather than redoing the work.' "$since" "$artifacts")
+else
+  landed=$(printf 'No issue or PR was touched since %s. Also check for a pushed branch with no PR before concluding nothing landed.' "$since")
+fi
 
 # Stable per-workflow dedup key. Hidden HTML comment so it never renders but is
 # reliably greppable in the issue body.
@@ -38,7 +78,7 @@ marker="<!-- genesis-failure-wf: ${WF_NAME} -->"
 existing=$(gh issue list --state open --label "automation:failure" --json number,body \
   | jq -r --arg m "$marker" '[.[] | select(.body | contains($m)) | .number] | first // empty')
 
-body=$(printf 'A workflow run failed and the loop could not self-advance.\n\n- Workflow: **%s**\n- Failed run: %s\n\nLikely cause: the agent hit max-turns, an API error, or an unrecoverable task. Review the run, unblock, and close this issue once resolved.\n\n%s' "$WF_NAME" "$RUN_URL" "$marker")
+body=$(printf 'A workflow run failed and the loop could not self-advance.\n\n- Workflow: **%s**\n- Failed run: %s\n\nLikely cause: the agent hit max-turns, an API error, or an unrecoverable task.\n\n### What this run may already have landed\n\n%s\n\n%s' "$WF_NAME" "$RUN_URL" "$landed" "$marker")
 
 if [ -n "$existing" ]; then
   gh issue comment "$existing" --body "$body"
