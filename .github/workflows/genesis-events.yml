@@ -10,12 +10,6 @@ on:
   issue_comment:
     types: [created]
 
-# Serialize all orchestrator activity across triggers (events, schedule, merge)
-# so two near-simultaneous events can't run two orchestrators and duplicate work.
-concurrency:
-  group: genesis-orchestrator-${{ github.repository }}
-  cancel-in-progress: false
-
 permissions:
   contents: write
   issues: write
@@ -23,6 +17,24 @@ permissions:
 
 jobs:
   orchestrate:
+    # Serialize all orchestrator activity across triggers (events, schedule,
+    # merge) so two near-simultaneous events can't run two orchestrators and
+    # duplicate work. Declared on the JOB, not the workflow, so the bot-actor
+    # gate below is evaluated *before* the group is joined.
+    #
+    # Only one run per group may be pending; a newer arrival cancels the older
+    # pending one. At workflow level the group is joined before any `if:` runs, so
+    # the bot-authored events this job exists to ignore still took the single
+    # pending slot and evicted real ones. Over the repo's history that is 132
+    # cancelled runs against 12 successes — and because a run cancelled while
+    # pending starts no job, none of the 132 could trip the `if: failure()`
+    # escalation below. Bot events outnumber human ones heavily here (a merge alone
+    # fires issues + issue_comment + pull_request), so the eviction was near
+    # constant. With the group here, a bot-triggered run skips in ~1s without ever
+    # queueing.
+    concurrency:
+      group: genesis-orchestrator-${{ github.repository }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     # Skip events from bots to prevent loops
     if: github.actor != 'github-actions[bot]' && github.actor != 'genesis-dev-bot[bot]' && github.actor != 'claude[bot]'

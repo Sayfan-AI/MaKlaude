@@ -14,10 +14,6 @@ on:
       - "E2E (kind)"
     types: [completed]
 
-concurrency:
-  group: genesis-orchestrator-${{ github.repository }}
-  cancel-in-progress: false
-
 permissions:
   contents: write
   issues: write
@@ -25,6 +21,35 @@ permissions:
 
 jobs:
   triage:
+    # The gate is `if:`, and it MUST be evaluated before the concurrency group is
+    # joined — hence the group lives on this job, not on the workflow.
+    #
+    # GitHub allows only ONE pending run per concurrency group: when a newer run
+    # queues, the older pending one is cancelled. A workflow-level group is joined
+    # before any job's `if:` runs, so a run with nothing to do still occupies the
+    # single pending slot and can evict a run that has real work. That is not
+    # theoretical — it is why this workflow, the loop's wake-on-CI-failure safety
+    # net, had **0 successful runs in 157** and never once fired:
+    #
+    #   09:28:28  E2E (kind) SUCCEEDED -> triage run queued; would have skipped,
+    #                                     but sits in the one pending slot anyway
+    #   09:29:04  CI FAILED            -> triage run queued: the real one
+    #   09:31:08  next no-op queued    -> evicts the CI-failure run. Never ran.
+    #
+    # The only genuine CI failure in the repo's history was dropped by runs that
+    # would have skipped in one second. Worse, a run cancelled while *pending*
+    # starts no job, so it cannot trip the `if: failure()` escalation below — the
+    # loss is completely invisible.
+    #
+    # With the group here, a run whose `if:` is false is skipped without ever
+    # queueing, so no-op triggers stop competing. Real work still queues (correctly
+    # — this agent pushes fixes and must not race the orchestrator), and the
+    # residual case of two *real* runs colliding is covered deterministically by
+    # `issues.sh red-prs`, which re-derives failing PRs from repo state on every
+    # scheduled tick instead of depending on this event surviving.
+    concurrency:
+      group: genesis-orchestrator-${{ github.repository }}
+      cancel-in-progress: false
     if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     steps:

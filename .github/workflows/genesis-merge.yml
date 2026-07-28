@@ -13,15 +13,6 @@ on:
     workflows: ["CI", "E2E (kind)"]
     types: [completed]
 
-# Auto-merge gets its OWN group, NOT the orchestrator group. Sharing it meant a
-# triage/orchestrator run already in the group would starve and cancel the
-# Auto-Merge run that fires on a green PR — leaving the PR green but unmerged and
-# the milestone stalled. Merges only need to serialize among themselves; a merge
-# (server-side squash) running alongside an orchestrator is harmless.
-concurrency:
-  group: genesis-merge-${{ github.repository }}
-  cancel-in-progress: false
-
 permissions:
   contents: write
   issues: write
@@ -29,6 +20,24 @@ permissions:
 
 jobs:
   merge:
+    # Auto-merge gets its OWN group, NOT the orchestrator group. Sharing it meant a
+    # triage/orchestrator run already in the group would starve and cancel the
+    # Auto-Merge run that fires on a green PR — leaving the PR green but unmerged and
+    # the milestone stalled. Merges only need to serialize among themselves; a merge
+    # (server-side squash) running alongside an orchestrator is harmless.
+    #
+    # Declared on the JOB so the `if:` below is evaluated *before* the group is
+    # joined. A separate group bounded who could evict this workflow but not
+    # whether it evicts itself: only one run per group may be pending, and the
+    # `workflow_run` trigger fires on every CI/E2E completion including pushes to
+    # main, which this gate skips. Those no-ops took the pending slot and cancelled
+    # real merge candidates — 10 cancelled runs, the same green-but-unmerged
+    # outcome the separate group was introduced to prevent, and invisible because a
+    # run cancelled while pending starts no job and so cannot trip `if: failure()`.
+    # Gate first, and a non-PR completion exits in ~1s without ever queueing.
+    concurrency:
+      group: genesis-merge-${{ github.repository }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     # Only run when CI succeeds on a PR
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
