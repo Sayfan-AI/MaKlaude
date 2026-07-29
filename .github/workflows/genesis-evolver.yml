@@ -72,6 +72,14 @@ jobs:
           prompt: |
             Run the evolver agent defined in .claude/agents/evolver.md.
             This is a scheduled review cycle — review recent system behavior and apply improvements.
+
+            FIRST, as soon as you know what you intend to do this cycle (right after
+            collecting signals, before any implementation), record it:
+              bash .genesis/scripts/checkpoint.sh "what I intend to do, and why"
+            If this run later dies at max-turns, that checkpoint is the only record
+            of your reasoning a human gets. One turn, before the unbounded work.
+            This runner has died with NO artifact at all (#85) — the checkpoint is
+            what makes that case say something instead of nothing.
           # The evolver runs the broadest open-ended work of any agent: a full
           # system review (collect signals → classify → apply fixes → escalate →
           # curate memory) that also dispatches subagents via the Agent tool —
