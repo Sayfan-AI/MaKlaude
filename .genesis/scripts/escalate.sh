@@ -63,7 +63,26 @@ else
   # Not a neutral absence: either the run died before its first write (the #85
   # shape — no artifact, no intent, and the costliest failure in the system), or
   # the agent skipped the instruction. Both are worth saying out loud.
-  intent='No intent checkpoint was recorded. Either the run died before its first action, or it skipped the checkpoint step — if there is also no artifact below, this run left no trace of its reasoning and the transcript in the run log is the only source.'
+  intent='No intent checkpoint was recorded. Either the run died before its first action, or it skipped the checkpoint step — if there is also no artifact below, this run left no trace of its stated reasoning and the retained transcript (see below) is the only source.'
+fi
+
+# Where the transcript went. Intent says what the run meant to do and artifacts
+# say what it produced; neither says where the turns actually WENT — which
+# approaches it tried, which dead ends it burned turns on. That is the middle of
+# the run, and it used to die with the runner: the Actions log holds `init` +
+# `result` and zero tool calls (#104 measured 469 lines). retain-transcript.sh
+# copies the full SDK message list to the private Loki sink after the agent step
+# (#106). Ask it for its status path rather than recomputing the default, for the
+# same reason as the checkpoint above — two derivations of one path drift, and
+# the symptom is this section claiming nothing was retained while it sits on disk.
+TRANSCRIPT_STATUS="$(bash "$SCRIPT_DIR/retain-transcript.sh" --path 2>/dev/null || true)"
+if [ -n "$TRANSCRIPT_STATUS" ] && [ -s "$TRANSCRIPT_STATUS" ]; then
+  transcript="$(cat "$TRANSCRIPT_STATUS")"
+else
+  # The retention step is `if: always()`, so a missing status means it never ran
+  # at all — the job died before reaching it, or the workflow is missing the
+  # step (which test/devsystem/transcript_test.go exists to prevent).
+  transcript='**Transcript: unknown** — no retention status was written, so the `retain-transcript.sh` step did not run. Either the job was torn down before reaching it, or this workflow is missing the step; `test/devsystem/transcript_test.go` asserts every Claude-invoking workflow has one.'
 fi
 
 # Whether a deliverable landed is not just triage colour — it is the ONLY signal
@@ -117,7 +136,7 @@ marker="<!-- genesis-failure-wf: ${WF_NAME} -->"
 existing=$(gh issue list --state open --label "automation:failure" --json number,body \
   | jq -r --arg m "$marker" '[.[] | select(.body | contains($m)) | .number] | first // empty')
 
-body=$(printf 'A workflow run failed and the loop could not self-advance.\n\n- Workflow: **%s**\n- Failed run: %s\n\nLikely cause: the agent hit max-turns, an API error, or an unrecoverable task.\n\n### What this run was trying to do\n\n%s\n\n### What this run may already have landed\n\n%s\n\n%s' "$WF_NAME" "$RUN_URL" "$intent" "$landed" "$marker")
+body=$(printf 'A workflow run failed and the loop could not self-advance.\n\n- Workflow: **%s**\n- Failed run: %s\n\nLikely cause: the agent hit max-turns, an API error, or an unrecoverable task.\n\n### What this run was trying to do\n\n%s\n\n### What this run may already have landed\n\n%s\n\n### Where the transcript is\n\n%s\n\n%s' "$WF_NAME" "$RUN_URL" "$intent" "$landed" "$transcript" "$marker")
 
 if [ -n "$existing" ]; then
   gh issue comment "$existing" --body "$body"

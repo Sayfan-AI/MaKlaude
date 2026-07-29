@@ -94,6 +94,21 @@ jobs:
           # by test/devsystem/workflows_test.go.
           claude_args: "--max-turns 60 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
 
+      # Copy this run's transcript (reasoning + tool calls) off the runner
+      # before it is torn down, and BEFORE the escalation below, which renders
+      # the retention status. `always()`: a dying run's transcript is the one
+      # that matters most, and a healthy run's is the baseline it is read
+      # against. Sink is private Loki — `show_full_output` deliberately stays
+      # off, because run logs and artifacts are world-readable on this public
+      # repo. See #106 and .genesis/scripts/retain-transcript.sh.
+      - name: Retain agent transcript
+        if: always()
+        run: bash .genesis/scripts/retain-transcript.sh
+        env:
+          GENESIS_LOKI_URL: ${{ secrets.GENESIS_LOKI_URL }}
+          GENESIS_LOKI_USER: ${{ secrets.GENESIS_LOKI_USER }}
+          GENESIS_LOKI_TOKEN: ${{ secrets.GENESIS_LOKI_TOKEN }}
+
       # Escalate a real run failure to a human. Runs only on job failure — no
       # separate watcher workflow, so it adds zero skipped runs to the Actions tab.
       - name: Escalate on failure
