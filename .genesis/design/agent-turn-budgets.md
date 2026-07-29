@@ -127,11 +127,85 @@ Guard: `test/devsystem/escalate_test.go` asserts (a) every workflow containing
 the build — and (b) `escalate.sh` still performs artifact discovery and still
 avoids the search API.
 
-## What is deliberately not solved
+## Follow-up: intent checkpointing (the condition fired)
 
-A run that dies at max-turns still loses its *reasoning*: the escalation reports
-what landed, not why the agent thought it was landing it. Recovering that would
-need the agent to checkpoint intent early (cheap: one comment before starting
-work), which is an agent-instruction change rather than a workflow change and is
-not attempted here. If max-turns deaths continue after this, that — not another
-raise, and not a split — is the next thing to try.
+This section previously read "deliberately not solved", with a condition
+attached: a run that dies at max-turns still loses its *reasoning* — the
+escalation reports what landed, not why the agent thought it was landing it — and
+if max-turns deaths continued **after** artifact discovery shipped, checkpointing
+intent early was the next thing to try, *not* another raise and *not* a split.
+
+**#101 was that continued death.** The evolver hit max-turns again after PR #99
+landed artifact discovery. Triage was genuinely cheaper — the escalation named PR
+#100 and a human could see the deliverable had escaped — but it still said
+nothing about why the run chose that work. So the condition fired and the
+follow-up is now implemented.
+
+### What was implemented
+
+`.genesis/scripts/checkpoint.sh`. The agent calls it once, as its first write,
+with a sentence on what it intends to do and why. `escalate.sh` renders it under
+**"What this run was trying to do"**, above the landed-artifacts section.
+
+Three design points worth keeping:
+
+1. **A file, not an issue comment.** Intent only matters when the run *fails*;
+   posting it every run would put a paragraph nobody reads on an issue every six
+   hours. `$RUNNER_TEMP` persists across steps within a job, which is exactly the
+   span needed (agent step writes → `if: failure()` step reads). It also means no
+   token and no network, so the checkpoint has no API failure mode — a step that
+   could 502 on every agent run would manufacture the same false escalation #91
+   removed. Accepted cost: a run cancelled mid-flight loses its checkpoint, which
+   is the benign-cancellation case `escalate.sh` already declines to report on.
+2. **`checkpoint.sh --path` is the single source of truth for the location.**
+   `escalate.sh` asks the script rather than recomputing the default. Two scripts
+   independently deriving one shared path drift, and the symptom would be an
+   escalation reporting "no intent recorded" while the file sits on disk.
+3. **Absence is reported, not omitted.** "No intent checkpoint was recorded" is
+   itself diagnostic: combined with no artifact, that is the #85 shape — died
+   before the first action — and a human should be told which of the two
+   happened rather than shown a blank section.
+
+Note this does **not** violate the rule the rest of this doc turns on. Intent is
+the one thing that *cannot* be moved outside the agent's budget, because only the
+agent knows it. What it gets instead is position: it is the first turn spent,
+before the unbounded implementation work that is what actually exhausts the
+budget. Same shape as `nudge-gates.sh` running before the agent step (#84) —
+early, so it escapes a later death.
+
+### Guard
+
+`test/devsystem/checkpoint_test.go`: membership (every workflow classified at
+`orchestratorClassFloor` instructs the checkpoint, and marks it as the run's
+FIRST action — placement is the whole point, since a checkpoint written after the
+implementation has already been crowded out) plus the read side (`escalate.sh`
+renders the intent section, resolves the path via `checkpoint.sh --path`, and
+says something explicit when no checkpoint exists) plus a round-trip that
+executes the script with a bare environment.
+
+Scope comes from the existing `minTurns` classification rather than a new list.
+A workflow at `orchestratorClassFloor` is by definition one whose work is chosen
+*during* the run, which is precisely when intent is unrecoverable afterwards; the
+narrow fixed-procedure runner (`genesis-merge.yml`) is exempt because its intent
+*is* its prompt and the escalation already names the workflow. Deriving both
+guards from one classification is what keeps that exemption principled instead of
+an ad-hoc name that quietly grows.
+
+### Still open
+
+The instruction currently lives in the **workflow prompts** only. Mirroring it
+into `.claude/agents/orchestrator.md` and `.claude/agents/evolver.md` — where an
+agent reading its own definition would also see it — was attempted and the edit
+was **declined** (the same `.claude/` write restriction that blocked correcting
+`evolver.md`'s stale step 4, see CLAUDE.md). The prompt is the surface the
+membership test guards, so the property holds; the agent-md mirror is a
+readability improvement a human can apply.
+
+### What to do if a max-turns death still loses information after this
+
+Both cheap fixes are now in place: what landed (artifact discovery) and what was
+intended (this). What remains unrecoverable is the *middle* — the specific dead
+ends a run burned turns on. That is a transcript-retention problem, not a budget
+or topology problem, so the next thing to try is exporting the agent transcript
+as a run artifact rather than any change to how the work is divided. Raising a
+budget and splitting coordinator from worker both remain rejected; see above.

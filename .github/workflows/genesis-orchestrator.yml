@@ -62,6 +62,12 @@ jobs:
           prompt: |
             Run the orchestrator agent defined in .claude/agents/orchestrator.md.
             This is a scheduled run — assess project state and advance work.
+
+            FIRST, as soon as you know what you intend to do this run (right after
+            assessing state, before any implementation), record it:
+              bash .genesis/scripts/checkpoint.sh "what I intend to do, and why"
+            If this run later dies at max-turns, that checkpoint is the only record
+            of your reasoning a human gets. One turn, before the unbounded work.
           # 60, not 40: this is the only workflow that must BOTH assess full
           # project state AND complete a unit of work in the same run, and it is
           # the loop's last line of defence — the tick that picks up whatever the

@@ -26,6 +26,13 @@
 # records "verify the artifact first" as a rule an agent must remember; this
 # makes it something the escalation just tells you (#97).
 #
+# The escalation also reports WHAT THE RUN WAS TRYING TO DO, when the agent
+# recorded it via checkpoint.sh. Artifact discovery answers "did anything land?";
+# it cannot answer "why did it think that was the right thing to land?", and a
+# run that died producing NO artifact (#85) gets nothing at all from it. The
+# design doc named intent checkpointing as the next thing to try if max-turns
+# deaths continued past artifact discovery; #101 was that continued death.
+#
 # Required env:
 #   GH_TOKEN  token with issues:write (the workflow's app token)
 #   GH_REPO   owner/repo
@@ -42,6 +49,22 @@ set -euo pipefail
 WF_NAME="${WF_NAME:-unknown workflow}"
 RUN_URL="${RUN_URL:-(run url unavailable)}"
 LOOKBACK_MIN="${GENESIS_ARTIFACT_LOOKBACK_MIN:-120}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The intent the agent checkpointed before it started work, if any. Ask
+# checkpoint.sh where the file is instead of recomputing its default — two
+# scripts deriving one shared path independently drift, and the failure mode is
+# this section reporting "no intent recorded" while the file sits on disk.
+CHECKPOINT_FILE="$(bash "$SCRIPT_DIR/checkpoint.sh" --path 2>/dev/null || true)"
+if [ -n "$CHECKPOINT_FILE" ] && [ -s "$CHECKPOINT_FILE" ]; then
+  intent=$(printf 'The agent recorded this before starting work. It is what the run *meant* to do — treat it as a hypothesis to check against what actually landed below, not as a description of what happened.\n\n%s' "$(cat "$CHECKPOINT_FILE")")
+else
+  # Not a neutral absence: either the run died before its first write (the #85
+  # shape — no artifact, no intent, and the costliest failure in the system), or
+  # the agent skipped the instruction. Both are worth saying out loud.
+  intent='No intent checkpoint was recorded. Either the run died before its first action, or it skipped the checkpoint step — if there is also no artifact below, this run left no trace of its reasoning and the transcript in the run log is the only source.'
+fi
 
 # The window this run could plausibly have written in. A lookback can only
 # over-report (an artifact from an adjacent run), which is a bounded and honest
@@ -78,7 +101,7 @@ marker="<!-- genesis-failure-wf: ${WF_NAME} -->"
 existing=$(gh issue list --state open --label "automation:failure" --json number,body \
   | jq -r --arg m "$marker" '[.[] | select(.body | contains($m)) | .number] | first // empty')
 
-body=$(printf 'A workflow run failed and the loop could not self-advance.\n\n- Workflow: **%s**\n- Failed run: %s\n\nLikely cause: the agent hit max-turns, an API error, or an unrecoverable task.\n\n### What this run may already have landed\n\n%s\n\n%s' "$WF_NAME" "$RUN_URL" "$landed" "$marker")
+body=$(printf 'A workflow run failed and the loop could not self-advance.\n\n- Workflow: **%s**\n- Failed run: %s\n\nLikely cause: the agent hit max-turns, an API error, or an unrecoverable task.\n\n### What this run was trying to do\n\n%s\n\n### What this run may already have landed\n\n%s\n\n%s' "$WF_NAME" "$RUN_URL" "$intent" "$landed" "$marker")
 
 if [ -n "$existing" ]; then
   gh issue comment "$existing" --body "$body"
