@@ -136,3 +136,47 @@ func TestEscalationReportsLandedArtifacts(t *testing.T) {
 		}
 	}
 }
+
+// TestEscalationClassifiesTheDeathClass pins the *conclusion* the escalation
+// draws, not just the facts it lists.
+//
+// Artifact discovery (#97) gave a human the facts; it left the inference to
+// them, and the inference has been drawn wrong six times running — every one of
+// 15→30→40→45→60 was read as "the budget is too low" and raised. Three of those
+// deaths (#87, #96, #101) happened *seconds after the deliverable landed*, where
+// no budget is the fix. The escalation is where that call gets made, so both
+// branches must name their class and point at the list the budget belongs in.
+//
+// Guarding the wording is deliberate: this is the sentence that stops raise #7,
+// and it is worth more than the artifact list it sits under.
+func TestEscalationClassifiesTheDeathClass(t *testing.T) {
+	b, err := os.ReadFile(escalatePathFor(t))
+	if err != nil {
+		t.Fatalf("read %s: %v", escalateScript, err)
+	}
+	src := string(b)
+
+	// The deliverable-landed branch must say plainly not to raise the budget,
+	// and route the value to the list that does NOT move the floor.
+	for _, want := range []string{"do NOT raise", "budgetsFailedDuringWrapUp"} {
+		if !strings.Contains(src, want) {
+			t.Errorf("%s no longer contains %q — without it the escalation reports a wrap-up truncation as a bare failure and the reflex fix is budget raise #7 (#97, #101)",
+				escalateScript, want)
+		}
+	}
+
+	// The nothing-landed branch is the one case where the budget genuinely is
+	// too small, and it must route to the list that DOES move the floor —
+	// otherwise the split silently disables the guard it replaced.
+	if !strings.Contains(src, "budgetsFailedBeforeDelivering") {
+		t.Errorf("%s never names budgetsFailedBeforeDelivering — a run that died with nothing landed (#85) is the only evidence that raises orchestratorClassFloor, so the escalation must say where to record it", escalateScript)
+	}
+
+	// Both branches must carry a note; a classification that only fires on one
+	// side leaves the other reading as "cause unknown".
+	for _, want := range []string{"WRAPUP_NOTE", "NO_ARTIFACT_NOTE"} {
+		if strings.Count(src, want) < 2 {
+			t.Errorf("%s defines or uses %s fewer than twice — each note must be both defined and rendered into the body, or the classification never reaches the issue", escalateScript, want)
+		}
+	}
+}
