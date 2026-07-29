@@ -15,11 +15,21 @@ Six raises, five deaths, one shape:
 | #85 | evolver | 30 | died at turn 31 with **no artifact at all** |
 | #87 | scheduled orchestrator | 40 | died at turn 41, seconds after opening PR #86 |
 | #96 | evolver | 45 | died at turn 46, seconds after PR #95 merged |
+| #101 | evolver | 60 | died at turn 61, after PR #100 landed |
 
 #89 fixed *instance-vs-class* (raise the floor, not the runner that failed).
 #96 fixed *floor-below-an-observed-failure* (`observedFailedBudgets` in
 `test/devsystem/workflows_test.go` now mechanically forces the floor above every
 budget seen to die). Neither explains why the number keeps needing to go up.
+
+#101 then exposed a third defect, in that second fix. `observedFailedBudgets` was
+built to make "the floor exceeds every observed failure" mechanical rather than
+remembered — but *appending to it* stayed remembered, and the only agent that
+would append is the evolver, which is the one that keeps dying. So 60 died on
+2026-07-28 while 60 was the floor, and the test that exists to catch exactly
+that stayed green for four consecutive failing days (30, 30, 45, 60 — Jul 25–28).
+A mechanism that is mechanical about its *check* and manual about its *input* is
+only as fresh as the agent feeding it. See "The list conflated two classes" below.
 
 The last two failures share a signature the first three do not: **the deliverable
 landed and only the bookkeeping was truncated.** #87 died having pushed PR #86.
@@ -209,3 +219,46 @@ ends a run burned turns on. That is a transcript-retention problem, not a budget
 or topology problem, so the next thing to try is exporting the agent transcript
 as a run artifact rather than any change to how the work is divided. Raising a
 budget and splitting coordinator from worker both remain rejected; see above.
+
+One measured caveat for whoever tries that. `claude-code-action` already has the
+knob — `show_full_output: true` puts the whole message stream in the run log,
+and without it the log contains only the `init` and `result` lines (verified on
+run 30353938690, 469 log lines, zero tool calls). But its own input description
+warns the stream includes **tool results**, and this repo is **public**, so both
+run logs and run artifacts are world-readable. Actions masks registered secrets
+and nothing else; a transcript that reads a config file or echoes an env dump
+publishes it. So transcript retention needs redaction or a private sink first —
+it is cheap to switch on and not cheap to switch on *safely*, which is why it
+stayed a "next thing to try" rather than shipping alongside the other two.
+
+## The list conflated two classes
+
+Splitting `observedFailedBudgets` is what #104 did about the stale-input defect
+above, and the split is not bookkeeping — it is the reason six raises did not
+converge. Sorted by whether the deliverable landed, the same six deaths say two
+different things:
+
+| class | budgets | what it means |
+| --- | --- | --- |
+| died **before** delivering | 20, 20, 30 (#38, #80/#81, #85) | the budget genuinely was too small — a floor fixes this |
+| died **during** wrap-up | 40, 45, 60 (#87, #96, #101) | the run's chosen task overran; **no** floor fixes this |
+
+Only the first class can move a floor. The second is evidence about the unbounded
+implementation term, and for any floor `N` there is a task that overruns it — so
+reading a wrap-up truncation as "N is too low" produces raise #7, then raise #8.
+Feeding both classes into one number is precisely what happened five times.
+
+Two consequences, both now mechanical rather than remembered:
+
+- `budgetsFailedBeforeDelivering` drives `orchestratorClassFloor`;
+  `budgetsFailedDuringWrapUp` is recorded and explicitly does not. The floor
+  therefore stays at 60 — it clears 30 comfortably — and 60's own death is filed
+  where it belongs instead of forcing a raise the doc already rejected.
+  `TestBudgetFailureClassesAreDisjoint` blocks the "append to both to be safe"
+  shortcut, which would silently force that raise anyway.
+- `escalate.sh` now states the classification in the escalation itself, because
+  the escalation is where the call actually gets made. Deliverable listed → "this
+  is a wrap-up truncation — do NOT raise `--max-turns`". Nothing listed → the #85
+  signature, append to the list that *does* move the floor. Artifact discovery
+  gave a human the facts and left the inference to them; the inference had been
+  drawn wrong six times, so it is no longer left open.

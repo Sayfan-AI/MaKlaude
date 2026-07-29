@@ -66,6 +66,22 @@ else
   intent='No intent checkpoint was recorded. Either the run died before its first action, or it skipped the checkpoint step — if there is also no artifact below, this run left no trace of its reasoning and the transcript in the run log is the only source.'
 fi
 
+# Whether a deliverable landed is not just triage colour — it is the ONLY signal
+# that separates the two max-turns failure classes, and they have opposite fixes.
+# Six consecutive budget raises (15→30→40→45→60) failed to converge because both
+# classes were read as "the budget is too low". A death *after* the deliverable
+# landed says nothing about the budget: implementation cost is unbounded (it
+# scales with whatever task the run chose mid-run), so for any floor N some task
+# overruns it. Only a death with nothing landed is evidence N is too small.
+#
+# The escalation is where that call actually gets made, so it states the rule
+# rather than leaving it to be remembered. Guarded by the two lists in
+# test/devsystem/workflows_test.go; reasoning in
+# .genesis/design/agent-turn-budgets.md.
+WRAPUP_NOTE='**If the deliverable landed, this is a wrap-up truncation — do NOT raise `--max-turns`.** No floor fixes this class: implementation cost scales with the task the run picked, so any budget can be overrun. Record the budget in `budgetsFailedDuringWrapUp` (test/devsystem/workflows_test.go) and, if a human-facing output was lost, move that output outside the agent step the way `nudge-gates.sh`/`escalate.sh`/`checkpoint.sh` already are. See #97, #101.'
+
+NO_ARTIFACT_NOTE='**If nothing landed and no intent was recorded above, this is the #85 signature** — the run died before its first deliverable, which is the one case where the turn budget genuinely is too small. Append this workflow'"'"'s `--max-turns` to `budgetsFailedBeforeDelivering` (test/devsystem/workflows_test.go); that fails the build until `orchestratorClassFloor` moves above it.'
+
 # The window this run could plausibly have written in. A lookback can only
 # over-report (an artifact from an adjacent run), which is a bounded and honest
 # error — every repo-mutating agent shares one concurrency group, so overlap is
@@ -86,9 +102,9 @@ artifacts=$(gh api --method GET "repos/${GH_REPO}/issues" \
   2>/dev/null || true)
 
 if [ -n "$artifacts" ]; then
-  landed=$(printf 'Touched since %s — **triage these before assuming the run achieved nothing**:\n\n%s\n\nIf the deliverable is already here (a green PR, a posted diagnosis), the run lost only its wrap-up: finish the bookkeeping and close this issue rather than redoing the work.' "$since" "$artifacts")
+  landed=$(printf 'Touched since %s — **triage these before assuming the run achieved nothing**:\n\n%s\n\nIf the deliverable is already here (a green PR, a posted diagnosis), the run lost only its wrap-up: finish the bookkeeping and close this issue rather than redoing the work.\n\n%s' "$since" "$artifacts" "$WRAPUP_NOTE")
 else
-  landed=$(printf 'No issue or PR was touched since %s. Also check for a pushed branch with no PR before concluding nothing landed.' "$since")
+  landed=$(printf 'No issue or PR was touched since %s. Also check for a pushed branch with no PR before concluding nothing landed.\n\n%s' "$since" "$NO_ARTIFACT_NOTE")
 fi
 
 # Stable per-workflow dedup key. Hidden HTML comment so it never renders but is

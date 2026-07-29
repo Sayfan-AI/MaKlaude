@@ -96,9 +96,19 @@ jobs:
           # 45 then failed the same way: run 30254684025 died at turn 46 (#96)
           # seconds after PR #95 merged and its #81 comment posted — the full
           # cycle (collect signals → classify → apply a fix → escalate → curate
-          # memory) fits, the wrap-up does not. 60 matches the class floor, which
-          # now sits strictly above every budget observed to fail. See #89, #96;
-          # floor enforced by test/devsystem/workflows_test.go.
+          # memory) fits, the wrap-up does not. So did 60: run 30353938690 died
+          # at turn 61 (#101) after PR #100 landed, the fourth consecutive
+          # evolver failure (30, 30, 45, 60 — Jul 25–28).
+          #
+          # 60 stays anyway, and that is a decision rather than an oversight.
+          # Deaths at 40/45/60 all landed their deliverable first, which makes
+          # them evidence about the unbounded implementation task the run chose,
+          # not about the budget — raise #7 would fail the same way. The floor's
+          # only job is to clear the budgets that died *before* delivering
+          # (20, 20, 30 — #38, #80, #85), which 60 does comfortably. The two
+          # lists are split in test/devsystem/workflows_test.go so a future death
+          # gets filed by class instead of reflexively raising this number; see
+          # #97 and .genesis/design/agent-turn-budgets.md.
           claude_args: "--max-turns 60 --allowedTools Read,Write,Edit,Bash,Glob,Grep,Agent"
 
       # Escalate a real run failure (e.g. agent hit max-turns) to a human. Without
