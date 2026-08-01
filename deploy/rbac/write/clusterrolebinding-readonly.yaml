@@ -1,0 +1,30 @@
+# Additionally grants the executor identity the SAME read-only ClusterRole the
+# observation identity uses.
+#
+# This is the "additive" half of the access model: maklaude-write is not a
+# self-sufficient role, it is a delta. An executor genuinely needs to read — it
+# re-reads a target to obtain the resourceVersion it will condition its action on,
+# and reads a Deployment's ReplicaSets to identify a previous revision — and
+# rather than restate those reads with a second copy that can drift, the executor
+# reuses maklaude-readonly verbatim.
+#
+# Consequence worth stating plainly: reuse means this bundle REQUIRES the base
+# bundle. `kubectl apply -k deploy/rbac` first, or this binding dangles on a
+# ClusterRole that does not exist (RBAC permits the dangling reference and simply
+# grants nothing, so the failure looks like unexplained "forbidden" errors on
+# reads rather than an apply-time error).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: maklaude-executor-readonly
+  labels:
+    app.kubernetes.io/name: maklaude
+    app.kubernetes.io/component: rbac
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: maklaude-readonly
+subjects:
+  - kind: ServiceAccount
+    name: maklaude-executor
+    namespace: maklaude

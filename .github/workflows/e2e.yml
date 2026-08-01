@@ -115,6 +115,74 @@ jobs:
           [ "$fail" -eq 0 ] || { echo "RBAC read-only assertions failed"; exit 1; }
           echo "RBAC is read-only as expected."
 
+      # The optional minimal-write bundle (deploy/rbac/write). It is applied here
+      # AFTER the read-only assertions above have already passed, and the checks
+      # below re-run the write-denial assertions on the observation identity, so
+      # this step proves the property that makes the bundle safe to install:
+      # granting the executor its three verbs widens nothing for the account every
+      # read in MaKlaude uses.
+      #
+      # Applying it cannot compromise the zero-writes proof the Go e2e performs
+      # later — that test authenticates with a token minted for the `maklaude`
+      # ServiceAccount, which this bundle never binds.
+      - name: Apply and verify the minimal-write RBAC bundle
+        run: |
+          set -euo pipefail
+          kubectl apply -k deploy/rbac/write
+          kubectl -n maklaude get serviceaccount maklaude-executor
+
+          SA=system:serviceaccount:maklaude:maklaude
+          EXEC=system:serviceaccount:maklaude:maklaude-executor
+          echo "Grants for $EXEC:"
+          kubectl auth can-i --list --as="$EXEC" || true
+
+          fail=0
+          assert_yes() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" != "yes" ]; then
+              echo "::error::expected ALLOWED but denied: $*"; fail=1
+            fi
+          }
+          assert_no() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" = "yes" ]; then
+              echo "::error::expected DENIED but allowed: $*"; fail=1
+            fi
+          }
+
+          # The executor's catalog: exactly the three primitives in
+          # internal/kube/executor.go, one assertion each.
+          assert_yes patch deployments.apps --as="$EXEC" -A
+          assert_yes patch nodes --as="$EXEC"
+          assert_yes delete pods --as="$EXEC" -A
+
+          # Reads, via the additive maklaude-readonly binding — an executor
+          # re-reads its target to obtain the resourceVersion it conditions on.
+          assert_yes get deployments.apps --as="$EXEC" -A
+          assert_yes list replicasets.apps --as="$EXEC" -A
+
+          # The dangerous neighbours. deletecollection is the one that matters
+          # most: the executor's WriteScope pins an exact object path and cannot
+          # express a bulk delete, and RBAC must agree rather than merely not be
+          # asked.
+          assert_no deletecollection pods --as="$EXEC" -A
+          assert_no deletecollection deployments.apps --as="$EXEC" -A
+          assert_no delete deployments.apps --as="$EXEC" -A
+          assert_no delete nodes --as="$EXEC"
+          assert_no update deployments.apps --as="$EXEC" -A
+          assert_no patch pods --as="$EXEC" -A
+          assert_no create pods --as="$EXEC" -A
+          assert_no create pods/eviction --as="$EXEC" -A
+          assert_no get secrets --as="$EXEC" -A
+
+          # THE POINT OF THE SEPARATE IDENTITY: installing the write bundle must
+          # leave the observation account exactly as read-only as it was before.
+          assert_no patch deployments.apps --as="$SA" -A
+          assert_no patch nodes --as="$SA"
+          assert_no delete pods --as="$SA" -A
+          assert_no deletecollection pods --as="$SA" -A
+
+          [ "$fail" -eq 0 ] || { echo "minimal-write RBAC assertions failed"; exit 1; }
+          echo "Minimal-write RBAC is scoped as expected, and the observation identity is unchanged."
+
       - name: Seed failure scenarios
         run: |
           set -euo pipefail
@@ -223,6 +291,36 @@ jobs:
           echo "MAKLAUDE_E2E_KUBECONFIG=${KCFG}" >> "$GITHUB_ENV"
           echo "MAKLAUDE_E2E_CONTEXT=${CLUSTER_NAME}" >> "$GITHUB_ENV"
 
+      # A SECOND kubeconfig, for the executor identity only. It is deliberately a
+      # separate file with a separate credential rather than another user entry in
+      # the read-only one: the write e2e must be incapable of reaching for the
+      # observation account's token, and vice versa, so a mix-up fails as "no such
+      # credential" instead of silently testing the wrong identity.
+      #
+      # The token is minted for maklaude-executor, which exists only because the
+      # optional write bundle was applied above. Reads in the write e2e go through
+      # this identity too (the additive maklaude-readonly binding covers them) —
+      # an executor re-reads its target for the resourceVersion it conditions on.
+      - name: Mint executor ServiceAccount kubeconfig
+        run: |
+          set -euo pipefail
+          KCFG="${RUNNER_TEMP}/maklaude-executor.kubeconfig"
+
+          SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+          TOKEN=$(kubectl -n maklaude create token maklaude-executor --duration=1h)
+
+          # ca.crt was written by the read-only mint step above, from the same
+          # cluster; both kubeconfigs point at one API server.
+          kubectl --kubeconfig "$KCFG" config set-cluster "${CLUSTER_NAME}" \
+            --server="$SERVER" --certificate-authority="${RUNNER_TEMP}/ca.crt" --embed-certs=true
+          kubectl --kubeconfig "$KCFG" config set-credentials maklaude-executor --token="$TOKEN"
+          kubectl --kubeconfig "$KCFG" config set-context "${CLUSTER_NAME}" \
+            --cluster="${CLUSTER_NAME}" --user=maklaude-executor
+          kubectl --kubeconfig "$KCFG" config use-context "${CLUSTER_NAME}"
+          chmod 600 "$KCFG"
+
+          echo "MAKLAUDE_E2E_EXECUTOR_KUBECONFIG=${KCFG}" >> "$GITHUB_ENV"
+
       - name: Locate audit log
         run: |
           set -euo pipefail
@@ -238,10 +336,11 @@ jobs:
             echo "::warning::audit log not found at ${LOG}; the e2e will rely on state-invariance + refused-write proofs only"
           fi
 
-      - name: Run e2e (detect + escalate + zero-writes)
+      - name: Run e2e (detect + escalate + zero-writes + dry-run)
         env:
           # MAKLAUDE_GITHUB_* intentionally unset -> in-memory dry-run escalation.
           MAKLAUDE_E2E_KUBECONFIG: ${{ env.MAKLAUDE_E2E_KUBECONFIG }}
+          MAKLAUDE_E2E_EXECUTOR_KUBECONFIG: ${{ env.MAKLAUDE_E2E_EXECUTOR_KUBECONFIG }}
           MAKLAUDE_E2E_CONTEXT: ${{ env.MAKLAUDE_E2E_CONTEXT }}
           MAKLAUDE_E2E_AUDIT_LOG: ${{ env.MAKLAUDE_E2E_AUDIT_LOG }}
         run: task e2e

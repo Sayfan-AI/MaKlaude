@@ -1,0 +1,32 @@
+# MaKlaude's OPTIONAL minimal-write RBAC bundle.
+#
+# It is a sibling of deploy/rbac, not a component of it, and the base
+# kustomization deliberately does not reference it. Applying `kubectl apply -k
+# deploy/rbac` gives you an identity that provably cannot write; you get a
+# write-capable identity only by naming this directory:
+#
+#   kubectl apply -k deploy/rbac         # required first: reads + the maklaude SA
+#   kubectl apply -k deploy/rbac/write   # optional: the executor SA + write delta
+#
+# Order matters — clusterrolebinding-readonly.yaml references the maklaude-readonly
+# ClusterRole from the base bundle.
+#
+# Applying this bundle does NOT enable execution. MaKlaude ships execute-off
+# (kube.ExecuteDisabled is the zero value, and kube.NewExecutor refuses to build
+# anything under it), so with this bundle installed and the mode unset the
+# executor identity holds permissions nothing in the process can use. Both gates
+# have to be opened, independently, by a person.
+#
+# To revoke writes without touching MaKlaude:
+#
+#   kubectl delete -k deploy/rbac/write
+#
+# See docs/rbac.md for the full access model and the auth can-i verification.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - serviceaccount.yaml
+  - clusterrole.yaml
+  - clusterrolebinding.yaml
+  - clusterrolebinding-readonly.yaml
