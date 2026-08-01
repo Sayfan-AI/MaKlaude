@@ -282,12 +282,12 @@ func TestBodyCarriesEverySectionAnApproverNeeds(t *testing.T) {
 		"Diagnosis this addresses",
 		"Rechecked immediately before running",
 		"How to decide",
-		"`prod`",                     // cluster
-		"`rolloutrestart`",           // operation
-		"deployment/shop/web",        // target
-		"`1000`",                     // resourceVersion the approval binds to
-		"the-gigi-style label",       // placeholder, replaced below
-		"restart count 7",            // evidence
+		"`prod`",               // cluster
+		"`rolloutrestart`",     // operation
+		"deployment/shop/web",  // target
+		"`1000`",               // resourceVersion the approval binds to
+		"the-gigi-style label", // placeholder, replaced below
+		"restart count 7",      // evidence
 		"the deployment has not changed since the snapshot", // precondition
 	} {
 		if want == "the-gigi-style label" {
