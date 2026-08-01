@@ -19,3 +19,6 @@ go.work.sum
 .env
 .env.*
 !.env.example
+
+# direnv: pins gh to the personal account for this OSS repo (see genesis)
+.envrc
