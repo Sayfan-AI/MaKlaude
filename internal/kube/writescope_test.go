@@ -20,6 +20,23 @@ func newScopedRequest(t *testing.T, method, rawURL string) *http.Request {
 	return req
 }
 
+// refuseRoundTrip performs a round trip the guard is expected to refuse and
+// returns the resulting error.
+//
+// It asserts a property the callers would otherwise leave implicit: a refusal
+// produces NO response at all, because the guard rejects before the wire. A
+// non-nil response therefore fails the test outright — and is closed first, so
+// the path that should never be taken still honours the body-close contract.
+func refuseRoundTrip(t *testing.T, rt http.RoundTripper, req *http.Request) error {
+	t.Helper()
+	resp, err := rt.RoundTrip(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+		t.Fatalf("a refused request came back with a response (%d) — the guard must reject before the wire", resp.StatusCode)
+	}
+	return err
+}
+
 // countingTransport records how many requests reached it, so a test can prove a
 // refusal happened BEFORE the network rather than merely that an error came back.
 type countingTransport struct {
@@ -129,7 +146,7 @@ func TestScopedWrite_RefusesOutOfScope(t *testing.T) {
 			inner := &countingTransport{}
 			rt := newScopedWriteTransport(inner, scope)
 
-			_, err := rt.RoundTrip(newScopedRequest(t, tc.method, "https://api.test"+tc.path))
+			err := refuseRoundTrip(t, rt, newScopedRequest(t, tc.method, "https://api.test"+tc.path))
 			if !errors.Is(err, ErrWriteOutOfScope) {
 				t.Fatalf("expected ErrWriteOutOfScope (%s), got: %v", tc.why, err)
 			}
@@ -149,7 +166,7 @@ func TestScopedWrite_ZeroValueScopeRefusesAllMutations(t *testing.T) {
 			inner := &countingTransport{}
 			rt := newScopedWriteTransport(inner, WriteScope{})
 
-			_, err := rt.RoundTrip(newScopedRequest(t, method, "https://api.test"+deployPath))
+			err := refuseRoundTrip(t, rt, newScopedRequest(t, method, "https://api.test"+deployPath))
 			if !errors.Is(err, ErrWriteOutOfScope) {
 				t.Fatalf("zero-value scope admitted %s: %v", method, err)
 			}
@@ -173,7 +190,7 @@ func TestScopedWrite_PartialScopeRefusesAllMutations(t *testing.T) {
 			inner := &countingTransport{}
 			rt := newScopedWriteTransport(inner, scope)
 
-			_, err := rt.RoundTrip(newScopedRequest(t, http.MethodPatch, "https://api.test"+deployPath))
+			err := refuseRoundTrip(t, rt, newScopedRequest(t, http.MethodPatch, "https://api.test"+deployPath))
 			if !errors.Is(err, ErrWriteOutOfScope) {
 				t.Fatalf("partial scope admitted a mutation: %v", err)
 			}
@@ -239,7 +256,7 @@ func TestScopedWrite_DryRunScopeRequiresServerDryRun(t *testing.T) {
 			inner := &countingTransport{}
 			rt := newScopedWriteTransport(inner, scope)
 
-			_, err := rt.RoundTrip(newScopedRequest(t, http.MethodPatch, "https://api.test"+deployPath+query))
+			err := refuseRoundTrip(t, rt, newScopedRequest(t, http.MethodPatch, "https://api.test"+deployPath+query))
 			if !errors.Is(err, ErrDryRunRequired) {
 				t.Fatalf("expected ErrDryRunRequired for %q, got: %v", query, err)
 			}
@@ -328,17 +345,19 @@ func TestScopedWrite_DeleteDryRunIsReadFromTheBody(t *testing.T) {
 			req.Body = io.NopCloser(strings.NewReader(tc.body))
 			req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(tc.body)), nil }
 
-			_, err := rt.RoundTrip(req)
 			if tc.admit {
+				resp, err := rt.RoundTrip(req)
 				if err != nil {
 					t.Fatalf("refused a genuine preview delete (%s): %v", tc.because, err)
 				}
+				_ = resp.Body.Close()
 				if inner.calls != 1 {
 					t.Fatalf("a genuine preview delete did not reach the inner transport")
 				}
 				return
 			}
-			if !errors.Is(err, ErrDryRunRequired) {
+
+			if err := refuseRoundTrip(t, rt, req); !errors.Is(err, ErrDryRunRequired) {
 				t.Fatalf("expected ErrDryRunRequired (%s), got: %v", tc.because, err)
 			}
 			if inner.calls != 0 {
@@ -374,7 +393,7 @@ func TestScopedWrite_DeleteWithoutARetrievableBodyIsRefused(t *testing.T) {
 			req := newScopedRequest(t, http.MethodDelete, "https://api.test"+podPath)
 			mangle(req)
 
-			if _, err := rt.RoundTrip(req); !errors.Is(err, ErrDryRunRequired) {
+			if err := refuseRoundTrip(t, rt, req); !errors.Is(err, ErrDryRunRequired) {
 				t.Fatalf("expected ErrDryRunRequired, got: %v", err)
 			}
 			if inner.calls != 0 {
