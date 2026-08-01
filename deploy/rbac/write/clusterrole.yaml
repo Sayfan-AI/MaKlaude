@@ -1,0 +1,97 @@
+# MaKlaude's least-privilege MINIMAL-WRITE ClusterRole.
+#
+# This is the only role in MaKlaude that carries a mutating verb. It exists for
+# the executor identity alone (see serviceaccount.yaml in this directory) and is
+# never bound to the observation ServiceAccount, so installing this bundle cannot
+# widen what the read/diagnose path is allowed to do.
+#
+# Every rule below is one action in internal/kube/executor.go's catalog. The
+# catalog is closed: the executor exposes exactly three primitives, each a single
+# API call against a single named object, and this role grants exactly those
+# three verbs and nothing else.
+#
+#   patch deployments.apps : Executor.PatchDeployment — used by
+#                            RestartDeploymentRollout (stamps the
+#                            kubectl.kubernetes.io/restartedAt annotation on the
+#                            pod template) and by rollback-shaped patches.
+#   patch nodes            : Executor.PatchNode — used by CordonNode
+#                            (spec.unschedulable=true).
+#   delete pods            : Executor.DeletePod — deletes one already-failed pod
+#                            whose controller will recreate it.
+#
+# WHAT IS DELIBERATELY ABSENT, and why each omission is load-bearing:
+#
+#   - create / update      : the executor only ever patches or deletes. `update`
+#                            in particular sends a whole object and would let a
+#                            malformed body replace a spec MaKlaude never read.
+#   - deletecollection     : the single most dangerous verb available here. One
+#                            request can remove every pod matching a selector.
+#                            The executor's WriteScope pins an exact object path
+#                            and so cannot express it, and this role does not
+#                            grant it either — the guard and the RBAC agree.
+#   - delete deployments   : nothing in the catalog deletes a workload. Deleting
+#     / delete nodes         a Deployment or a Node is not a remediation MaKlaude
+#                            performs; it is an outage.
+#   - pods/eviction        : cordoning is not draining. Evicting pods is outside
+#                            the catalog (see Executor.CordonNode), so the
+#                            subresource that would allow it is not granted.
+#   - patch pods           : the pod primitive is delete-only. A patch surface on
+#                            pods would let the executor edit objects it only
+#                            ever needs to remove.
+#   - secrets, any read    : reads come from the additive maklaude-readonly
+#                            binding, which grants no secrets access. This role
+#                            adds no read of any kind.
+#   - escalate / bind /    : never granted. Any of them would let this identity
+#     impersonate            grant itself the permissions above are missing.
+#
+# DRY RUN NEEDS THE SAME VERB. Kubernetes authorizes a `dryRun=All` request with
+# the identical verb it would use for a real one — SubjectAccessReview has no
+# notion of a preview. So MaKlaude running in its execute=dry-run mode still
+# requires this role. "Preview only" is enforced by the transport
+# (kube.ErrDryRunRequired) and by the mode, NOT by RBAC, and an operator reading
+# `kubectl auth can-i patch deployments` for the executor identity should expect
+# "yes" even on a deployment that has never been allowed to change anything.
+#
+# NARROWING FURTHER. deployments and pods are namespaced, so if MaKlaude only
+# operates a known set of namespaces you can copy the two namespaced rules into a
+# Role per namespace and bind those with RoleBindings, leaving only the nodes rule
+# in a ClusterRole. That is strictly tighter than what ships here and changes no
+# code. Nodes are cluster-scoped and cannot be narrowed this way.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: maklaude-write
+  labels:
+    app.kubernetes.io/name: maklaude
+    app.kubernetes.io/component: rbac
+rules:
+  # apps/v1 deployments — patch only.
+  #   internal/kube/executor.go PatchDeployment issues a single strategic-merge
+  #   PATCH against /apis/apps/v1/namespaces/<ns>/deployments/<name>, with
+  #   metadata.resourceVersion injected as an optimistic-concurrency
+  #   precondition. No create, no update, no delete.
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+    verbs: ["patch"]
+
+  # core/v1 nodes — patch only.
+  #   internal/kube/executor.go PatchNode issues a single strategic-merge PATCH
+  #   against /api/v1/nodes/<name>; CordonNode is its only current caller.
+  #   Nodes are cluster-scoped, which is why this bundle needs a ClusterRole.
+  - apiGroups: [""]
+    resources:
+      - nodes
+    verbs: ["patch"]
+
+  # core/v1 pods — delete only.
+  #   internal/kube/executor.go DeletePod issues a single DELETE against
+  #   /api/v1/namespaces/<ns>/pods/<name>, carrying a resourceVersion
+  #   precondition in its DeleteOptions body. Note "delete", not
+  #   "deletecollection": the collection endpoint is a different verb and is not
+  #   granted, so a bulk delete is refused by the API server as well as by the
+  #   executor's scope guard.
+  - apiGroups: [""]
+    resources:
+      - pods
+    verbs: ["delete"]

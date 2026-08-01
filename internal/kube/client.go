@@ -1,29 +1,61 @@
-// Package kube turns a validated [cluster.Handle] into a live, strictly
-// read-only Kubernetes client.
+// Package kube turns a validated [cluster.Handle] into a live Kubernetes client.
+//
+// It offers exactly two, and they are separate types with separate guards:
+//
+//   - [Client] — the strictly read-only observation client. Everything that
+//     watches, collects, detects, correlates, diagnoses, and proposes uses this
+//     one, and it cannot mutate a cluster.
+//   - [Executor] — the scoped write client, off by default, reachable only by an
+//     operator explicitly enabling execution. It is the only type in MaKlaude
+//     that can change a cluster.
+//
+// # The observation path cannot write
 //
 // MaKlaude's foundational safety promise is that its observation layer can
 // never mutate a cluster. This package makes that promise structural rather
 // than merely conventional:
 //
-//   - The public surface exposes only read operations (get/list/watch). There
-//     is no exported method that creates, updates, patches, or deletes anything,
+//   - [Client]'s surface exposes only read operations (get/list/watch). There
+//     is no method on it that creates, updates, patches, or deletes anything,
 //     and the underlying client-go clientset is never handed out, so a caller
-//     simply has no way to express a write.
+//     holding one simply has no way to express a write.
 //
-//   - As defense in depth, every client's HTTP transport is wrapped by a
+//   - As defense in depth, every [Client]'s HTTP transport is wrapped by a
 //     read-only guard (see [ErrWriteForbidden]) that rejects any request whose
 //     verb is not GET/HEAD/OPTIONS before it reaches the network. Even if a
-//     future code path obtained a writable client built on this config, the
+//     future code path obtained a writable clientset built on that config, the
 //     mutating request would be refused at the wire.
 //
-// Each [Client] is built from a single cluster's kubeconfig path and context
-// and owns its own rest.Config, transport, and clientset. There is no shared or
-// global mutable state between clients, so clusters are fully isolated: building
-// or using one client can never affect another.
+// Enabling the write path does not weaken any of this. The two paths install
+// their guards through different functions ([restConfigForHandle] and
+// [restConfigForScope]), and the read-only one takes no argument and consults no
+// mode, flag, or config — so there is no value an operator can set, and no
+// refactor of the write path, that turns an observation client into a writing
+// one.
+//
+// # The write path is narrow, off, and preconditioned
+//
+// [Executor] inverts the usual shape: rather than a client that can write and a
+// caller that promises to be careful, each action builds a client whose transport
+// admits exactly one request — one method, one exact path — and drops it
+// afterwards. See [WriteScope] for what that bounds and [ExecuteMode] for the kill
+// switch, whose zero value is "disabled" and under which [NewExecutor] refuses to
+// build anything at all.
+//
+// # Isolation and error reporting
+//
+// Every client and executor is built from a single cluster's kubeconfig path and
+// context and owns its own rest.Config, transport, and clientset. There is no
+// shared or global mutable state. So clusters are fully isolated: building or
+// using one client can never affect another, and an executor for one cluster
+// cannot reach a second.
 //
 // Reachability and configuration problems are never swallowed. They surface as
 // clear, wrapped, actionable errors that name the cluster and unwrap to the
-// package sentinels [ErrBuildConfig] and [ErrUnreachable].
+// package sentinels [ErrBuildConfig] and [ErrUnreachable] (reads), or
+// [ErrExecutorDisabled], [ErrWriteOutOfScope], [ErrDryRunRequired],
+// [ErrInvalidTarget], [ErrInvalidPatch], [ErrMissingPrecondition],
+// [ErrPreconditionConflict] and [ErrExecute] (writes).
 package kube
 
 import (
@@ -124,14 +156,20 @@ func NewClientWithInterface(clusterName string, clientset kubernetes.Interface) 
 	}
 }
 
-// restConfigForHandle constructs a *rest.Config from a handle's kubeconfig path
-// and context, with the read-only transport guard installed. It is the single
-// point where a cluster's connection parameters are assembled, so the guard can
-// never be bypassed by a caller.
-func restConfigForHandle(h *cluster.Handle) (*rest.Config, error) {
-	// Load strictly from the handle's explicit kubeconfig path and context.
-	// Defaulting to in-cluster config or $KUBECONFIG is deliberately avoided so
-	// a client only ever talks to the cluster the operator configured.
+// baseRestConfig loads a handle's connection parameters into a *rest.Config with
+// NO transport guard installed. It is unexported and must never be called
+// directly by anything but the two guard-installing constructors below it
+// ([restConfigForHandle] for the read-only observation path,
+// [restConfigForScope] for the scoped write path) — an unguarded config is not a
+// usable client in this package, it is an ingredient.
+//
+// It exists so both paths load their cluster identically: strictly from the
+// handle's explicit kubeconfig path and context, never from in-cluster config or
+// $KUBECONFIG, so no client can talk to a cluster the operator did not configure.
+// That property is the one thing the read and write paths should share; the
+// guard is emphatically not, which is why it is installed by the callers rather
+// than here.
+func baseRestConfig(h *cluster.Handle) (*rest.Config, error) {
 	loadingRules := &clientcmd.ClientConfigLoadingRules{
 		ExplicitPath: h.Kubeconfig(),
 	}
@@ -143,6 +181,22 @@ func restConfigForHandle(h *cluster.Handle) (*rest.Config, error) {
 	restCfg, err := clientCfg.ClientConfig()
 	if err != nil {
 		return nil, fmt.Errorf("%w for %s: %w", ErrBuildConfig, h.String(), err)
+	}
+	return restCfg, nil
+}
+
+// restConfigForHandle constructs a *rest.Config from a handle's kubeconfig path
+// and context, with the read-only transport guard installed. It is the single
+// point where an observation client's connection parameters are assembled, so the
+// guard can never be bypassed by a caller.
+//
+// The guard is installed unconditionally: this function takes no argument that
+// could weaken it and consults no mode, flag, or config. Enabling MaKlaude's write
+// path (see [NewExecutor]) therefore cannot affect any client built here.
+func restConfigForHandle(h *cluster.Handle) (*rest.Config, error) {
+	restCfg, err := baseRestConfig(h)
+	if err != nil {
+		return nil, err
 	}
 
 	// Defense in depth: wrap the transport so only read verbs ever reach the

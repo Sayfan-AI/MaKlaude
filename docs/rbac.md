@@ -1,13 +1,26 @@
-# MaKlaude read-only RBAC
+# MaKlaude RBAC
 
-MaKlaude is a **read-only** Kubernetes monitoring system. It observes the health
-of the clusters under its care and never mutates them. This document describes
-the least-privilege RBAC bundle that grants MaKlaude exactly the access it needs,
-how an operator installs it, how to wire the resulting identity into MaKlaude,
-and how to verify the access really is read-only.
+MaKlaude observes the health of the clusters under its care and, by default,
+cannot mutate them at all. This document describes the least-privilege RBAC that
+grants it exactly the access it needs, how an operator installs it, how to wire
+the resulting identity into MaKlaude, and how to verify each grant.
 
-The bundle lives in [`deploy/rbac/`](../deploy/rbac/) and applies as one unit
-with `kubectl apply -k deploy/rbac`.
+There are **two bundles and two identities**, and the separation between them is
+the point:
+
+| Bundle | Identity | Grants | Installed by |
+| ------ | -------- | ------ | ------------ |
+| [`deploy/rbac/`](../deploy/rbac/) | `maklaude` | `get`/`list`/`watch` on a fixed resource set — **no mutating verb anywhere** | `kubectl apply -k deploy/rbac` |
+| [`deploy/rbac/write/`](../deploy/rbac/write/) — optional | `maklaude-executor` | the same reads, **plus** exactly three mutating verbs | `kubectl apply -k deploy/rbac/write` |
+
+Install only the first and MaKlaude provably cannot change anything: everything
+that watches, collects, detects, correlates, diagnoses, and proposes runs as
+`maklaude`. The write bundle is a *delta* bound to a *different* account, so
+installing it grants the observation identity nothing — which is asserted in CI
+against a live cluster, not just claimed here.
+
+Most of this document is about the read-only bundle. The write bundle has its own
+section: [The optional minimal-write bundle](#the-optional-minimal-write-bundle).
 
 ## The access model
 
@@ -162,11 +175,141 @@ kubectl auth can-i get configmaps   --as="$SA" -A
 If any mutating check returns `yes`, the bundle has been modified — revert to the
 manifests in `deploy/rbac/`, which grant only `get`/`list`/`watch`.
 
+## The optional minimal-write bundle
+
+Everything above describes an identity that cannot change a cluster. Remediation
+needs one that can, for a very small number of actions, and
+[`deploy/rbac/write/`](../deploy/rbac/write/) is it.
+
+It is a separate bundle rather than extra rules on `maklaude-readonly`, and it
+binds a separate ServiceAccount (`maklaude-executor`). That mirrors the code —
+`kube.Client` and `kube.Executor` are sibling types with different transport
+guards installed by different constructors — and it buys one thing prose cannot:
+in an apiserver audit log, a mutating request attributed to
+`system:serviceaccount:maklaude:maklaude` is by construction a bug or an
+intrusion, never normal operation.
+
+### What it grants
+
+One rule per primitive in
+[`internal/kube/executor.go`](../internal/kube/executor.go). The catalog is
+closed — three single-object API calls, three verbs:
+
+| API group | Resource | Verb | Executor method | What it does |
+| --------- | -------- | ---- | --------------- | ------------ |
+| `apps` | `deployments` | patch | `PatchDeployment` | Strategic-merge patch of one Deployment. `RestartDeploymentRollout` uses it to stamp the `kubectl.kubernetes.io/restartedAt` annotation (`kubectl rollout restart` at the API level) |
+| `""` (core/v1) | `nodes` | patch | `PatchNode` | Strategic-merge patch of one Node. `CordonNode` uses it to set `spec.unschedulable` |
+| `""` (core/v1) | `pods` | delete | `DeletePod` | Deletes one already-failed pod whose controller will recreate it |
+
+Plus, via a second binding, the *same* `maklaude-readonly` ClusterRole the
+observation identity holds. The write role is additive, not self-sufficient: an
+executor has to re-read its target to obtain the `resourceVersion` it conditions
+the action on. Reusing the read role verbatim means the two can't drift — but it
+also means **the base bundle must be applied first**, or the executor's read
+binding dangles on a ClusterRole that doesn't exist. (RBAC allows the dangling
+reference and silently grants nothing, so the symptom is unexplained `Forbidden`
+errors on reads, not an apply-time failure.)
+
+### What it deliberately withholds
+
+Each omission is load-bearing, and each is asserted absent in CI:
+
+- **`deletecollection`** — the most dangerous verb available here: one request
+  can remove every pod matching a selector. The executor's `WriteScope` pins an
+  exact object path, so it cannot express a bulk delete; RBAC has to agree rather
+  than merely not be asked.
+- **`delete` on deployments or nodes** — deleting a workload or a node is an
+  outage, not a remediation. Nothing in the catalog does it.
+- **`update`** — sends a whole object, which would let a malformed body replace a
+  spec MaKlaude never read. The executor only ever patches.
+- **`create`, including `pods/eviction`** — cordoning is not draining. Eviction
+  is outside the catalog.
+- **`patch` on pods** — the pod primitive is delete-only.
+- **`secrets` or any other read** — the write role adds no read of any kind.
+- **`bind`, `escalate`, `impersonate`** — each would let this identity grant
+  itself everything on this list.
+
+### Dry-run still needs the write verb
+
+Kubernetes authorizes a `dryRun=All` request with the **identical verb** it would
+use for a real one; `SubjectAccessReview` has no notion of a preview. So MaKlaude
+running in `execute=dry-run` — where every action is sent with `dryRun=All`, the
+API server validates it against real admission controllers and then discards it —
+still requires this bundle.
+
+The consequence to internalize before reading `auth can-i` output: for the
+executor identity, `kubectl auth can-i patch deployments` prints `yes` even on a
+deployment where MaKlaude has never been permitted to change anything.
+Preview-only is enforced by the mode (`kube.ExecuteDryRun`) and by the transport
+(`kube.ErrDryRunRequired`, which refuses a mutating request lacking the marker) —
+**not** by RBAC.
+
+### Two independent gates
+
+Installing this bundle does not enable execution, and enabling execution does not
+grant permission. Both have to be opened, separately, by a person:
+
+| Gate | Where it lives | Default | How to close it |
+| ---- | -------------- | ------- | --------------- |
+| API-server permission | this bundle | not installed | `kubectl delete -k deploy/rbac/write` |
+| In-process kill switch | `kube.ExecuteMode` | `ExecuteDisabled` (the zero value; `kube.NewExecutor` refuses to build anything under it) | leave it unset |
+
+Deleting the bundle is the cheaper revocation: it stops every write at the API
+server without touching MaKlaude's config or restarting it, and leaves the
+read / diagnose / propose path fully working.
+
+### Installing and verifying it
+
+```bash
+kubectl apply -k deploy/rbac         # first — reads, and the maklaude SA
+kubectl apply -k deploy/rbac/write   # the executor SA and the write delta
+```
+
+Mint a kubeconfig for `maklaude-executor` exactly as in step 2 above,
+substituting the account name (`kubectl -n maklaude create token maklaude-executor`).
+
+```bash
+EXEC=system:serviceaccount:maklaude:maklaude-executor
+SA=system:serviceaccount:maklaude:maklaude
+
+# The catalog — each MUST print "yes".
+kubectl auth can-i patch deployments.apps --as="$EXEC" -A
+kubectl auth can-i patch nodes            --as="$EXEC"
+kubectl auth can-i delete pods            --as="$EXEC" -A
+
+# The dangerous neighbours — each MUST print "no".
+kubectl auth can-i deletecollection pods  --as="$EXEC" -A
+kubectl auth can-i delete deployments.apps --as="$EXEC" -A
+kubectl auth can-i update deployments.apps --as="$EXEC" -A
+kubectl auth can-i patch pods             --as="$EXEC" -A
+kubectl auth can-i create pods/eviction   --as="$EXEC" -A
+kubectl auth can-i get secrets            --as="$EXEC" -A
+
+# The point of the separate identity: the observation account is UNCHANGED.
+# Each MUST still print "no".
+kubectl auth can-i patch deployments.apps --as="$SA" -A
+kubectl auth can-i delete pods            --as="$SA" -A
+```
+
+### Narrowing it further
+
+`deployments` and `pods` are namespaced. If MaKlaude operates a known set of
+namespaces, copy those two rules into a `Role` per namespace and bind them with
+`RoleBinding`s, leaving only the `nodes` rule in a `ClusterRole`. That is strictly
+tighter than what ships and requires no code change. Nodes are cluster-scoped and
+cannot be narrowed this way.
+
 ## Validation status
 
-The manifests in this bundle are validated structurally with
-`kubectl kustomize build deploy/rbac` (the bundle assembles cleanly) and a YAML
-parser. Full server-side validation (`kubectl apply --dry-run=server`) and the
-`auth can-i` checks above require a live API server, so **end-to-end
-verification against a real `kind` cluster is covered by tasks T8/T9** (the
-kind-based CI/e2e harness).
+Both bundles assemble cleanly under `kubectl kustomize`, and their contents are
+asserted by the unit suite in [`test/rbac/`](../test/rbac/), which runs on every
+PR without needing a cluster: `maklaude-readonly` grants **no** mutating verb,
+`maklaude-write` grants **exactly** the executor's three, no binding hands a
+mutating role to the observation identity, and the base kustomization does not
+pull in the write delta.
+
+Against a live API server, the `e2e` CI job applies both bundles to a `kind`
+cluster and runs every `auth can-i` assertion above — including the re-check that
+the observation identity is still denied writes *after* the write bundle is
+installed. The two layers answer different questions: the unit suite catches a
+widened manifest in seconds, `can-i` proves the cluster actually behaves that way.

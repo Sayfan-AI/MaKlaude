@@ -10,7 +10,7 @@ This is the map of the operator and architecture docs. If you just want to get M
 | --- | -------------- |
 | [architecture.md](architecture.md) | The two-layer posture: a deterministic Go product built and evolved by an AI dev system, with one optional gated LLM seam. Read this for the mental model. |
 | [quickstart.md](quickstart.md) | Operator setup end to end: grant read-only access, register a cluster, run the monitor, and optionally route escalations to GitHub. **Start here to run it.** |
-| [rbac.md](rbac.md) | The read-only access model, and how to grant and verify a least-privilege ServiceAccount for MaKlaude. |
+| [rbac.md](rbac.md) | The access model: the read-only ServiceAccount MaKlaude observes with, the separate optional identity that can execute three approved actions, and how to grant and verify each. |
 | [no-writes.md](no-writes.md) | The four-layer guarantee that MaKlaude never mutates a cluster, and how to re-verify it yourself. |
 | [escalation.md](escalation.md) | How detected problems become a comms trail: one GitHub issue per problem, keyed by identity, with escalation, recurrence, and resolution. |
 | [slack.md](slack.md) | The optional Slack / ChatOps mirror of the escalation trail: threaded escalations, the `needs:human` mobile push, and inbound replies. |
