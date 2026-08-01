@@ -291,6 +291,36 @@ jobs:
           echo "MAKLAUDE_E2E_KUBECONFIG=${KCFG}" >> "$GITHUB_ENV"
           echo "MAKLAUDE_E2E_CONTEXT=${CLUSTER_NAME}" >> "$GITHUB_ENV"
 
+      # A SECOND kubeconfig, for the executor identity only. It is deliberately a
+      # separate file with a separate credential rather than another user entry in
+      # the read-only one: the write e2e must be incapable of reaching for the
+      # observation account's token, and vice versa, so a mix-up fails as "no such
+      # credential" instead of silently testing the wrong identity.
+      #
+      # The token is minted for maklaude-executor, which exists only because the
+      # optional write bundle was applied above. Reads in the write e2e go through
+      # this identity too (the additive maklaude-readonly binding covers them) —
+      # an executor re-reads its target for the resourceVersion it conditions on.
+      - name: Mint executor ServiceAccount kubeconfig
+        run: |
+          set -euo pipefail
+          KCFG="${RUNNER_TEMP}/maklaude-executor.kubeconfig"
+
+          SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+          TOKEN=$(kubectl -n maklaude create token maklaude-executor --duration=1h)
+
+          # ca.crt was written by the read-only mint step above, from the same
+          # cluster; both kubeconfigs point at one API server.
+          kubectl --kubeconfig "$KCFG" config set-cluster "${CLUSTER_NAME}" \
+            --server="$SERVER" --certificate-authority="${RUNNER_TEMP}/ca.crt" --embed-certs=true
+          kubectl --kubeconfig "$KCFG" config set-credentials maklaude-executor --token="$TOKEN"
+          kubectl --kubeconfig "$KCFG" config set-context "${CLUSTER_NAME}" \
+            --cluster="${CLUSTER_NAME}" --user=maklaude-executor
+          kubectl --kubeconfig "$KCFG" config use-context "${CLUSTER_NAME}"
+          chmod 600 "$KCFG"
+
+          echo "MAKLAUDE_E2E_EXECUTOR_KUBECONFIG=${KCFG}" >> "$GITHUB_ENV"
+
       - name: Locate audit log
         run: |
           set -euo pipefail
@@ -306,10 +336,11 @@ jobs:
             echo "::warning::audit log not found at ${LOG}; the e2e will rely on state-invariance + refused-write proofs only"
           fi
 
-      - name: Run e2e (detect + escalate + zero-writes)
+      - name: Run e2e (detect + escalate + zero-writes + dry-run)
         env:
           # MAKLAUDE_GITHUB_* intentionally unset -> in-memory dry-run escalation.
           MAKLAUDE_E2E_KUBECONFIG: ${{ env.MAKLAUDE_E2E_KUBECONFIG }}
+          MAKLAUDE_E2E_EXECUTOR_KUBECONFIG: ${{ env.MAKLAUDE_E2E_EXECUTOR_KUBECONFIG }}
           MAKLAUDE_E2E_CONTEXT: ${{ env.MAKLAUDE_E2E_CONTEXT }}
           MAKLAUDE_E2E_AUDIT_LOG: ${{ env.MAKLAUDE_E2E_AUDIT_LOG }}
         run: task e2e
