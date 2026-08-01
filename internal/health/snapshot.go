@@ -95,6 +95,13 @@ type NodeSignal struct {
 	// Name is the node's name; node signals are sorted by it.
 	Name string
 
+	// ResourceVersion is the node's resourceVersion at collection time, captured
+	// verbatim. It is the optimistic-concurrency token: a later layer that
+	// proposes a mutating action against this node can carry it as a
+	// precondition, so the action is refused if the node changed after the
+	// snapshot it was reasoned about. Collection itself never uses it.
+	ResourceVersion string
+
 	// Ready reflects the node's Ready condition: true only when the condition is
 	// explicitly present and True. A node whose Ready condition is False,
 	// Unknown, or absent reports false.
@@ -213,6 +220,11 @@ type PodSignal struct {
 	Namespace string
 	Name      string
 
+	// ResourceVersion is the pod's resourceVersion at collection time, captured
+	// verbatim, and serves the same optimistic-concurrency purpose as
+	// [NodeSignal.ResourceVersion].
+	ResourceVersion string
+
 	// Phase is the pod's lifecycle phase as reported by the API server (for
 	// example "Running", "Pending", "Failed").
 	Phase string
@@ -265,6 +277,11 @@ type DeploymentSignal struct {
 	Namespace string
 	Name      string
 
+	// ResourceVersion is the deployment's resourceVersion at collection time,
+	// captured verbatim, and serves the same optimistic-concurrency purpose as
+	// [NodeSignal.ResourceVersion].
+	ResourceVersion string
+
 	// DesiredReplicas is the spec's replica count (defaulting to 1 when the spec
 	// leaves it unset, matching Kubernetes' own default).
 	DesiredReplicas int32
@@ -284,6 +301,11 @@ type ReplicaSetSignal struct {
 	Namespace string
 	Name      string
 
+	// ResourceVersion is the replica set's resourceVersion at collection time,
+	// captured verbatim, and serves the same optimistic-concurrency purpose as
+	// [NodeSignal.ResourceVersion].
+	ResourceVersion string
+
 	// DesiredReplicas is the spec's replica count (defaulting to 1 when unset,
 	// matching Kubernetes' own default).
 	DesiredReplicas int32
@@ -292,6 +314,21 @@ type ReplicaSetSignal struct {
 	// verbatim.
 	ReadyReplicas     int32
 	AvailableReplicas int32
+
+	// Owners lists the replica set's ownerReferences, sorted by (kind, name),
+	// exactly as [PodSignal.Owners] does for pods. It is what authoritatively ties
+	// a ReplicaSet to its Deployment — the "<deployment>-<hash>" naming convention
+	// is a convenience, but a mutating action must not guess its target from a
+	// name.
+	Owners []OwnerRef
+
+	// Revision is the deployment revision this replica set represents, parsed from
+	// the "deployment.kubernetes.io/revision" annotation Kubernetes stamps on
+	// Deployment-managed ReplicaSets. It is 0 when the annotation is absent or
+	// unparseable (a hand-made ReplicaSet, or one not managed by a Deployment).
+	// Revisions are what make a rollback target nameable: the highest revision is
+	// current, the next-highest is what "roll back one revision" means.
+	Revision int64
 }
 
 // EventSignal captures a single recent warning event in a compact, typed form.

@@ -885,3 +885,83 @@ func TestCollect_ReadErrorPropagates(t *testing.T) {
 		t.Fatalf("expected wrapped ErrUnreachable, got: %v", err)
 	}
 }
+
+// TestCollect_ResourceVersionsCaptured proves every mutable object's
+// resourceVersion reaches its signal verbatim. Collection itself never uses the
+// field: it is the optimistic-concurrency token a later layer carries as an
+// action precondition, so an action is refused if the object changed after the
+// snapshot it was reasoned about. Dropping it would silently turn that guard
+// into a no-op — hence a test that only asserts it survives the trip.
+func TestCollect_ResourceVersionsCaptured(t *testing.T) {
+	col := newTestCollector(t,
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", ResourceVersion: "11"}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web-1", ResourceVersion: "22"}},
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web", ResourceVersion: "33"}},
+		&appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web-abc", ResourceVersion: "44"}},
+	)
+
+	snap, err := col.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+
+	got := map[string]string{
+		"node":       snap.Nodes[0].ResourceVersion,
+		"pod":        snap.Pods[0].ResourceVersion,
+		"deployment": snap.Deployments[0].ResourceVersion,
+		"replicaset": snap.ReplicaSets[0].ResourceVersion,
+	}
+	want := map[string]string{"node": "11", "pod": "22", "deployment": "33", "replicaset": "44"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("resourceVersions mismatch:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+// TestCollect_ReplicaSetOwnersAndRevision proves a ReplicaSet carries the two
+// facts needed to reconstruct a Deployment's rollout history: who owns it, and
+// which revision it is. Together they are what lets a later layer resolve "the
+// previous revision" from ownership rather than from the "<deployment>-<hash>"
+// naming convention — a name-prefix guess is fine for grouping findings and not
+// fine for aiming a mutating action.
+func TestCollect_ReplicaSetOwnersAndRevision(t *testing.T) {
+	isController := true
+	owned := func(name, revision string) *appsv1.ReplicaSet {
+		meta := metav1.ObjectMeta{
+			Namespace: "default", Name: name,
+			OwnerReferences: []metav1.OwnerReference{
+				{Kind: "Deployment", Name: "web", UID: "u1", Controller: &isController},
+			},
+		}
+		if revision != "" {
+			meta.Annotations = map[string]string{revisionAnnotation: revision}
+		}
+		return &appsv1.ReplicaSet{ObjectMeta: meta}
+	}
+
+	col := newTestCollector(t,
+		owned("web-old", "1"),
+		owned("web-new", "2"),
+		// A bare ReplicaSet: no Deployment owns it, and it has no revision at all.
+		&appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "standalone"}},
+		// A Deployment-managed ReplicaSet whose annotation is not a number. An
+		// unparseable revision degrades to 0 rather than failing collection:
+		// deciding what a missing revision means belongs downstream.
+		owned("web-garbled", "not-a-number"),
+	)
+
+	snap, err := col.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+
+	deploymentOwner := []OwnerRef{{Kind: "Deployment", Name: "web", Controller: true}}
+	want := []ReplicaSetSignal{
+		{Namespace: "default", Name: "standalone", DesiredReplicas: 1},
+		{Namespace: "default", Name: "web-garbled", DesiredReplicas: 1, Owners: deploymentOwner},
+		{Namespace: "default", Name: "web-new", DesiredReplicas: 1, Owners: deploymentOwner, Revision: 2},
+		{Namespace: "default", Name: "web-old", DesiredReplicas: 1, Owners: deploymentOwner, Revision: 1},
+	}
+	if !reflect.DeepEqual(snap.ReplicaSets, want) {
+		t.Fatalf("replicaset signals mismatch:\n got %+v\nwant %+v", snap.ReplicaSets, want)
+	}
+}
