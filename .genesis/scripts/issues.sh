@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Genesis issue manager — abstraction over gh CLI
-# Supports: create, list, gates, stale-gates, red-prs, close, assign, comment,
+# Supports: create, list, gates, stale-gates, red-prs, ready-prs, close, assign, comment,
 #           label, view
 set -euo pipefail
 
@@ -145,10 +145,90 @@ for age, p, failing in rows:
 "
 }
 
-# Open PRs plus their check rollup, for format_red_prs to filter and render.
+# The other half of the same invisible-nothing-happened class: a PR that is
+# *finished* and merely unmerged. `genesis-merge.yml` auto-merges bot PRs only —
+# deliberately, because the repo is public and `pull_request` fires for fork PRs
+# from anyone, so "merge any green PR" would let an arbitrary contributor land on
+# main unreviewed. A human-authored PR is therefore merged by the orchestrator on
+# a following run, "one run late by design".
+#
+# The lag is by design; permanent invisibility is not. Until now that merge
+# depended on a run happening to notice the PR, and nothing put it in front of
+# one: a human PR whose tracking issue is closed early, or that has no linked
+# issue at all, is unreachable from every section of `summary`. So the same
+# treatment red-prs got — derive it from repo state, print it unconditionally.
+#
+# Ready means merging is the ONLY remaining step. Everything else is somebody
+# else's section: red checks are red-prs', BEHIND/BLOCKED/DIRTY need a rebase or
+# a review rather than a merge, and `needs:human` means a person is deliberately
+# holding it. Because this prints on every tick, a false positive is far more
+# expensive than a false negative — it trains the orchestrator to skip the whole
+# report (the lesson red-prs was built around) — so every predicate below is the
+# conservative direction, including requiring checks to exist and to have
+# concluded SUCCESS rather than merely not-failed.
+#
+# Reads `gh pr list --json` output on stdin. Prints nothing when nothing is
+# ready, so callers can treat empty output as all-clear.
+format_ready_prs() {
+    python3 -c "
+import sys, json
+from datetime import datetime, timezone
+
+prs = json.load(sys.stdin)
+now = datetime.now(timezone.utc)
+
+rows = []
+for p in prs:
+    if p.get('isDraft'):
+        continue
+
+    # A bot PR belongs to genesis-merge.yml. Listing it here races the
+    # auto-merger and would have the orchestrator duplicate work that is
+    # already automated, so it is excluded on purpose.
+    author = p.get('author') or {}
+    if author.get('is_bot') or str(author.get('login', '')).endswith('[bot]'):
+        continue
+
+    # A person holding the PR outranks any state we can compute.
+    if any(l.get('name') == 'needs:human' for l in p.get('labels') or []):
+        continue
+
+    # Only GitHub knows whether the merge button is actually live; MERGEABLE
+    # alone is not enough (a PR needing a rebase or a review is still
+    # 'mergeable'). CLEAN is the state where merging is the only step left.
+    if p.get('mergeable') != 'MERGEABLE' or p.get('mergeStateStatus') != 'CLEAN':
+        continue
+
+    # Same rollup shape as format_red_prs: CheckRun (name/conclusion) mixed with
+    # StatusContext (context/state). Require every entry to have concluded
+    # SUCCESS. An empty verdict is a check still in flight, so a PR mid-CI is
+    # not ready; an empty rollup means CI has not reported at all. Both are
+    # excluded. Requiring SUCCESS (not merely 'not failed') also makes this
+    # provably disjoint from red-prs: any verdict red-prs counts as failing is
+    # by construction not SUCCESS.
+    checks = p.get('statusCheckRollup') or []
+    if not checks:
+        continue
+    if not all((c.get('conclusion') or c.get('state') or '').upper() == 'SUCCESS' for c in checks):
+        continue
+
+    updated = datetime.fromisoformat(p['updatedAt'].replace('Z', '+00:00'))
+    rows.append(((now - updated).days, p))
+
+# Stalest first, matching gates and red-prs: the PR that has been sitting ready
+# longest is the one being forgotten.
+rows.sort(key=lambda r: -r[0])
+
+for age, p in rows:
+    print('#%d  ready %dd — %s (%s)' % (p['number'], age, p['title'], p['headRefName']))
+"
+}
+
+# Open PRs plus everything format_red_prs and format_ready_prs filter on. One
+# query serves both so `summary` pays for a single PR round-trip.
 fetch_prs() {
     gh pr list --state open --limit 100 \
-        --json number,title,headRefName,isDraft,updatedAt,statusCheckRollup
+        --json number,title,headRefName,isDraft,updatedAt,statusCheckRollup,mergeable,mergeStateStatus,labels,author
 }
 
 case "$CMD" in
@@ -250,6 +330,13 @@ json.dump(filtered, sys.stdout)
         fetch_prs | format_red_prs
         ;;
 
+    ready-prs)
+        # Open PRs where merging is the only remaining step (empty = nothing
+        # waiting). Auto-merge covers bot PRs only, so a human PR is merged by
+        # the orchestrator — this is what puts it in front of one.
+        fetch_prs | format_ready_prs
+        ;;
+
     blocked)
         # Shortcut: list all blocked issues
         gh issue list --state open --label "blocked" --json "$FIELDS" --limit 100 | format_issues
@@ -285,6 +372,14 @@ json.dump(filtered, sys.stdout)
         # alone. Empty here means no PR is red.
         echo "=== Red PRs (failing checks — triage or escalate) ==="
         fetch_prs | format_red_prs
+        echo ""
+        # Unconditional for the third time, and for the third variant of the same
+        # failure: a gate waits forever, a triage event is dropped, a finished PR
+        # is never merged. None of them error, so none of them are visible unless
+        # state-derived and printed every tick. Empty here means nothing is
+        # waiting on a merge.
+        echo "=== Ready to Merge (green, clean, unmerged — merge or say why not) ==="
+        fetch_prs | format_ready_prs
         echo ""
         echo "=== Blocked ==="
         gh issue list --state open --label "blocked" --json "$FIELDS" --limit 100 | format_issues
@@ -387,6 +482,9 @@ Commands:
   gates       List open needs:human gates with their age (stale ones flagged)
   stale-gates List only gates past the staleness threshold (empty = all clear)
   red-prs     List open PRs with failing checks, stalest first (empty = all clear)
+  ready-prs   List open PRs where merging is the only remaining step — green,
+              MERGEABLE/CLEAN, not draft, no needs:human, non-bot author —
+              stalest first (empty = nothing waiting on a merge)
   blocked   List all blocked issues
   recent    List recently updated issues (default: last 24h)
   summary   Overview of project state
