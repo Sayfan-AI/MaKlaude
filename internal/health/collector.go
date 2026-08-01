@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/kube"
 )
@@ -304,7 +306,9 @@ func nodeSignals(nodes []corev1.Node) []NodeSignal {
 	for i := range nodes {
 		n := &nodes[i]
 		out = append(out, NodeSignal{
-			Name:           n.Name,
+			Name:            n.Name,
+			ResourceVersion: n.ResourceVersion,
+
 			Ready:          nodeConditionTrue(n, corev1.NodeReady),
 			MemoryPressure: nodeConditionTrue(n, corev1.NodeMemoryPressure),
 			DiskPressure:   nodeConditionTrue(n, corev1.NodeDiskPressure),
@@ -395,6 +399,7 @@ func podSignals(pods []corev1.Pod) []PodSignal {
 		out = append(out, PodSignal{
 			Namespace:              p.Namespace,
 			Name:                   p.Name,
+			ResourceVersion:        p.ResourceVersion,
 			Phase:                  phase,
 			Reason:                 p.Status.Reason,
 			RestartCount:           restarts,
@@ -402,7 +407,7 @@ func podSignals(pods []corev1.Pod) []PodSignal {
 			Pending:                p.Status.Phase == corev1.PodPending,
 			Failed:                 p.Status.Phase == corev1.PodFailed,
 			Node:                   p.Spec.NodeName,
-			Owners:                 ownerRefs(p),
+			Owners:                 ownerRefs(p.OwnerReferences),
 			Containers:             containers,
 			Requests:               sumRequests(p.Spec.Containers),
 		})
@@ -411,16 +416,17 @@ func podSignals(pods []corev1.Pod) []PodSignal {
 	return out
 }
 
-// ownerRefs transforms a pod's ownerReferences into sorted [OwnerRef]s. It
-// returns nil (not an empty slice) when the pod is unowned, matching the
-// collector's convention for absent repeated signals.
-func ownerRefs(p *corev1.Pod) []OwnerRef {
-	if len(p.OwnerReferences) == 0 {
+// ownerRefs transforms an object's ownerReferences into sorted [OwnerRef]s. It
+// returns nil (not an empty slice) when the object is unowned, matching the
+// collector's convention for absent repeated signals. It takes the references
+// rather than a typed object so pods and replica sets share one implementation.
+func ownerRefs(refs []metav1.OwnerReference) []OwnerRef {
+	if len(refs) == 0 {
 		return nil
 	}
-	out := make([]OwnerRef, 0, len(p.OwnerReferences))
-	for i := range p.OwnerReferences {
-		o := &p.OwnerReferences[i]
+	out := make([]OwnerRef, 0, len(refs))
+	for i := range refs {
+		o := &refs[i]
 		out = append(out, OwnerRef{
 			Kind:       o.Kind,
 			Name:       o.Name,
@@ -529,6 +535,7 @@ func deploymentSignals(deployments []appsv1.Deployment) []DeploymentSignal {
 		out = append(out, DeploymentSignal{
 			Namespace:         d.Namespace,
 			Name:              d.Name,
+			ResourceVersion:   d.ResourceVersion,
 			DesiredReplicas:   desiredReplicas(d.Spec.Replicas),
 			ReadyReplicas:     d.Status.ReadyReplicas,
 			AvailableReplicas: d.Status.AvailableReplicas,
@@ -547,13 +554,33 @@ func replicaSetSignals(replicaSets []appsv1.ReplicaSet) []ReplicaSetSignal {
 		out = append(out, ReplicaSetSignal{
 			Namespace:         r.Namespace,
 			Name:              r.Name,
+			ResourceVersion:   r.ResourceVersion,
 			DesiredReplicas:   desiredReplicas(r.Spec.Replicas),
 			ReadyReplicas:     r.Status.ReadyReplicas,
 			AvailableReplicas: r.Status.AvailableReplicas,
+			Owners:            ownerRefs(r.OwnerReferences),
+			Revision:          deploymentRevision(r.Annotations),
 		})
 	}
 	sortByNamespaceName(out, func(s ReplicaSetSignal) (string, string) { return s.Namespace, s.Name })
 	return out
+}
+
+// revisionAnnotation is the annotation Kubernetes' deployment controller stamps
+// on every ReplicaSet it manages, holding that ReplicaSet's revision number as a
+// decimal string.
+const revisionAnnotation = "deployment.kubernetes.io/revision"
+
+// deploymentRevision reads a ReplicaSet's revision from its annotations. An
+// absent or unparseable annotation yields 0 rather than an error: a ReplicaSet
+// that is not Deployment-managed legitimately has no revision, and collection is
+// judgment-free — deciding what a missing revision means belongs downstream.
+func deploymentRevision(annotations map[string]string) int64 {
+	rev, err := strconv.ParseInt(annotations[revisionAnnotation], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return rev
 }
 
 // desiredReplicas resolves a workload's spec replica count, applying
