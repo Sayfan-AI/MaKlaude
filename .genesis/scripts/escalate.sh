@@ -85,6 +85,36 @@ else
   transcript='**Transcript: unknown** — no retention status was written, so the `retain-transcript.sh` step did not run. Either the job was torn down before reaching it, or this workflow is missing the step; `test/devsystem/transcript_test.go` asserts every Claude-invoking workflow has one.'
 fi
 
+# HOW the run died, established before anything infers WHY from its side effects.
+#
+# The deliverable-landed split below is the #104 fix for six non-converging
+# budget raises, and it is right — but it was applied unconditionally, and it
+# quietly assumed the run died at max-turns at all. Artifact presence cannot tell
+# a max-turns death apart from a run that never reached the model. #108 and #109
+# are the bill: both died `subtype: success, is_error: true, num_turns: 1,
+# total_cost_usd: 0` — one turn against a budget of 60, an API failure on the
+# first request — and both escalations printed the #85 note telling a reader to
+# append 60 to `budgetsFailedBeforeDelivering`. That is raise #7 from non-budget
+# evidence, and it does not even fail cleanly: 60 is already in
+# `budgetsFailedDuringWrapUp`, so the append also trips
+# TestBudgetFailureClassesAreDisjoint.
+#
+# So the split only runs once `error_max_turns` is confirmed. run-outcome.sh
+# reads the terminal `result` message from the SDK output file that
+# `retain-transcript.sh` already consumes one step earlier, and returns its class
+# on line 1 with prose from line 3. Every non-max-turns class carries its own
+# "do NOT touch either budget list" instruction, because saying nothing about the
+# budget is exactly what let the #85 note run on evidence that never supported it.
+outcome_raw="$(bash "$SCRIPT_DIR/run-outcome.sh" 2>/dev/null || true)"
+death_class="$(printf '%s' "$outcome_raw" | sed -n '1p')"
+outcome="$(printf '%s' "$outcome_raw" | tail -n +3)"
+if [ -z "$outcome" ]; then
+  # Same posture as every other section here: absence is reported, not omitted,
+  # and it withholds the budget instruction rather than guessing a class.
+  death_class="unknown"
+  outcome='**How this run died could not be determined** — `run-outcome.sh` returned nothing, so the terminal SDK result was not readable. Do not append this workflow'"'"'s `--max-turns` to either budget list on this evidence; no `error_max_turns` was observed.'
+fi
+
 # Whether a deliverable landed is not just triage colour — it is the ONLY signal
 # that separates the two max-turns failure classes, and they have opposite fixes.
 # Six consecutive budget raises (15→30→40→45→60) failed to converge because both
@@ -120,10 +150,24 @@ artifacts=$(gh api --method GET "repos/${GH_REPO}/issues" \
   --jq '.[] | "- \(if .pull_request then "PR" else "Issue" end) #\(.number) (\(.state)) — \(.title)\n  \(.html_url)"' \
   2>/dev/null || true)
 
-if [ -n "$artifacts" ]; then
-  landed=$(printf 'Touched since %s — **triage these before assuming the run achieved nothing**:\n\n%s\n\nIf the deliverable is already here (a green PR, a posted diagnosis), the run lost only its wrap-up: finish the bookkeeping and close this issue rather than redoing the work.\n\n%s' "$since" "$artifacts" "$WRAPUP_NOTE")
+# The budget notes are gated on the death class, not merely on artifact presence.
+# Artifact discovery is still worth printing for every class — "did anything
+# land?" is the first question a human has regardless of why the run died — but
+# the *instruction* attached to it is only sound when the run actually exhausted
+# its turns. For every other class the outcome section above already carries the
+# correct instruction, which is to leave both lists alone.
+if [ "$death_class" = "max-turns" ]; then
+  wrapup_note="$WRAPUP_NOTE"
+  no_artifact_note="$NO_ARTIFACT_NOTE"
 else
-  landed=$(printf 'No issue or PR was touched since %s. Also check for a pushed branch with no PR before concluding nothing landed.\n\n%s' "$since" "$NO_ARTIFACT_NOTE")
+  wrapup_note='This run did not die at `error_max_turns` (see the section above), so nothing here is evidence about the turn budget — triage the artifacts on their own terms.'
+  no_artifact_note='This run did not die at `error_max_turns` (see the section above), so **an empty list here is not the #85 signature** and must not be read as one. #85 is specifically a max-turns death that produced nothing; a run that errored or never started produces nothing too, and looks identical from here.'
+fi
+
+if [ -n "$artifacts" ]; then
+  landed=$(printf 'Touched since %s — **triage these before assuming the run achieved nothing**:\n\n%s\n\nIf the deliverable is already here (a green PR, a posted diagnosis), the run lost only its wrap-up: finish the bookkeeping and close this issue rather than redoing the work.\n\n%s' "$since" "$artifacts" "$wrapup_note")
+else
+  landed=$(printf 'No issue or PR was touched since %s. Also check for a pushed branch with no PR before concluding nothing landed.\n\n%s' "$since" "$no_artifact_note")
 fi
 
 # Stable per-workflow dedup key. Hidden HTML comment so it never renders but is
@@ -136,7 +180,11 @@ marker="<!-- genesis-failure-wf: ${WF_NAME} -->"
 existing=$(gh issue list --state open --label "automation:failure" --json number,body \
   | jq -r --arg m "$marker" '[.[] | select(.body | contains($m)) | .number] | first // empty')
 
-body=$(printf 'A workflow run failed and the loop could not self-advance.\n\n- Workflow: **%s**\n- Failed run: %s\n\nLikely cause: the agent hit max-turns, an API error, or an unrecoverable task.\n\n### What this run was trying to do\n\n%s\n\n### What this run may already have landed\n\n%s\n\n### Where the transcript is\n\n%s\n\n%s' "$WF_NAME" "$RUN_URL" "$intent" "$landed" "$transcript" "$marker")
+# "How this run died" comes FIRST among the diagnostic sections on purpose: every
+# section under it — intent, artifacts, and the budget instruction attached to
+# them — is read differently depending on the answer, and putting it last is how
+# a reader reaches the #85 note before learning the run used one turn.
+body=$(printf 'A workflow run failed and the loop could not self-advance.\n\n- Workflow: **%s**\n- Failed run: %s\n\n### How this run died\n\n%s\n\n### What this run was trying to do\n\n%s\n\n### What this run may already have landed\n\n%s\n\n### Where the transcript is\n\n%s\n\n%s' "$WF_NAME" "$RUN_URL" "$outcome" "$intent" "$landed" "$transcript" "$marker")
 
 if [ -n "$existing" ]; then
   gh issue comment "$existing" --body "$body"
