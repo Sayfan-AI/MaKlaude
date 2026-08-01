@@ -22,3 +22,9 @@ go.work.sum
 
 # direnv: pins gh to the personal account for this OSS repo (see genesis)
 .envrc
+
+# genesis local control plane runtime state (genesis serve)
+.genesis/.disabled-by-genesis
+.genesis/.orchestrator.lock
+.genesis/.poll-etag
+.genesis/.poll-highwater
