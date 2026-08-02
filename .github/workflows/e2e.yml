@@ -202,7 +202,14 @@ jobs:
           # working image), and a later step rolls it forward onto one that cannot be
           # pulled. Both halves are required — the rollback MaKlaude proposes is only
           # possible because a previous revision demonstrably ran. See the manifest.
+          #
+          # There are TWO of them because two tests each drive an approved rollback to
+          # completion and a remediated Deployment is healthy afterwards, so neither can
+          # reuse the other's fault: `wedged` is remediated in-process by
+          # TestE2E_GatedRemediation, `stuck` by the shipped binary in
+          # TestE2E_BinaryTwoPassGatedRemediation. See stuck-deploy.yaml.
           kubectl apply -f test/e2e/manifests/wedged-deploy.yaml
+          kubectl apply -f test/e2e/manifests/stuck-deploy.yaml
 
       - name: Wait for crashloop pod to enter CrashLoopBackOff
         run: |
@@ -284,64 +291,80 @@ jobs:
             sleep 5
           done
 
-      # --- The fixable fault, in two steps. ---
+      # --- The fixable faults, in two steps each. ---
       #
       # Revision 1 must be observed HEALTHY before the bad rollout lands. That is not
       # tidiness: the approval artifact tells a human "revision 1 was running before
       # this one, so it is known-good", and the whole justification for the rollback
       # MaKlaude proposes rests on it having been true.
-      - name: Wait for the wedged deployment's first revision to be healthy
+      #
+      # Both scenarios go through the same three phases, so they share one loop rather
+      # than three duplicated step bodies. `wedged` is remediated in-process by
+      # TestE2E_GatedRemediation and `stuck` by the shipped binary in
+      # TestE2E_BinaryTwoPassGatedRemediation; each test needs a fault of its own
+      # because the first thing a successful remediation does is remove it.
+      - name: Wait for each fixable fault's first revision to be healthy
         run: |
           set -euo pipefail
-          kubectl rollout status deployment/wedged --timeout=180s -n maklaude-e2e
-          kubectl get deployment wedged -o wide -n maklaude-e2e
+          for d in wedged stuck; do
+            kubectl rollout status "deployment/${d}" --timeout=180s -n maklaude-e2e
+            kubectl get deployment "$d" -o wide -n maklaude-e2e
+          done
 
       # The bad rollout itself. The tag does not exist on Docker Hub, so the pull fails
       # fast with "manifest unknown" rather than hanging on DNS — the same determinism
       # argument badimage-deploy.yaml makes. `set image` (rather than a second manifest)
       # is used because it produces a genuine second revision through the same API path
       # an operator's own bad rollout would.
-      - name: Wedge the deployment with a bad rollout
+      #
+      # Both get the SAME unpullable tag on purpose: the Go assertion that the rollback
+      # restored a good image keys on the substring "maklaude-e2e-wedged-rollout"
+      # (test/e2e/remediation_test.go, wedgeImageMarker), so one marker covers both.
+      - name: Wedge each fixable fault with a bad rollout
         run: |
           set -euo pipefail
-          kubectl set image deployment/wedged \
-            app=busybox:maklaude-e2e-wedged-rollout-v0 -n maklaude-e2e
+          for d in wedged stuck; do
+            kubectl set image "deployment/${d}" \
+              app=busybox:maklaude-e2e-wedged-rollout-v0 -n maklaude-e2e
+          done
 
-      - name: Wait for the wedged deployment to be stuck on the bad revision
+      - name: Wait for each fixable fault to be stuck on the bad revision
         run: |
           set -euo pipefail
           ns=maklaude-e2e
-          deadline=$(( $(date +%s) + 180 ))
-          while :; do
-            reason=$(kubectl get pod -l scenario=wedged \
-              -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' \
-              -n "$ns" 2>/dev/null || true)
-            avail=$(kubectl get deployment wedged \
-              -o jsonpath='{.status.availableReplicas}' -n "$ns" 2>/dev/null || echo 0)
-            # The rollback rule refuses unless a PREVIOUS revision still exists, so the
-            # count of surviving revisions is part of what "wedged" has to mean here.
-            # The kubectl call is separated from the counting pipeline so a transient
-            # API error yields an empty list rather than tripping `pipefail` and
-            # aborting the whole wait.
-            raw_revisions=$(kubectl get rs -l scenario=wedged \
-              -o jsonpath='{range .items[*]}{.metadata.annotations.deployment\.kubernetes\.io/revision}{"\n"}{end}' \
-              -n "$ns" 2>/dev/null || true)
-            revisions=$(printf '%s\n' "$raw_revisions" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')
-            echo "wedged: reason='${reason}' availableReplicas='${avail:-0}' revisions='${revisions}'"
-            if { [ "$reason" = "ImagePullBackOff" ] || [ "$reason" = "ErrImagePull" ]; } \
-               && { [ -z "${avail:-}" ] || [ "${avail:-0}" = "0" ]; } \
-               && [ "${revisions:-0}" -ge 2 ]; then
-              echo "wedged deployment is stuck on the bad revision with a previous revision to roll back to."
-              break
-            fi
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::wedged deployment did not reach the stuck-on-bad-revision state in time"
-              kubectl describe deployment wedged -n "$ns" || true
-              kubectl get rs -l scenario=wedged -o wide -n "$ns" || true
-              kubectl describe pod -l scenario=wedged -n "$ns" || true
-              exit 1
-            fi
-            sleep 5
+          for d in wedged stuck; do
+            deadline=$(( $(date +%s) + 180 ))
+            while :; do
+              reason=$(kubectl get pod -l "scenario=${d}" \
+                -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' \
+                -n "$ns" 2>/dev/null || true)
+              avail=$(kubectl get deployment "$d" \
+                -o jsonpath='{.status.availableReplicas}' -n "$ns" 2>/dev/null || echo 0)
+              # The rollback rule refuses unless a PREVIOUS revision still exists, so the
+              # count of surviving revisions is part of what "stuck on a bad revision"
+              # has to mean here. The kubectl call is separated from the counting
+              # pipeline so a transient API error yields an empty list rather than
+              # tripping `pipefail` and aborting the whole wait.
+              raw_revisions=$(kubectl get rs -l "scenario=${d}" \
+                -o jsonpath='{range .items[*]}{.metadata.annotations.deployment\.kubernetes\.io/revision}{"\n"}{end}' \
+                -n "$ns" 2>/dev/null || true)
+              revisions=$(printf '%s\n' "$raw_revisions" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')
+              echo "${d}: reason='${reason}' availableReplicas='${avail:-0}' revisions='${revisions}'"
+              if { [ "$reason" = "ImagePullBackOff" ] || [ "$reason" = "ErrImagePull" ]; } \
+                 && { [ -z "${avail:-}" ] || [ "${avail:-0}" = "0" ]; } \
+                 && [ "${revisions:-0}" -ge 2 ]; then
+                echo "${d} deployment is stuck on the bad revision with a previous revision to roll back to."
+                break
+              fi
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::error::${d} deployment did not reach the stuck-on-bad-revision state in time"
+                kubectl describe deployment "$d" -n "$ns" || true
+                kubectl get rs -l "scenario=${d}" -o wide -n "$ns" || true
+                kubectl describe pod -l "scenario=${d}" -n "$ns" || true
+                exit 1
+              fi
+              sleep 5
+            done
           done
 
       - name: Mint read-only ServiceAccount kubeconfig
@@ -426,10 +449,12 @@ jobs:
           kubectl get pods -A || true
           echo "=== e2e namespace ==="
           kubectl -n maklaude-e2e describe pods || true
-          echo "=== deployments + revisions (the gated-remediation target) ==="
+          echo "=== deployments + revisions (the gated-remediation targets) ==="
           kubectl get deployments,replicasets -o wide -n maklaude-e2e || true
-          kubectl rollout history deployment/wedged -n maklaude-e2e || true
-          kubectl describe deployment wedged -n maklaude-e2e || true
+          for d in wedged stuck; do
+            kubectl rollout history "deployment/${d}" -n maklaude-e2e || true
+            kubectl describe deployment "$d" -n maklaude-e2e || true
+          done
           echo "=== audit tail (MaKlaude SA) ==="
           if [ -n "${AUDIT_LOG_DIR:-}" ] && [ -f "${AUDIT_LOG_DIR}/audit.log" ]; then
             grep "system:serviceaccount:maklaude:maklaude" "${AUDIT_LOG_DIR}/audit.log" | tail -50 || true
