@@ -128,6 +128,32 @@ enables it) and fails the build if **any** mutating verb (`create`, `update`,
 corroboration: it is the cluster's own independent record, not MaKlaude's. When
 the log is unavailable the check skips with a warning — layers 1–3 still hold.
 
+> **The gated-remediation e2e does not weaken this promise, and reading its audit
+> log will show you a `patch`.** Since Milestone 4 MaKlaude has a *second*
+> identity, `system:serviceaccount:maklaude:maklaude-executor`, which exists only
+> to carry out an action a human explicitly approved (see
+> [`docs/rbac.md`](rbac.md) for the access model and
+> [`docs/autonomous-mode.md`](autonomous-mode.md) for the one documented way the
+> approval requirement can be waived). The four layers above are about the
+> **observation** identity, and every one of them still holds: the write bundle is
+> never bound to it, and layer 2 is what makes that true at the API server rather
+> than by convention.
+>
+> The gated-remediation e2e holds both identities to a differently-shaped
+> assertion, because "zero mutating verbs" is not quite the property either one
+> has. `assertOnlyTheApprovedWriteLanded` in
+> [`test/e2e/remediation_test.go`](../test/e2e/remediation_test.go) classifies
+> *every* mutating request the apiserver attributed to a MaKlaude identity —
+> server-side previews, requests the server rejected, and requests that landed —
+> and fails the build unless **nothing the observation identity sent was accepted**
+> and **exactly one executor request landed**, on the object a human approved.
+>
+> The observation identity does appear in that log with one `patch`, and it is
+> supposed to: `TestE2E_ObservationIdentityCannotExecute` aims a dry-run patch at a
+> Deployment precisely so RBAC can refuse it, and the apiserver audits the attempt
+> whatever it answers. A refusal recorded there is layer 2 working, which is why
+> the assertion is about what was *accepted* rather than about what was tried.
+
 ---
 
 ## How to re-verify the guarantee yourself

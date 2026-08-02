@@ -361,10 +361,11 @@ tests — the same checks `task ci` runs locally. Keep the gate green.
 
 A separate CI job (`.github/workflows/e2e.yml`) runs on every pull request: it
 creates a real [kind](https://kind.sigs.k8s.io/) cluster, applies the read-only
-RBAC bundle, seeds two failure scenarios — a **crashlooping** pod and an
-**unschedulable/pending** pod (see [`test/e2e/manifests/`](test/e2e/manifests/))
-— waits for them to manifest, then runs the pipeline **as MaKlaude's
-least-privilege ServiceAccount** and asserts:
+RBAC bundle, seeds four failure scenarios — a **crashlooping** pod, an
+**unschedulable/pending** pod, a Deployment on an **unpullable image**, and a
+Deployment **wedged by a bad rollout** (see
+[`test/e2e/manifests/`](test/e2e/manifests/)) — waits for each to manifest, then
+runs the pipeline **as MaKlaude's least-privilege ServiceAccount** and asserts:
 
 1. **Findings** — a critical `pod.crashloop` and a warning `pod.pending` are detected.
 2. **Escalation** — the findings correlate into incidents and a diagnostic issue is opened per incident (in-memory dry-run, no external writes).
@@ -377,11 +378,21 @@ least-privilege ServiceAccount** and asserts:
    The no-writes assertions are part of the test and **fail the build** if violated.
    See [`docs/no-writes.md`](docs/no-writes.md) for the full belt-and-suspenders
    guarantee and the exact code/tests that back each layer.
+4. **Gated remediation** — the wedged Deployment is driven all the way through:
+   the pipeline proposes a rollback, a dry run of that exact request is previewed
+   against the API server, an explicit human approval is simulated on the
+   approval artifact, and only then is the action executed as the separate
+   `maklaude-executor` identity. The cluster must **converge** back to healthy,
+   the **audit trail** must name the approver, the **approval artifact** must
+   show the whole `proposed → approved → executed → verified` lifecycle, and —
+   the sharp one — exactly **one** mutating request may have landed on the
+   cluster, the one that was approved. See
+   [`test/e2e/remediation_test.go`](test/e2e/remediation_test.go).
 
 The test is gated behind the `e2e` build tag (`task e2e`) and expects
-`MAKLAUDE_E2E_KUBECONFIG`, `MAKLAUDE_E2E_CONTEXT`, and (optionally)
-`MAKLAUDE_E2E_AUDIT_LOG`; the CI job sets them. `MAKLAUDE_GITHUB_*` is left unset
-so escalation stays a safe dry-run.
+`MAKLAUDE_E2E_KUBECONFIG`, `MAKLAUDE_E2E_EXECUTOR_KUBECONFIG`,
+`MAKLAUDE_E2E_CONTEXT`, and (optionally) `MAKLAUDE_E2E_AUDIT_LOG`; the CI job sets
+them. `MAKLAUDE_GITHUB_*` is left unset so escalation stays a safe dry-run.
 
 Try the CLI:
 

@@ -5,6 +5,15 @@ name: E2E (kind)
 #   (a) the expected findings are detected,
 #   (b) an escalation is produced, and
 #   (c) ZERO writes reached the cluster.
+#
+# Since Milestone 4 the job also seeds a FIXABLE fault — a Deployment rolled forward
+# onto an unpullable image — and drives the whole gated-remediation flow against it:
+# propose, preview, simulate an explicit human approval, execute exactly that one
+# action, and watch the cluster converge. The zero-writes assertion above is unchanged
+# for the observation identity; the executor identity's single approved write is
+# accounted for request-by-request against the apiserver audit log. See
+# test/e2e/remediation_test.go.
+#
 # This job runs on every pull request (and pushes to main) so it gates merges.
 on:
   push:
@@ -189,6 +198,11 @@ jobs:
           kubectl apply -f test/e2e/manifests/crashloop-pod.yaml
           kubectl apply -f test/e2e/manifests/pending-pod.yaml
           kubectl apply -f test/e2e/manifests/badimage-deploy.yaml
+          # The FIXABLE fault is seeded in two steps: this applies revision 1 (a
+          # working image), and a later step rolls it forward onto one that cannot be
+          # pulled. Both halves are required — the rollback MaKlaude proposes is only
+          # possible because a previous revision demonstrably ran. See the manifest.
+          kubectl apply -f test/e2e/manifests/wedged-deploy.yaml
 
       - name: Wait for crashloop pod to enter CrashLoopBackOff
         run: |
@@ -270,6 +284,66 @@ jobs:
             sleep 5
           done
 
+      # --- The fixable fault, in two steps. ---
+      #
+      # Revision 1 must be observed HEALTHY before the bad rollout lands. That is not
+      # tidiness: the approval artifact tells a human "revision 1 was running before
+      # this one, so it is known-good", and the whole justification for the rollback
+      # MaKlaude proposes rests on it having been true.
+      - name: Wait for the wedged deployment's first revision to be healthy
+        run: |
+          set -euo pipefail
+          kubectl rollout status deployment/wedged --timeout=180s -n maklaude-e2e
+          kubectl get deployment wedged -o wide -n maklaude-e2e
+
+      # The bad rollout itself. The tag does not exist on Docker Hub, so the pull fails
+      # fast with "manifest unknown" rather than hanging on DNS — the same determinism
+      # argument badimage-deploy.yaml makes. `set image` (rather than a second manifest)
+      # is used because it produces a genuine second revision through the same API path
+      # an operator's own bad rollout would.
+      - name: Wedge the deployment with a bad rollout
+        run: |
+          set -euo pipefail
+          kubectl set image deployment/wedged \
+            app=busybox:maklaude-e2e-wedged-rollout-v0 -n maklaude-e2e
+
+      - name: Wait for the wedged deployment to be stuck on the bad revision
+        run: |
+          set -euo pipefail
+          ns=maklaude-e2e
+          deadline=$(( $(date +%s) + 180 ))
+          while :; do
+            reason=$(kubectl get pod -l scenario=wedged \
+              -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' \
+              -n "$ns" 2>/dev/null || true)
+            avail=$(kubectl get deployment wedged \
+              -o jsonpath='{.status.availableReplicas}' -n "$ns" 2>/dev/null || echo 0)
+            # The rollback rule refuses unless a PREVIOUS revision still exists, so the
+            # count of surviving revisions is part of what "wedged" has to mean here.
+            # The kubectl call is separated from the counting pipeline so a transient
+            # API error yields an empty list rather than tripping `pipefail` and
+            # aborting the whole wait.
+            raw_revisions=$(kubectl get rs -l scenario=wedged \
+              -o jsonpath='{range .items[*]}{.metadata.annotations.deployment\.kubernetes\.io/revision}{"\n"}{end}' \
+              -n "$ns" 2>/dev/null || true)
+            revisions=$(printf '%s\n' "$raw_revisions" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')
+            echo "wedged: reason='${reason}' availableReplicas='${avail:-0}' revisions='${revisions}'"
+            if { [ "$reason" = "ImagePullBackOff" ] || [ "$reason" = "ErrImagePull" ]; } \
+               && { [ -z "${avail:-}" ] || [ "${avail:-0}" = "0" ]; } \
+               && [ "${revisions:-0}" -ge 2 ]; then
+              echo "wedged deployment is stuck on the bad revision with a previous revision to roll back to."
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::wedged deployment did not reach the stuck-on-bad-revision state in time"
+              kubectl describe deployment wedged -n "$ns" || true
+              kubectl get rs -l scenario=wedged -o wide -n "$ns" || true
+              kubectl describe pod -l scenario=wedged -n "$ns" || true
+              exit 1
+            fi
+            sleep 5
+          done
+
       - name: Mint read-only ServiceAccount kubeconfig
         run: |
           set -euo pipefail
@@ -336,7 +410,7 @@ jobs:
             echo "::warning::audit log not found at ${LOG}; the e2e will rely on state-invariance + refused-write proofs only"
           fi
 
-      - name: Run e2e (detect + escalate + zero-writes + dry-run)
+      - name: Run e2e (detect + escalate + zero-writes + dry-run + gated remediation)
         env:
           # MAKLAUDE_GITHUB_* intentionally unset -> in-memory dry-run escalation.
           MAKLAUDE_E2E_KUBECONFIG: ${{ env.MAKLAUDE_E2E_KUBECONFIG }}
@@ -352,6 +426,10 @@ jobs:
           kubectl get pods -A || true
           echo "=== e2e namespace ==="
           kubectl -n maklaude-e2e describe pods || true
+          echo "=== deployments + revisions (the gated-remediation target) ==="
+          kubectl get deployments,replicasets -o wide -n maklaude-e2e || true
+          kubectl rollout history deployment/wedged -n maklaude-e2e || true
+          kubectl describe deployment wedged -n maklaude-e2e || true
           echo "=== audit tail (MaKlaude SA) ==="
           if [ -n "${AUDIT_LOG_DIR:-}" ] && [ -f "${AUDIT_LOG_DIR}/audit.log" ]; then
             grep "system:serviceaccount:maklaude:maklaude" "${AUDIT_LOG_DIR}/audit.log" | tail -50 || true
