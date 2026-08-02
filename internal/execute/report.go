@@ -343,6 +343,12 @@ type Report struct {
 	Target        remediate.Target
 	Reversibility remediate.Reversibility
 
+	// ProposedAt is when the proposal was computed. It is carried so the report — and
+	// the audit record derived from it — can state the whole lifecycle from proposal
+	// to outcome without a second lookup, including how long the action waited for a
+	// human.
+	ProposedAt time.Time
+
 	// Approver is the human whose approval authorized this, and ApprovalRef is the
 	// artifact that carried it. Both are empty when the authorization was not valid.
 	Approver    string

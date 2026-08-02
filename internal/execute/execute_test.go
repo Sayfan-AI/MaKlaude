@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/approve"
+	"github.com/Sayfan-AI/MaKlaude/internal/audit"
 	"github.com/Sayfan-AI/MaKlaude/internal/health"
 	"github.com/Sayfan-AI/MaKlaude/internal/kube"
 	"github.com/Sayfan-AI/MaKlaude/internal/remediate"
@@ -78,7 +79,7 @@ func TestExecute_MarksTheApprovalTrailExecuted(t *testing.T) {
 	auth := g.authorize()
 
 	mutator := newFakeMutator(model)
-	runner, err := New(mutator, &fakeObserver{model: model}, g.gk, fastPolicy())
+	runner, err := New(mutator, &fakeObserver{model: model}, g.gk, audit.NewTrail(), fastPolicy())
 	if err != nil {
 		t.Fatalf("building runner: %v", err)
 	}
@@ -758,33 +759,38 @@ func TestExecute_RecordsBeforeObserving(t *testing.T) {
 	}
 }
 
-// TestNew_RequiresEveryDependency proves none of the three can be left out. The
-// recorder matters most: without it nothing marks the approval artifact executed, so
-// "exactly once" would quietly become "once per cycle".
+// TestNew_RequiresEveryDependency proves none of the four can be left out. Two of
+// them matter beyond testability: without the recorder nothing marks the approval
+// artifact executed, so "exactly once" would quietly become "once per cycle"; and
+// without the audit sink a mutation happens with no record of who authorized it,
+// which fails silently and is therefore the worst kind of missing dependency.
 func TestNew_RequiresEveryDependency(t *testing.T) {
 	model := newClusterModel()
 	mutator := newFakeMutator(model)
 	observer := &fakeObserver{model: model}
 	recorder := &fakeRecorder{}
+	trail := audit.NewTrail()
 
 	cases := map[string]struct {
 		mutator  Mutator
 		observer Observer
 		recorder Recorder
+		trail    audit.Sink
 	}{
-		"no write client": {nil, observer, recorder},
-		"no observer":     {mutator, nil, recorder},
-		"no recorder":     {mutator, observer, nil},
+		"no write client": {nil, observer, recorder, trail},
+		"no observer":     {mutator, nil, recorder, trail},
+		"no recorder":     {mutator, observer, nil, trail},
+		"no audit sink":   {mutator, observer, recorder, nil},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := New(tc.mutator, tc.observer, tc.recorder, Policy{}); err == nil {
+			if _, err := New(tc.mutator, tc.observer, tc.recorder, tc.trail, Policy{}); err == nil {
 				t.Fatal("a runner was built with a missing dependency")
 			}
 		})
 	}
 
-	runner, err := New(mutator, observer, recorder, Policy{})
+	runner, err := New(mutator, observer, recorder, trail, Policy{})
 	if err != nil {
 		t.Fatalf("building a runner with every dependency: %v", err)
 	}

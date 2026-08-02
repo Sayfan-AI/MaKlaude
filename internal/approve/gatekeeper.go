@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/detect"
@@ -354,6 +355,43 @@ func (g *Gatekeeper) RecordExecution(ctx context.Context, auth *Authorization, d
 		errs = append(errs, fmt.Errorf("clearing the human gate on %q: %w", ref, err))
 	}
 	return errors.Join(errs...)
+}
+
+// RecordOutcome posts a note onto an artifact's trail WITHOUT touching any label.
+//
+// It exists because [Gatekeeper.RecordExecution] does two things at once — it
+// comments and it applies [ExecutedLabel] — and only one of them may happen more
+// than once. The label is the durable single-execution flag and is applied the
+// instant a mutation lands, before anything is known about whether it worked. The
+// audit trail, by contrast, has things to say afterwards: the convergence verdict
+// once the observation window closes, the rollback once one is performed, and the
+// abort when an approved action was abandoned because the world moved. Routing
+// those through RecordExecution would re-apply the executed label to actions that
+// never executed, which is the one label whose meaning must stay exact.
+//
+// So this is the append-only half on its own: comment, change nothing else. It
+// refuses an invalid authorization for the same reason RecordExecution does — a note
+// on a trail the gate never authorized is a false entry, and a false entry in an
+// audit trail is worse than a missing one.
+//
+// Like RecordExecution it does not mirror to chat. Both are follow-ups on a
+// conversation that already has a root, and the artifact is the durable record; a
+// chat outage must never be able to lose an audit note.
+func (g *Gatekeeper) RecordOutcome(ctx context.Context, auth *Authorization, note string) error {
+	if !auth.Valid() {
+		return errors.New("approve: refusing to record an outcome against an authorization the gate did not issue")
+	}
+	ref := auth.Ref()
+	if ref == "" {
+		return errors.New("approve: authorization carries no artifact reference to record against")
+	}
+	if strings.TrimSpace(note) == "" {
+		return errors.New("approve: refusing to record an empty outcome note")
+	}
+	if err := g.sink.Comment(ctx, ref, note); err != nil {
+		return fmt.Errorf("recording outcome on %q: %w", ref, err)
+	}
+	return nil
 }
 
 // notifyID adapts a proposal identity to the notifier's key type. The notifier is
