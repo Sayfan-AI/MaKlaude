@@ -21,6 +21,12 @@ type recordedRequest struct {
 	Query       string
 	ContentType string
 	Body        map[string]any
+
+	// RawBody is the body exactly as it arrived. Body is the convenient form for a
+	// strategic-merge patch, which is an object; a JSON patch is an ARRAY of operations,
+	// which does not survive being decoded into a map at all — and the order of those
+	// operations is itself part of what the guard promises.
+	RawBody string
 }
 
 // stubAPIServer is an httptest server standing in for an API server. It records

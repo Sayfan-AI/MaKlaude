@@ -21,6 +21,7 @@ const (
 	fieldUpdatedReplicas   = "updatedReplicas"
 	fieldAvailableReplicas = "availableReplicas"
 	fieldMaxRevision       = "maxRevision"
+	fieldCurrentReplicaSet = "currentReplicaSet"
 )
 
 // capturePreState records what the target looked like immediately before the
@@ -65,12 +66,27 @@ func capturePreState(idx *clusterIndex, t remediate.Target) (PreState, error) {
 		// previous rollout until the deployment controller catches up, so convergence is
 		// judged against this number rather than against the counts alone. See
 		// [rolloutRestartConverged].
+		//
+		// The current ReplicaSet's NAME is recorded alongside it because the number does
+		// not survive its own restoration: rolling back to a revision re-uses that
+		// revision's ReplicaSet and re-annotates it with the next number, so a rollback's
+		// own rollback has to identify "the template that was running" by object rather
+		// than by revision. See [clusterIndex.currentReplicaSet].
+		current, ok := idx.currentReplicaSet(t.Namespace, t.Name)
+		if !ok {
+			// Recorded as a word rather than as an empty value: a reader of the trail must
+			// be able to tell "no ReplicaSet was visible" from "this field was never
+			// populated", and the rollback path refuses on it rather than comparing a name
+			// against nothing. See [rollForwardSatisfied].
+			current = noReplicaSet
+		}
 		pre.Fields = []PreStateField{
 			{Name: fieldDesiredReplicas, Value: strconv.FormatInt(int64(dep.DesiredReplicas), 10)},
 			{Name: fieldReadyReplicas, Value: strconv.FormatInt(int64(dep.ReadyReplicas), 10)},
 			{Name: fieldUpdatedReplicas, Value: strconv.FormatInt(int64(dep.UpdatedReplicas), 10)},
 			{Name: fieldAvailableReplicas, Value: strconv.FormatInt(int64(dep.AvailableReplicas), 10)},
 			{Name: fieldMaxRevision, Value: strconv.FormatInt(maxRevision(idx.revisions(t.Namespace, t.Name)), 10)},
+			{Name: fieldCurrentReplicaSet, Value: current},
 		}
 
 	case kindPod:

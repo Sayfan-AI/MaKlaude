@@ -313,11 +313,23 @@ type clusterIndex struct {
 	nodes       map[string]health.NodeSignal
 	deployments map[string]health.DeploymentSignal
 
-	// revisionsByDeployment maps a deployment's namespace/name to the revisions of
-	// the ReplicaSets it owns, resolved through ownerReferences rather than the
-	// "<deployment>-<hash>" naming convention — a mutating action must not guess its
-	// target from a name.
-	revisionsByDeployment map[string][]int64
+	// replicaSetsByDeployment maps a deployment's namespace/name to the ReplicaSets it
+	// owns, resolved through ownerReferences rather than the "<deployment>-<hash>"
+	// naming convention — a mutating action must not guess its target from a name.
+	//
+	// The ReplicaSet's NAME is kept alongside its revision because a rollback needs an
+	// identity that survives a rollout, and a revision number does not: rolling back
+	// re-uses the target revision's ReplicaSet and re-annotates it with the next
+	// revision number, so "revision 2" ceases to exist the moment it is restored. The
+	// object it lived on is still there, under the same name.
+	replicaSetsByDeployment map[string][]replicaSetRevision
+}
+
+// replicaSetRevision is one of a deployment's ReplicaSets, reduced to the two facts
+// this package reasons about: which object it is, and which rollout it represents.
+type replicaSetRevision struct {
+	name     string
+	revision int64
 }
 
 // newClusterIndex builds the index over a snapshot. It iterates the snapshot's
@@ -325,11 +337,11 @@ type clusterIndex struct {
 // introduces no nondeterminism.
 func newClusterIndex(snap health.Snapshot) *clusterIndex {
 	idx := &clusterIndex{
-		snapshot:              snap,
-		pods:                  make(map[string]health.PodSignal, len(snap.Pods)),
-		nodes:                 make(map[string]health.NodeSignal, len(snap.Nodes)),
-		deployments:           make(map[string]health.DeploymentSignal, len(snap.Deployments)),
-		revisionsByDeployment: make(map[string][]int64, len(snap.Deployments)),
+		snapshot:                snap,
+		pods:                    make(map[string]health.PodSignal, len(snap.Pods)),
+		nodes:                   make(map[string]health.NodeSignal, len(snap.Nodes)),
+		deployments:             make(map[string]health.DeploymentSignal, len(snap.Deployments)),
+		replicaSetsByDeployment: make(map[string][]replicaSetRevision, len(snap.Deployments)),
 	}
 	for i := range snap.Pods {
 		idx.pods[objectKey(snap.Pods[i].Namespace, snap.Pods[i].Name)] = snap.Pods[i]
@@ -350,7 +362,8 @@ func newClusterIndex(snap health.Snapshot) *clusterIndex {
 				continue
 			}
 			key := objectKey(rs.Namespace, rs.Owners[j].Name)
-			idx.revisionsByDeployment[key] = append(idx.revisionsByDeployment[key], rs.Revision)
+			idx.replicaSetsByDeployment[key] = append(idx.replicaSetsByDeployment[key],
+				replicaSetRevision{name: rs.Name, revision: rs.Revision})
 		}
 	}
 	return idx
@@ -377,7 +390,32 @@ func (idx *clusterIndex) deployment(namespace, name string) (health.DeploymentSi
 // revisions returns the deployment's surviving ReplicaSet revisions, in the
 // snapshot's own stable order.
 func (idx *clusterIndex) revisions(namespace, name string) []int64 {
-	return idx.revisionsByDeployment[objectKey(namespace, name)]
+	owned := idx.replicaSetsByDeployment[objectKey(namespace, name)]
+	out := make([]int64, 0, len(owned))
+	for _, rs := range owned {
+		out = append(out, rs.revision)
+	}
+	return out
+}
+
+// currentReplicaSet returns the name of the ReplicaSet carrying the deployment's
+// HIGHEST surviving revision — the one whose pod template the deployment is running
+// now — and false when the snapshot saw none.
+//
+// The name is the identity a rollback needs. The Deployment controller creates exactly
+// one ReplicaSet per distinct pod template and re-uses it whenever that template comes
+// back, so "the current ReplicaSet is the same object as before" and "the pod template
+// is the one from before" are the same statement. Comparing revision NUMBERS cannot say
+// that: restoring revision 2 re-annotates its ReplicaSet as revision 4, so the number a
+// pre-state recorded is gone precisely when the rollback worked.
+func (idx *clusterIndex) currentReplicaSet(namespace, name string) (string, bool) {
+	var current replicaSetRevision
+	for _, rs := range idx.replicaSetsByDeployment[objectKey(namespace, name)] {
+		if rs.revision > current.revision {
+			current = rs
+		}
+	}
+	return current.name, current.revision > 0
 }
 
 // resourceVersion returns the target's current resourceVersion, and false when the

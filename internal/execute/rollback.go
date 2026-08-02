@@ -106,7 +106,7 @@ func (r *Runner) rollback(ctx context.Context, auth *approve.Authorization, rep 
 	}
 
 	out, attempts, err := r.send(ctx, func(ctx context.Context) (*kube.Outcome, error) {
-		return undo.mutate(ctx, r.mutator, rep.Target, resourceVersion)
+		return undo.mutate(ctx, r.mutator, rep.Target, rep.PreState, resourceVersion)
 	})
 	rb.Attempts = attempts
 	switch {

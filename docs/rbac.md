@@ -193,18 +193,24 @@ intrusion, never normal operation.
 
 One rule per primitive in
 [`internal/kube/executor.go`](../internal/kube/executor.go). The catalog is
-closed — three single-object API calls, three verbs:
+closed — every primitive is one single-object API call, and between them they need
+three verbs:
 
 | API group | Resource | Verb | Executor method | What it does |
 | --------- | -------- | ---- | --------------- | ------------ |
 | `apps` | `deployments` | patch | `PatchDeployment` | Strategic-merge patch of one Deployment. `RestartDeploymentRollout` uses it to stamp the `kubectl.kubernetes.io/restartedAt` annotation (`kubectl rollout restart` at the API level) |
+| `apps` | `deployments` | patch | `PatchDeploymentJSON` | RFC 6902 JSON patch of one Deployment — the same verb, a different patch type. `RollbackDeploymentToRevision` uses it to `replace` `/spec/template` with a previous revision's pod template (`kubectl rollout undo`). A strategic merge cannot express this: it merges containers and env vars by name, so anything the current revision added would survive the rollback |
 | `""` (core/v1) | `nodes` | patch | `PatchNode` | Strategic-merge patch of one Node. `CordonNode` uses it to set `spec.unschedulable` |
 | `""` (core/v1) | `pods` | delete | `DeletePod` | Deletes one already-failed pod whose controller will recreate it |
 
 Plus, via a second binding, the *same* `maklaude-readonly` ClusterRole the
 observation identity holds. The write role is additive, not self-sufficient: an
 executor has to re-read its target to obtain the `resourceVersion` it conditions
-the action on. Reusing the read role verbatim means the two can't drift — but it
+the action on, and a revision rollback additionally reads the target revision's
+ReplicaSet — the pod template it restores only exists in the cluster. Those reads
+run on a client built from the *zero* `WriteScope`, which admits read verbs and
+refuses every mutating one, so the read half of a rollback holds no authority to
+change anything. Reusing the read role verbatim means the two can't drift — but it
 also means **the base bundle must be applied first**, or the executor's read
 binding dangles on a ClusterRole that doesn't exist. (RBAC allows the dangling
 reference and silently grants nothing, so the symptom is unexplained `Forbidden`

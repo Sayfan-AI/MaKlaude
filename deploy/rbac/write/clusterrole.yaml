@@ -6,14 +6,21 @@
 # widen what the read/diagnose path is allowed to do.
 #
 # Every rule below is one action in internal/kube/executor.go's catalog. The
-# catalog is closed: the executor exposes exactly three primitives, each a single
-# API call against a single named object, and this role grants exactly those
-# three verbs and nothing else.
+# catalog is closed: every primitive the executor exposes is a single mutating API
+# call against a single named object, and this role grants exactly the three verbs
+# those calls need and nothing else.
 #
-#   patch deployments.apps : Executor.PatchDeployment — used by
-#                            RestartDeploymentRollout (stamps the
+#   patch deployments.apps : Executor.PatchDeployment (strategic merge) — used by
+#                            RestartDeploymentRollout, which stamps the
 #                            kubectl.kubernetes.io/restartedAt annotation on the
-#                            pod template) and by rollback-shaped patches.
+#                            pod template — AND Executor.PatchDeploymentJSON
+#                            (RFC 6902), used by RollbackDeploymentToRevision to
+#                            `replace` /spec/template with a previous revision's.
+#                            Two patch TYPES, one verb: Kubernetes authorizes both
+#                            as `patch`, so restoring a revision needs no
+#                            additional permission. It does need a READ of the
+#                            revision's ReplicaSet, which comes from the additive
+#                            maklaude-readonly binding rather than from here.
 #   patch nodes            : Executor.PatchNode — used by CordonNode
 #                            (spec.unschedulable=true).
 #   delete pods            : Executor.DeletePod — deletes one already-failed pod
@@ -66,10 +73,13 @@ metadata:
     app.kubernetes.io/component: rbac
 rules:
   # apps/v1 deployments — patch only.
-  #   internal/kube/executor.go PatchDeployment issues a single strategic-merge
-  #   PATCH against /apis/apps/v1/namespaces/<ns>/deployments/<name>, with
-  #   metadata.resourceVersion injected as an optimistic-concurrency
-  #   precondition. No create, no update, no delete.
+  #   internal/kube/executor.go PatchDeployment and PatchDeploymentJSON each issue
+  #   a single PATCH against /apis/apps/v1/namespaces/<ns>/deployments/<name>, with
+  #   metadata.resourceVersion injected as an optimistic-concurrency precondition
+  #   (as a body field for the merge patch, as a prepended `replace` op for the
+  #   JSON one). No create, no update, no delete — `update` in particular would
+  #   send a whole object, which is how a rollback could replace a spec MaKlaude
+  #   never read; a JSON patch pinned to /spec/template cannot.
   - apiGroups: ["apps"]
     resources:
       - deployments
