@@ -8,8 +8,10 @@ import (
 
 	"github.com/Sayfan-AI/MaKlaude/internal/approve"
 	"github.com/Sayfan-AI/MaKlaude/internal/audit"
+	"github.com/Sayfan-AI/MaKlaude/internal/autonomy"
 	"github.com/Sayfan-AI/MaKlaude/internal/budget"
 	"github.com/Sayfan-AI/MaKlaude/internal/cluster"
+	"github.com/Sayfan-AI/MaKlaude/internal/disclose"
 	"github.com/Sayfan-AI/MaKlaude/internal/execute"
 	"github.com/Sayfan-AI/MaKlaude/internal/kube"
 )
@@ -73,6 +75,26 @@ const AutonomyStateEnv = "MAKLAUDE_AUTONOMY_STATE"
 // live reports whether the gate reaches a real comms system. A false value with an
 // opted-in mode is a legitimate configuration — it rehearses the whole path with an
 // in-memory trail nobody can approve on — so it is reported rather than refused.
+//
+// # Autonomy is NOT wired here
+//
+// A cycle built by this function auto-applies nothing: it has no ruleset, no trust
+// oracle and no disclosure trail, so [Cycle.autonomyWired] is false and every proposal
+// takes the human gate. That is the shipped posture and it is byte-for-byte Milestone
+// 4's behaviour.
+//
+// The missing piece is deliberately a CONFIGURATION surface rather than a mechanism.
+// [autonomy]'s own doc places rule loading with the documentation that describes it —
+// task T7 (#147) — and the reason is worth restating where the wiring is: the bytes that
+// grant a machine permission to change a production cluster unattended are the single
+// most consequential thing an operator will write in this system, and shipping a loader
+// ahead of the document that explains the format is how somebody ends up with autonomy
+// they did not understand they had enabled. [Cycle.UseAutonomy] is the seam T7 fills;
+// everything behind it is complete and tested.
+//
+// Note that the disclosure trail is not built here either, even though it needs no new
+// configuration knob (it reuses MAKLAUDE_GITHUB_*). Building it would make every pass
+// list the disclosure trail over the network in order to discover that autonomy is off.
 func New() (c *Cycle, live bool, err error) {
 	mode, err := ExecuteModeFromEnv(os.Getenv)
 	if err != nil {
@@ -159,6 +181,37 @@ func (c *Cycle) Mode() kube.ExecuteMode { return c.mode }
 // A nil budget is the shipped posture and is accepted here as such — see [Cycle.budget]
 // for why nothing being bounded means nothing is auto-applied.
 func (c *Cycle) UseBudget(b *budget.Budget) { c.budget = b }
+
+// UseAutonomy attaches the four things a cycle needs to act without asking: the
+// operator's rules, the trust oracle that says whether a shape earned them, the trail
+// every unattended action is disclosed on, and the ledger a failure demotes the shape in.
+//
+// It is one setter rather than four for a reason [Cycle.autonomyWired] then enforces:
+// these are not independent knobs. Rules with no oracle grant nothing, an oracle with no
+// disclosure would let an action run unrecorded, and either half wired alone is a
+// half-configured autonomy that looks configured. Taking them together makes the
+// all-or-nothing shape visible at the call site.
+//
+// ledger may be nil, and that is the one genuine option here: a deployment can run
+// autonomy against a trust oracle it does not write back to (a static allowlist under
+// test, a ledger owned by another process). A failure then cannot demote the shape, and
+// the disclosure says so in those words rather than reporting a demotion that did not
+// happen.
+//
+// It is a setter rather than a [NewForTest] parameter for the reason [Cycle.UseBudget]
+// is: four more arguments would touch every existing call site to pass nil, and a wall
+// of nils is how a genuinely-forgotten argument stops being noticeable.
+func (c *Cycle) UseAutonomy(rules autonomy.Ruleset, oracle autonomy.TrustOracle, trail *disclose.Trail, ledger Demoter) {
+	c.rules = rules
+	c.oracle = oracle
+	c.disclosure = trail
+	c.ledger = ledger
+}
+
+// Autonomous reports whether this cycle can auto-apply anything at all. It is the
+// posture an operator most wants to confirm before believing a quiet report, and it is
+// exposed so a caller can state it without reconstructing the four-way condition.
+func (c *Cycle) Autonomous() bool { return c.autonomyWired() }
 
 // Budget returns the blast-radius budget this cycle bounds unattended actions with,
 // nil when autonomy is not configured. It is exposed so a caller can record an

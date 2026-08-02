@@ -80,6 +80,18 @@ type AutonomyReport struct {
 
 	// Suppressed is every auto-apply a bound held back during this pass.
 	Suppressed []budget.Suppression `json:"suppressed"`
+
+	// RevocationError, when non-empty, reports that the disclosure trail could not be
+	// read, so what a person has revoked is unknown and NOTHING was auto-applied this
+	// pass.
+	//
+	// It is a first-class field rather than a per-cluster error because of what it
+	// costs to miss. An unreadable revocation list produces an empty one, an empty one
+	// is indistinguishable from "nothing is revoked", and a pass that acted on that
+	// reading would be acting unattended precisely because it could not find out what
+	// it was forbidden to do. So the read failure disqualifies the unattended half of
+	// the whole pass, and this is where a reader is told it happened.
+	RevocationError string `json:"revocationError,omitempty"`
 }
 
 // autonomyReport projects a budget's status, or the not-configured posture when there
@@ -134,9 +146,92 @@ type ClusterReport struct {
 	// outcome: it means nobody had approved anything yet.
 	Executions []ExecutionReport `json:"executions,omitempty"`
 
+	// AutoApplied is one entry per action MaKlaude took on this cluster WITHOUT asking
+	// anybody, in the order it took them. Empty is the shipped posture.
+	AutoApplied []AutoApplyReport `json:"autoApplied,omitempty"`
+
+	// RefusedByPolicy lists proposals the autonomy layer refused outright — an operation
+	// off the catalog, an irreversible or unclassifiable action.
+	//
+	// They are reported here because a refusal is the one verdict that removes a
+	// proposal from BOTH paths: it is not auto-applied and it is not offered to a human
+	// either. Without this list, the only trace of a refused proposal would be its
+	// absence from the approval gate, which reads exactly like a proposal that was never
+	// made.
+	RefusedByPolicy []string `json:"refusedByPolicy,omitempty"`
+
+	// RevokedByHuman lists proposals a rule would have auto-applied and a person's
+	// revocation held back. They still went to the approval gate, so nothing was lost —
+	// but "your revocation is why this is waiting for you" is the one thing the gate
+	// itself cannot say.
+	RevokedByHuman []string `json:"revokedByHuman,omitempty"`
+
 	// Error, when non-empty, explains a per-cluster failure. It never aborts the
 	// cycle over the other clusters.
 	Error string `json:"error,omitempty"`
+}
+
+// AutoApplyReport is one action MaKlaude took with nobody watching: what permitted it,
+// what earned it, where it is disclosed, and what happened.
+//
+// The decision half (Rule, Evidence, Reason, Admission) is populated before the action
+// runs and survives every failure path, so an entry always answers "why was this
+// allowed?" even when it answers nothing else. That ordering is deliberate: the failures
+// most worth reading are the ones where the action did not happen, and an entry that
+// lost its authorization story on the way to reporting a failure would be the least
+// useful record of the most interesting case.
+type AutoApplyReport struct {
+	Identity  string `json:"identity"`
+	Cluster   string `json:"cluster"`
+	Operation string `json:"operation"`
+	Target    string `json:"target"`
+
+	// Rule is the autonomy rule that permitted the action, and Evidence is the trust
+	// citation that earned it. Together they are what stands in for an approver's name;
+	// see [approve.GrantAutonomous] for why neither may be empty.
+	Rule     string `json:"rule"`
+	Evidence string `json:"evidence"`
+
+	// Reason is the policy layer's verdict token, always "earned-trust" for an action
+	// that got this far. It is recorded rather than assumed so a report cannot imply a
+	// decision path the code did not take.
+	Reason string `json:"reason"`
+
+	// Admission is the blast-radius layer's verdict token.
+	Admission string `json:"admission"`
+
+	// Disclosure is the artifact this action is recorded on — the reference a person
+	// opens, and the one they apply the revocation label to. Empty means the disclosure
+	// could not be opened, in which case the action was NOT taken.
+	Disclosure string `json:"disclosure,omitempty"`
+
+	// Execution is what the execution layer reported. Its Authority is always "policy".
+	Execution ExecutionReport `json:"execution"`
+
+	// Tripped, Escalated, Demoted and RolledBack are the consequences that followed a
+	// failure, as carried out rather than as merely decided — Demoted is false when the
+	// ledger refused the write, and the disclosure says why.
+	Tripped    bool `json:"tripped,omitempty"`
+	Escalated  bool `json:"escalated,omitempty"`
+	Demoted    bool `json:"demoted,omitempty"`
+	RolledBack bool `json:"rolledBack,omitempty"`
+
+	// Error, when non-empty, explains a failure in the unattended machinery itself —
+	// the disclosure could not be opened, the permission slip was refused, the outcome
+	// could not be recorded. It is separate from [ExecutionReport.Error], which is about
+	// the action.
+	Error string `json:"error,omitempty"`
+}
+
+// withError stamps a machinery failure onto a report and returns it, so every abort
+// path in the unattended half is one line and cannot forget to record why.
+func (r AutoApplyReport) withError(msg string) AutoApplyReport {
+	if r.Error == "" {
+		r.Error = msg
+		return r
+	}
+	r.Error += "; " + msg
+	return r
 }
 
 // ProposalReport is the serializable projection of a [remediate.Proposal] — enough
@@ -233,8 +328,31 @@ type Totals struct {
 	// Failed counts executions that failed for a reason that is not a clean abort.
 	Failed int `json:"failed"`
 
+	// AutoApplied counts actions taken with nobody watching. It is a SEPARATE total from
+	// Mutated rather than a subset spelled out in prose, because the two answer different
+	// questions and only one of them is about oversight: Mutated asks how much changed,
+	// this asks how much changed that no person agreed to. It is reported even when zero,
+	// which is the shipped posture and the one an operator should be able to confirm at a
+	// glance.
+	AutoApplied int `json:"autoApplied"`
+
 	// ByOperation counts proposals by operation token. Absent operations are omitted.
 	ByOperation map[string]int `json:"byOperation,omitempty"`
+}
+
+// count folds one execution into the totals. It is shared by the gated and unattended
+// paths so the two cannot come to disagree about what counts as a mutation, a preview,
+// or a failure — which they would, since only one of the two is under a human's eye.
+func (t *Totals) count(e *ExecutionReport) {
+	if e.Executed {
+		t.Mutated++
+	}
+	if e.Previewed {
+		t.Previewed++
+	}
+	if e.Failure != "" && !e.CleanAbort {
+		t.Failed++
+	}
 }
 
 // finalize computes the report's rolled-up totals from its per-cluster entries.
@@ -249,16 +367,15 @@ func (r *Report) finalize() {
 		t.Asked += c.Gate.Opened
 		t.Authorized += c.Gate.Authorized
 		for j := range c.Executions {
-			e := &c.Executions[j]
-			if e.Executed {
-				t.Mutated++
-			}
-			if e.Previewed {
-				t.Previewed++
-			}
-			if e.Failure != "" && !e.CleanAbort {
-				t.Failed++
-			}
+			t.count(&c.Executions[j])
+		}
+		// An unattended action counts toward the same Mutated/Previewed/Failed totals as
+		// an approved one — it is the same execution through the same runner, and a total
+		// that excluded it would understate what happened to the cluster. AutoApplied is
+		// the extra column, not a replacement for the ordinary ones.
+		for j := range c.AutoApplied {
+			t.AutoApplied++
+			t.count(&c.AutoApplied[j].Execution)
 		}
 	}
 	if len(t.ByOperation) == 0 {
@@ -318,6 +435,8 @@ func (r *Report) WriteText(w io.Writer) error {
 			fmt.Fprintf(&b, "    ! %s\n", pe)
 		}
 
+		writeAutoApplied(&b, c)
+
 		fmt.Fprintf(&b, "  approval: opened=%d refreshed=%d held=%d refused=%d withdrawn=%d authorized=%d\n",
 			c.Gate.Opened, c.Gate.Refreshed, c.Gate.Held, c.Gate.Refused, c.Gate.Withdrawn, c.Gate.Authorized)
 
@@ -354,11 +473,83 @@ func (r *Report) WriteText(w io.Writer) error {
 		}
 		fmt.Fprintf(&b, " (%s)", strings.Join(parts, ", "))
 	}
-	fmt.Fprintf(&b, "; asked=%d authorized=%d previewed=%d mutated=%d failed=%d\n",
-		r.Totals.Asked, r.Totals.Authorized, r.Totals.Previewed, r.Totals.Mutated, r.Totals.Failed)
+	fmt.Fprintf(&b, "; asked=%d authorized=%d previewed=%d mutated=%d failed=%d auto-applied=%d\n",
+		r.Totals.Asked, r.Totals.Authorized, r.Totals.Previewed, r.Totals.Mutated, r.Totals.Failed, r.Totals.AutoApplied)
 
 	_, err := io.WriteString(w, b.String())
 	return err
+}
+
+// writeAutoApplied renders one cluster's unattended half: what MaKlaude did without
+// asking, what policy refused outright, and what a person's revocation held back.
+//
+// The header line is printed UNCONDITIONALLY, "none" included, and it is printed above
+// the approval line rather than below it. Both are the same argument: an operator
+// scanning a pass has to be able to tell "nothing was auto-applied" from "the section
+// that would have said so is missing", and the count that matters most is the one for
+// actions nobody agreed to. The two absence lists follow only when non-empty — they are
+// exceptions rather than a posture, and printing "refused by policy: none" every pass on
+// every cluster is how a reader learns to skip the block that eventually says something.
+func writeAutoApplied(b *strings.Builder, c *ClusterReport) {
+	if len(c.AutoApplied) == 0 {
+		b.WriteString("  auto-applied (no human): none\n")
+	} else {
+		fmt.Fprintf(b, "  AUTO-APPLIED WITH NO HUMAN REVIEW (%d):\n", len(c.AutoApplied))
+		for i := range c.AutoApplied {
+			a := &c.AutoApplied[i]
+			fmt.Fprintf(b, "    - %s on %s: %s (rule %s; disclosed at %s)\n",
+				a.Operation, a.Target, describeEffect(&a.Execution), orUnknown(a.Rule), orUnknown(a.Disclosure))
+			if a.Error != "" {
+				fmt.Fprintf(b, "      ! %s\n", a.Error)
+			}
+			if consequences := describeConsequences(a); consequences != "" {
+				fmt.Fprintf(b, "      %s\n", consequences)
+			}
+		}
+	}
+	for _, r := range c.RefusedByPolicy {
+		fmt.Fprintf(b, "    x refused by policy: %s\n", r)
+	}
+	for _, r := range c.RevokedByHuman {
+		fmt.Fprintf(b, "    o revoked by a human: %s\n", r)
+	}
+}
+
+// describeConsequences renders what followed a failed unattended action, or empty when
+// nothing did.
+func describeConsequences(a *AutoApplyReport) string {
+	var parts []string
+	if a.Tripped {
+		parts = append(parts, "BREAKER TRIPPED — autonomy is now off for this cluster until a human clears it")
+	}
+	if a.RolledBack {
+		parts = append(parts, "rolled back")
+	}
+	if a.Demoted {
+		parts = append(parts, "shape demoted in the trust ledger")
+	}
+	if a.Escalated {
+		parts = append(parts, "escalated (needs:human)")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "consequences: " + strings.Join(parts, "; ")
+}
+
+// writeRevocationError reports an unreadable disclosure trail.
+//
+// It is its own method, and it is called on BOTH branches of [AutonomyReport.writeText],
+// because the two conditions are independent: the disclosure trail can be wired and
+// unreadable while no blast-radius budget exists at all. Printing it only under the
+// configured branch would hide the failure in exactly the configuration where the
+// operator is midway through enabling autonomy and most needs to be told.
+func (a AutonomyReport) writeRevocationError(b *strings.Builder) {
+	if a.RevocationError == "" {
+		return
+	}
+	fmt.Fprintf(b, "  ! THE DISCLOSURE TRAIL COULD NOT BE READ — nothing was auto-applied this pass, because what a human has revoked is unknown: %s\n",
+		a.RevocationError)
 }
 
 // writeText renders the blast-radius posture as two always-present sections.
@@ -370,6 +561,7 @@ func (a AutonomyReport) writeText(b *strings.Builder) {
 	b.WriteString("\nAutonomy (blast radius): ")
 	if !a.Configured {
 		b.WriteString("not configured — no action can be auto-applied, so nothing is bounded and nothing is suppressed.\n")
+		a.writeRevocationError(b)
 		return
 	}
 	if a.StatePath != "" {
@@ -380,6 +572,7 @@ func (a AutonomyReport) writeText(b *strings.Builder) {
 	if a.Sealed {
 		fmt.Fprintf(b, "  ! STATE UNREADABLE — every auto-apply is denied: %s\n", a.SealDetail)
 	}
+	a.writeRevocationError(b)
 
 	tripped := a.Tripped()
 	if len(tripped) == 0 {
