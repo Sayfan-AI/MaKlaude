@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sayfan-AI/MaKlaude/internal/audit"
 	"github.com/Sayfan-AI/MaKlaude/internal/escalate"
 )
 
@@ -311,6 +312,27 @@ func (g *GitHubSink) Comment(ctx context.Context, ref ActionRef, body string) er
 func (g *GitHubSink) AddLabel(ctx context.Context, ref ActionRef, label string) error {
 	payload := map[string]any{"labels": []string{label}}
 	return g.do(ctx, http.MethodPost, g.issuePath(ref)+"/labels", payload, nil)
+}
+
+// SetLifecycleMarker reads the artifact's current body, replaces its lifecycle marker,
+// and PATCHes back the body alone.
+//
+// The read is unavoidable and is the reason this is a sink operation rather than something
+// the gatekeeper assembles: the marker has to be spliced into prose the gate no longer
+// holds, and the alternative — re-rendering the whole body from the request — would
+// overwrite whatever the artifact actually says with what this pass thinks it should say,
+// on an artifact that by this point records a decision a person made.
+//
+// The PATCH sends only `body`, so GitHub leaves the labels untouched. That is the same
+// property [GitHubSink.Update] cannot offer, and the reason the [ApprovalSink] doc rules
+// Update out for this.
+func (g *GitHubSink) SetLifecycleMarker(ctx context.Context, ref ActionRef, marker string) error {
+	var current ghIssue
+	if err := g.do(ctx, http.MethodGet, g.issuePath(ref), nil, &current); err != nil {
+		return fmt.Errorf("reading %q to attach its lifecycle marker: %w", ref, err)
+	}
+	return g.do(ctx, http.MethodPatch, g.issuePath(ref),
+		map[string]any{"body": audit.WithLifecycleMarker(current.Body, marker)}, nil)
 }
 
 // RemoveLabel removes one label without disturbing the others.

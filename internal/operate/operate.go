@@ -403,9 +403,53 @@ func (c *Cycle) executeAuthorized(ctx context.Context, h *cluster.Handle,
 		// "a policy waived the requirement" is the distinction an operator reading
 		// this is most likely to care about.
 		er.Authority = auth.Authority().String()
+		c.markLifecycle(ctx, auth, p, &er)
 		out = append(out, er)
 	}
 	return out
+}
+
+// markLifecycle attaches the machine-readable lifecycle marker to the approval artifact
+// once a gated action has finished, so the execution can be read back off the trail and
+// re-projected onto a trust entry.
+//
+// It runs on the GATED path deliberately, and the reason is specific to this path rather
+// than symmetry with the unattended one: the trust ledger's promotion arithmetic counts
+// human-approved executions, so a marker written only onto disclosures would make the
+// evidence FOR autonomy the one thing a rebuild cannot reconstruct. See
+// [approve.Gatekeeper.RecordLifecycle].
+//
+// A failure to mark is reported on the execution report and does not fail the action.
+// The action has already run; the marker describes something finished, and the audit
+// trail still holds the records whether or not the artifact carries them. The report is
+// what keeps the loss visible — an artifact silently missing its marker is history a
+// rebuild will not know it lost, which is the one failure mode this whole format exists
+// to prevent.
+func (c *Cycle) markLifecycle(ctx context.Context, auth *approve.Authorization,
+	p remediate.Proposal, er *ExecutionReport) {
+
+	if c.gate == nil {
+		return
+	}
+	recs := c.lifecycleFor(p.Identity)
+	if len(recs) == 0 {
+		// No records to mark. The audit sink could not be read back, which the
+		// execution report already reflects; writing an empty marker would put an
+		// unreadable history on the trail in place of an absent one.
+		return
+	}
+	if err := c.gate.RecordLifecycle(ctx, auth, recs); err != nil {
+		er.Error = appendError(er.Error,
+			fmt.Sprintf("the action ran and its approval artifact carries no rebuildable lifecycle: %v", err))
+	}
+}
+
+// appendError joins a new problem onto an existing error string without losing either.
+func appendError(existing, add string) string {
+	if existing == "" {
+		return add
+	}
+	return existing + "; " + add
 }
 
 // proposalFor finds the proposal a permission slip covers.
