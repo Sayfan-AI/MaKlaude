@@ -53,8 +53,13 @@ jobs:
 
       - uses: anthropics/claude-code-action@v1
         with:
-          # Subscription OAuth token (`claude setup-token`), not an API key:
-          # ANTHROPIC_API_KEY went invalid and 401'd every run for 3.5 days (#150).
+          # CI authenticates with ANTHROPIC_API_KEY, deliberately. Do NOT "fix" this
+          # by swapping in claude_code_oauth_token — a subscription token bills a
+          # person's subscription for unattended automation. PR #152 made exactly
+          # that swap and was reverted in 2931732; see #150 for the reasoning.
+          # No valid key exists right now, so CI is dormant on purpose and local
+          # `genesis serve` (the CLI is already authenticated, no secret needed) is
+          # the only path. If CI matters again, supply a key — don't change this.
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ steps.app-token.outputs.token }}
           allowed_bots: "genesis-dev-bot[bot]"
