@@ -1,0 +1,82 @@
+# Seed scenario (d): a Deployment WEDGED BY A BAD ROLLOUT — the fixable fault.
+#
+# Every other seed in this directory is a fault MaKlaude can only observe. This one
+# is the fault it can FIX, and it is the scenario the whole gated-remediation e2e
+# (T6) is built around: the pipeline must diagnose it, propose a rollback, wait for
+# an explicit human approval, execute exactly that action, and watch the cluster
+# come back healthy.
+#
+# The manifest below is only HALF the scenario. It seeds revision 1 — a container
+# image that pulls and runs — and the CI job then rolls the Deployment forward onto
+# an image that cannot be pulled, producing revision 2. That two-step shape is
+# load-bearing rather than a convenience:
+#
+#   - `remediate.rollbackRevisionRule` refuses to propose a rollback unless a
+#     PREVIOUS revision actually survives in the cluster. A Deployment born broken
+#     (which is what badimage-deploy.yaml is) has exactly one revision and correctly
+#     yields no proposal at all — proposing an action that would fail is worse than
+#     proposing nothing. So the fixable fault has to be a fault the workload rolled
+#     INTO from a known-good state, which is also what a bad rollout is in real life.
+#   - Revision 1 must be observed healthy before the bad rollout lands, otherwise
+#     "the previous revision was demonstrably running" — the entire justification the
+#     approval artifact shows a human — is not true.
+#
+# `strategy: Recreate` rather than the default RollingUpdate, and this is the
+# difference between a scenario and a coin flip. With one replica, RollingUpdate
+# defaults to maxUnavailable=25% which rounds DOWN to zero, so Kubernetes keeps the
+# healthy old pod running while the new one fails to pull: the Deployment stays
+# 1/1 available and never presents as broken at all. Recreate tears the old pod down
+# first, so the bad rollout produces the unambiguous 0/1-available cascade the
+# detector, the correlator, and the bad-image diagnosis rule all key on — and, after
+# the rollback, an equally unambiguous 1/1 to converge to.
+#
+# The good image is busybox:1.36, the same tag the crashloop and pending seeds use.
+# That is deliberate: the node has it cached by the time the rollback runs, so the
+# restored pod starts without a registry round-trip and convergence is observed well
+# inside the runner's bounded window rather than racing Docker Hub.
+#
+# It shares the maklaude-e2e namespace (created by crashloop-pod.yaml) with the other
+# scenarios, and carries its own `scenario: wedged` label so the CI waits and the
+# test can address it without touching anything else.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wedged
+  namespace: maklaude-e2e
+  labels:
+    app.kubernetes.io/part-of: maklaude-e2e
+    scenario: wedged
+spec:
+  # One replica keeps the cascade minimal and the convergence check unambiguous:
+  # desired == updated == ready == available == 1, or it has not converged.
+  replicas: 1
+  # See the header: with one replica, RollingUpdate would keep the old pod alive and
+  # the bad rollout would never present as a fault.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: maklaude-e2e
+      scenario: wedged
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: maklaude-e2e
+        scenario: wedged
+    spec:
+      containers:
+        - name: app
+          # Revision 1: the known-good image the approved rollback restores.
+          image: busybox:1.36
+          # IfNotPresent (the default for a pinned tag, stated explicitly because it
+          # matters here): the node already holds this image from the sibling seeds,
+          # so the restored pod becomes Ready in seconds.
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "sleep 3600"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi

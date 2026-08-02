@@ -128,6 +128,25 @@ enables it) and fails the build if **any** mutating verb (`create`, `update`,
 corroboration: it is the cluster's own independent record, not MaKlaude's. When
 the log is unavailable the check skips with a warning — layers 1–3 still hold.
 
+> **The gated-remediation e2e does not weaken this promise, and reading its audit
+> log will show you a `patch`.** Since Milestone 4 MaKlaude has a *second*
+> identity, `system:serviceaccount:maklaude:maklaude-executor`, which exists only
+> to carry out an action a human explicitly approved (see
+> [`docs/rbac.md`](rbac.md) for the access model and
+> [`docs/autonomous-mode.md`](autonomous-mode.md) for the one documented way the
+> approval requirement can be waived). The four layers above are about the
+> **observation** identity, and every one of them still holds verbatim: the write
+> bundle is never bound to it, and `assertNoMutatingAudit` is re-run *after* the
+> approved mutation lands to prove the point rather than assume it.
+>
+> The executor identity is held to its own, differently-shaped assertion, because
+> "zero" is the wrong number for an account whose job is to perform one approved
+> action. `assertOnlyTheApprovedWriteLanded` in
+> [`test/e2e/remediation_test.go`](../test/e2e/remediation_test.go) classifies
+> *every* mutating request the apiserver attributed to it — server-side previews,
+> requests the server rejected, and requests that landed — and fails the build
+> unless exactly one landed and it is the object a human approved.
+
 ---
 
 ## How to re-verify the guarantee yourself
