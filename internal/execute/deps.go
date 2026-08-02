@@ -13,9 +13,9 @@ import (
 //
 // It is an interface rather than a *kube.Executor for one reason that matters more
 // than testability: it makes the authority this package holds enumerable. Every
-// mutating request MaKlaude can issue is one of the five methods below, so "what
+// mutating request MaKlaude can issue is one of the six methods below, so "what
 // can the execution layer do to a cluster?" is answered by reading this interface
-// rather than by auditing a concrete type that might grow a sixth method nobody
+// rather than by auditing a concrete type that might grow a seventh method nobody
 // noticed. A fake in a test is the same enumeration from the other side — it can
 // record exactly what was attempted, and prove that an aborted action attempted
 // nothing.
@@ -39,6 +39,16 @@ type Mutator interface {
 	// PatchDeployment applies a strategic-merge patch to one Deployment, conditioned
 	// on resourceVersion.
 	PatchDeployment(ctx context.Context, namespace, name string, patch []byte, resourceVersion string) (*kube.Outcome, error)
+
+	// RollbackDeploymentToRevision restores the pod template of one numbered revision
+	// of a Deployment, conditioned on resourceVersion.
+	//
+	// It is the one method here that reads before it writes — the template it restores
+	// lives on the revision's ReplicaSet and only the cluster has it — so it is also
+	// the one that can fail with [kube.ErrRevisionNotFound] having sent nothing. That
+	// is drift (the history was pruned while the approval waited), not a malfunction,
+	// and [Runner.Execute] classifies it as such.
+	RollbackDeploymentToRevision(ctx context.Context, namespace, name string, revision int64, resourceVersion string) (*kube.Outcome, error)
 
 	// CordonNode marks one node unschedulable, conditioned on resourceVersion.
 	CordonNode(ctx context.Context, name, resourceVersion string) (*kube.Outcome, error)

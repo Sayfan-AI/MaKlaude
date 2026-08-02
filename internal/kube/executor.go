@@ -43,6 +43,14 @@ var (
 	// object, or attempts to set identity/precondition fields the executor owns.
 	ErrInvalidPatch = errors.New("kube: invalid patch body")
 
+	// ErrRevisionNotFound is returned when a numbered Deployment revision the
+	// executor was asked to restore has no surviving ReplicaSet. Kubernetes prunes
+	// old ReplicaSets past a Deployment's revisionHistoryLimit, so this is the
+	// expected outcome of an approval that sat while two more rollouts happened —
+	// drift, not a malfunction — and it is its own sentinel because nothing is sent
+	// when it happens: the revision is read before the patch is composed.
+	ErrRevisionNotFound = errors.New("kube: the deployment revision no longer exists")
+
 	// ErrPreconditionConflict wraps the API server's rejection of an action whose
 	// target changed after the snapshot the proposal was reasoned about. It is the
 	// expected, healthy outcome of a stale approval — not a malfunction — and is
@@ -309,6 +317,48 @@ func (e *Executor) PatchDeployment(ctx context.Context, namespace, name string, 
 
 	return e.act(scope, target, resourceVersion, func(cs kubernetes.Interface) error {
 		_, err := cs.AppsV1().Deployments(namespace).Patch(ctx, name, types.StrategicMergePatchType, body,
+			metav1.PatchOptions{DryRun: e.dryRunOptions()})
+		return err
+	})
+}
+
+// PatchDeploymentJSON applies an RFC 6902 JSON patch to a single Deployment,
+// conditioned on resourceVersion.
+//
+// It is the strategic-merge patch's sibling, not its replacement, and the two are
+// separate methods because they can express different things. Strategic merge is
+// the right primitive for ADDING to an object — it merges lists by key, so a
+// restart annotation lands beside whatever else is there. It cannot REMOVE
+// anything, which makes it the wrong primitive for restoring a whole subtree to a
+// prior value: containers and environment variables merge by name, so anything the
+// current state added survives a "restore" and the result is a mixture of both.
+// JSON patch replaces a pointer's value outright, which is what restoring a
+// previous revision's pod template actually means.
+//
+// The wider expressive power is bounded the same way the merge path is. The
+// [WriteScope] still pins one method and one exact path, the precondition is still
+// injected here rather than trusted from the caller, and every operation is checked
+// against [protectedPatchPaths] — including its `from`, and including pointers that
+// merely CONTAIN a protected field rather than naming one. See
+// [withResourceVersionOp].
+func (e *Executor) PatchDeploymentJSON(ctx context.Context, namespace, name string, ops []byte, resourceVersion string) (*Outcome, error) {
+	if err := validateNamespacedTarget(namespace, name); err != nil {
+		return nil, err
+	}
+	body, err := withResourceVersionOp(ops, resourceVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	scope := WriteScope{
+		Method:        http.MethodPatch,
+		Path:          "/apis/apps/v1/namespaces/" + namespace + "/deployments/" + name,
+		RequireDryRun: e.dryRun(),
+	}
+	target := "deployment/" + namespace + "/" + name
+
+	return e.act(scope, target, resourceVersion, func(cs kubernetes.Interface) error {
+		_, err := cs.AppsV1().Deployments(namespace).Patch(ctx, name, types.JSONPatchType, body,
 			metav1.PatchOptions{DryRun: e.dryRunOptions()})
 		return err
 	})

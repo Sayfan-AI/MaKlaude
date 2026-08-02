@@ -278,6 +278,16 @@ func (r *Runner) execute(ctx context.Context, auth *approve.Authorization, p rem
 			"%w: the authorization carries no preconditions, so nothing could be re-checked before acting", ErrRefused))
 	}
 
+	// Some operations need a value the target does not carry — which revision a rollback
+	// restores — and it is read from those same approved conditions. Resolved here,
+	// before the cluster is read and long before anything is sent, so an approval that
+	// does not record it is a refusal that costs nothing rather than a failure surfacing
+	// from inside the retry loop.
+	prm, err := resolveParams(pl, conditions)
+	if err != nil {
+		return rep.fail(FailureRefused, fmt.Errorf("%w: %s: %w", ErrRefused, p.Operation, err))
+	}
+
 	// One read of the cluster serves both the precondition re-check and the pre-state
 	// capture, which is what makes them provably consistent with each other.
 	idx, class, err := r.readCluster(ctx, p.Cluster)
@@ -301,10 +311,20 @@ func (r *Runner) execute(ctx context.Context, auth *approve.Authorization, p rem
 	// attempt re-sends a byte-identical request rather than a second, different one.
 	at := time.Now().UTC()
 	out, attempts, err := r.send(ctx, func(ctx context.Context) (*kube.Outcome, error) {
-		return pl.mutate(ctx, r.mutator, p.Target, at)
+		return pl.mutate(ctx, r.mutator, p.Target, prm, at)
 	})
 	rep.Attempts = attempts
 	switch {
+	case errors.Is(err, kube.ErrRevisionNotFound):
+		// The same drift [checkRevisionExists] guards against, arriving in the window
+		// between that check and this send: Kubernetes prunes ReplicaSets past a
+		// Deployment's history limit, and an approval can outlive the revision it names.
+		// Nothing was sent — the revision is resolved by a READ before any patch is
+		// composed — so Attempts is corrected back to zero to keep "0 for every abort"
+		// true, and the class is the clean abort a caller re-proposes from rather than
+		// the execution failure a human is paged for.
+		rep.Attempts = 0
+		return rep.fail(FailureDrifted, fmt.Errorf("%w: %w", ErrPreconditionDrift, err))
 	case errors.Is(err, kube.ErrPreconditionConflict):
 		// The drift the pre-check is designed to catch, caught instead by the API
 		// server. Nothing was applied, and the response is the same: re-propose.

@@ -361,28 +361,133 @@ func TestExecute_RefusesAnIrreversibleAction(t *testing.T) {
 	}
 }
 
-// TestExecute_RefusesAnOperationTheWritePathCannotExpress pins the deliberate gap
-// documented on [operationPlans]: a revision rollback is planned and approvable, and
-// this layer will not perform it because a strategic-merge patch cannot express it
-// faithfully. The refusal must name the missing primitive, because a gap an operator
-// has to infer from a rollback that quietly did the wrong thing is not a gap, it is
-// a bug.
-func TestExecute_RefusesAnOperationTheWritePathCannotExpress(t *testing.T) {
-	model := newClusterModel().withDeployment("shop", "web", 3, 4)
+// TestExecute_RollsBackToTheRevisionTheApproverWasShown covers the operation this
+// layer refused until the write path could express it faithfully (issue #127).
+//
+// The assertion that matters is the REVISION the request carried. Everything else about
+// a rollback — the target, the precondition, the convergence check — is shared with the
+// restart it sits beside, but which revision gets restored is the whole action, and the
+// only record of the one a human agreed to is the precondition they were shown. A
+// rollback that sent a plausible number from a live read would pass a test that only
+// checked "a rollback was sent".
+func TestExecute_RollsBackToTheRevisionTheApproverWasShown(t *testing.T) {
+	model := rollbackModel()
 	h := newHarness(t, model, fastPolicy())
 
 	rep, err := h.execute(revisionRollbackProposal())
-	if !errors.Is(err, ErrUnsupportedOperation) {
-		t.Fatalf("expected ErrUnsupportedOperation, got: %v", err)
+	if err != nil {
+		t.Fatalf("executing an approved rollback: %v", err)
 	}
-	if rep.Failure != FailureRefused {
-		t.Fatalf("failure = %s, want refused", rep.Failure)
+	if rep.Failure != FailureNone {
+		t.Fatalf("failure = %s (%s), want none", rep.Failure, rep.Error)
+	}
+	if !rep.Executed || rep.DryRun {
+		t.Fatalf("executed=%t dryRun=%t, want a real execution", rep.Executed, rep.DryRun)
+	}
+
+	sent := h.mutator.lastCall(t)
+	if h.mutator.callCount() != 1 {
+		t.Fatalf("the rollback produced %d requests, want exactly 1", h.mutator.callCount())
+	}
+	if sent.Verb != "rollback" {
+		t.Fatalf("verb = %q, want the rollback primitive (a strategic-merge patch cannot restore a template)", sent.Verb)
+	}
+	if sent.Revision != 4 {
+		t.Fatalf("rolled back to revision %d, want 4 — the revision named by the approved precondition", sent.Revision)
+	}
+	if sent.ResourceVersion != "2002" {
+		t.Fatalf("conditioned on resourceVersion %q, want the one the proposal was computed against", sent.ResourceVersion)
+	}
+
+	// The restored ReplicaSet is re-annotated with the next revision, so the deployment's
+	// highest revision moved — the same evidence a restart's convergence check reads.
+	if rep.Convergence != ConvergenceConverged {
+		t.Fatalf("convergence = %s (%s), want converged", rep.Convergence, rep.ConvergenceDetail)
+	}
+	if !rep.Rollback.Available {
+		t.Fatal("a performed rollback reports no rollback of its own; rolling forward again is the inverse and the pre-state records it")
+	}
+}
+
+// TestExecute_RefusesARollbackTheApprovalDoesNotParameterize is the fail-closed half.
+//
+// A slip with no revision precondition, or one naming something that is not a revision,
+// leaves nothing recording WHICH pod template a human agreed to restore. There is no
+// safe default — every candidate is a guess at a template nobody previewed — so the
+// action is refused before the cluster is even read. "Before the cluster is read" is
+// asserted rather than assumed: a refusal that still costs a snapshot would mean the
+// resolution had drifted back down into the send path.
+func TestExecute_RefusesARollbackTheApprovalDoesNotParameterize(t *testing.T) {
+	cases := map[string][]remediate.Precondition{
+		"no revision precondition": {
+			{Kind: remediate.PreconditionUnchanged, Expect: "2002", Description: "deployment/shop/web is still at resourceVersion 2002."},
+		},
+		"revision is not a number": {
+			{Kind: remediate.PreconditionUnchanged, Expect: "2002", Description: "deployment/shop/web is still at resourceVersion 2002."},
+			{Kind: remediate.PreconditionRevisionExists, Expect: "latest", Description: "Revision latest still exists."},
+		},
+		"revision is zero": {
+			{Kind: remediate.PreconditionUnchanged, Expect: "2002", Description: "deployment/shop/web is still at resourceVersion 2002."},
+			{Kind: remediate.PreconditionRevisionExists, Expect: "0", Description: "Revision 0 still exists."},
+		},
+	}
+
+	for name, conditions := range cases {
+		t.Run(name, func(t *testing.T) {
+			model := rollbackModel()
+			h := newHarness(t, model, fastPolicy())
+
+			p := revisionRollbackProposal()
+			p.Preconditions = conditions
+
+			rep, err := h.execute(p)
+			if !errors.Is(err, ErrRefused) {
+				t.Fatalf("expected ErrRefused, got: %v", err)
+			}
+			if rep.Failure != FailureRefused {
+				t.Fatalf("failure = %s, want refused", rep.Failure)
+			}
+			if rep.CleanAbort() {
+				t.Fatal("an unparameterized approval is a refusal, not the routine clean abort of a stale one")
+			}
+			if h.mutator.callCount() != 0 {
+				t.Fatal("a rollback with no approved revision reached the write path")
+			}
+			if h.observer.reads != 0 {
+				t.Fatalf("the refusal read the cluster %d time(s); it is resolvable from the approval alone", h.observer.reads)
+			}
+		})
+	}
+}
+
+// TestExecute_AbortsCleanlyWhenTheRevisionIsPrunedAfterTheCheck covers the one race the
+// precondition cannot close.
+//
+// [checkRevisionExists] verifies the revision against the runner's snapshot, and the
+// write path then does its OWN read to find the template — Kubernetes prunes ReplicaSets
+// past a Deployment's history limit, and it can happen in between. The outcome must be
+// the clean abort a caller re-proposes from rather than the execution failure a human is
+// paged for: nothing was sent, because the read precedes the patch.
+func TestExecute_AbortsCleanlyWhenTheRevisionIsPrunedAfterTheCheck(t *testing.T) {
+	model := rollbackModel()
+	h := newHarness(t, model, fastPolicy())
+	h.mutator.beforeRollback = func() { model.pruneRevision("shop", "web", 4) }
+
+	rep, err := h.execute(revisionRollbackProposal())
+	if !errors.Is(err, ErrPreconditionDrift) {
+		t.Fatalf("expected ErrPreconditionDrift, got: %v", err)
+	}
+	if rep.Failure != FailureDrifted || !rep.CleanAbort() {
+		t.Fatalf("failure = %s (cleanAbort=%t), want a clean drifted abort", rep.Failure, rep.CleanAbort())
+	}
+	if rep.Attempts != 0 {
+		t.Fatalf("attempts = %d, want 0: the revision is read before any patch is composed, so nothing was sent", rep.Attempts)
 	}
 	if h.mutator.callCount() != 0 {
-		t.Fatal("an operation with no faithful primitive still sent a request")
+		t.Fatal("a pruned revision still produced a mutating request")
 	}
-	if !strings.Contains(err.Error(), "spec.template") {
-		t.Fatalf("the refusal does not name the missing primitive: %v", err)
+	if rep.Executed || rep.Recorded {
+		t.Fatalf("executed=%t recorded=%t; an abort must not be marked on the approval trail", rep.Executed, rep.Recorded)
 	}
 }
 

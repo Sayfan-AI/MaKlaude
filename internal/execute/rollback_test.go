@@ -77,6 +77,92 @@ func TestRollback_RestoresThePreState(t *testing.T) {
 	}
 }
 
+// TestRollback_RollsARevisionRollbackForwardAgain is the same arc for the operation
+// whose inverse is itself a rollback: MaKlaude restores revision 4, then puts the
+// deployment back on the template it was running before that.
+//
+// The check that earns this test is the one on ReplicaSet IDENTITY. A rollback re-uses
+// the target revision's ReplicaSet and re-annotates it with the next number, so revision
+// numbers cannot say which template is running — the number a pre-state recorded is gone
+// precisely when the rollback worked. Comparing the current ReplicaSet against the one
+// recorded before the action is what survives that, and it is why the pre-state records a
+// name at all.
+func TestRollback_RollsARevisionRollbackForwardAgain(t *testing.T) {
+	model := rollbackModel()
+	h := newHarness(t, model, fastPolicy())
+	p := revisionRollbackProposal()
+	auth := authorizationFor(t, p)
+
+	rep, err := h.runner.Execute(context.Background(), auth, p)
+	if err != nil {
+		t.Fatalf("executing the rollback: %v", err)
+	}
+	was, ok := rep.PreState.Field(fieldCurrentReplicaSet)
+	if !ok || was != "web-old" {
+		t.Fatalf("pre-state recorded currentReplicaSet=%q (present=%t), want the ReplicaSet running before the action", was, ok)
+	}
+	if current, _ := model.currentReplicaSetName("shop", "web"); current != "web-r4" {
+		t.Fatalf("the cluster is running ReplicaSet %q after the rollback, want revision 4's", current)
+	}
+	if !rep.Rollback.Available {
+		t.Fatal("the rollback reports no inverse; rolling forward is performable and the pre-state records the target")
+	}
+
+	rb, err := h.runner.Rollback(context.Background(), auth, rep)
+	if err != nil {
+		t.Fatalf("rolling forward again: %v", err)
+	}
+	if !rb.Performed || rb.Failure != FailureNone {
+		t.Fatalf("performed=%t failure=%s (%s), want a performed rollback", rb.Performed, rb.Failure, rb.Error)
+	}
+	if rb.Convergence != ConvergenceConverged {
+		t.Fatalf("rollback convergence = %s (%s), want converged", rb.Convergence, rb.ConvergenceDetail)
+	}
+	if current, _ := model.currentReplicaSetName("shop", "web"); current != was {
+		t.Fatalf("the cluster is running ReplicaSet %q, want %q — the template it had before the action", current, was)
+	}
+
+	inverse := h.mutator.lastCall(t)
+	if inverse.Verb != "rollback" || inverse.Revision != 5 {
+		t.Fatalf("the inverse request was %+v, want a rollback to revision 5 (the revision recorded as current before the action)", inverse)
+	}
+	if got := h.mutator.callCount(); got != 2 {
+		t.Fatalf("the write path received %d requests across action and rollback, want 2: %+v", got, h.mutator.recorded())
+	}
+}
+
+// TestRollback_DoesNothingWhenARevisionRollbackWasAlreadyUndone is the already-restored
+// case for the same operation. Someone rolling the deployment forward by hand — with
+// kubectl, or through a GitOps sync — leaves MaKlaude with nothing to do, and re-asserting
+// the template would be a second rollout nobody asked for.
+func TestRollback_DoesNothingWhenARevisionRollbackWasAlreadyUndone(t *testing.T) {
+	model := rollbackModel()
+	h := newHarness(t, model, fastPolicy())
+	p := revisionRollbackProposal()
+	auth := authorizationFor(t, p)
+
+	rep, err := h.runner.Execute(context.Background(), auth, p)
+	if err != nil {
+		t.Fatalf("executing the rollback: %v", err)
+	}
+
+	// A human rolls the deployment forward before MaKlaude is asked to: the ReplicaSet
+	// that was current before the action is current again.
+	model.rollBackTo("shop", "web", 5)
+	callsBefore := h.mutator.callCount()
+
+	rb, err := h.runner.Rollback(context.Background(), auth, rep)
+	if err != nil {
+		t.Fatalf("rolling back an already-restored deployment: %v", err)
+	}
+	if !rb.AlreadyAtPreState {
+		t.Fatalf("the rollback did not notice the template was already restored: %s", rb.ConvergenceDetail)
+	}
+	if got := h.mutator.callCount(); got != callsBefore {
+		t.Fatalf("the rollback sent %d extra requests to re-assert a template that was already running", got-callsBefore)
+	}
+}
+
 // TestRollback_DoesNothingWhenTheTargetIsAlreadyRestored proves a rollback whose
 // work is already done sends nothing and reports success. A machine and a person
 // taking turns undoing each other is a worse outcome than a redundant no-op.

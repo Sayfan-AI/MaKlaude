@@ -2,6 +2,7 @@ package execute
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"testing"
@@ -36,6 +37,7 @@ type call struct {
 	Name            string
 	Patch           string
 	RestartedAt     string
+	Revision        int64
 	ResourceVersion string
 }
 
@@ -163,6 +165,119 @@ func (c *clusterModel) rollOut(namespace, name string, revision int64) {
 	c.nextVersion++
 	dep.ResourceVersion = versionString(c.nextVersion)
 	c.deployments[namespace+"/"+name] = dep
+}
+
+// withRevision adds one more ReplicaSet to an existing deployment's history, so a test
+// can build the two-revision Deployment a rollback needs. The name embeds the revision
+// the way "<deployment>-<pod-template-hash>" embeds a template: distinct templates get
+// distinct ReplicaSets, which is the property rollForwardSatisfied compares on.
+func (c *clusterModel) withRevision(namespace, name string, revision int64) *clusterModel {
+	c.replicaSets = append(c.replicaSets, health.ReplicaSetSignal{
+		Namespace:       namespace,
+		Name:            fmt.Sprintf("%s-r%d", name, revision),
+		ResourceVersion: "2003",
+		Revision:        revision,
+		Owners:          []health.OwnerRef{{Kind: "Deployment", Name: name, Controller: true}},
+	})
+	return c
+}
+
+// hasRevision reports whether any of the deployment's ReplicaSets still carries the
+// revision — the read a rollback performs before it composes a patch.
+func (c *clusterModel) hasRevision(namespace, name string, revision int64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, rs := range c.replicaSets {
+		if rs.Namespace == namespace && ownedByDeployment(rs, name) && rs.Revision == revision {
+			return true
+		}
+	}
+	return false
+}
+
+// pruneRevision drops one revision's ReplicaSet, the way Kubernetes prunes history past
+// a Deployment's revisionHistoryLimit.
+func (c *clusterModel) pruneRevision(namespace, name string, revision int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	kept := c.replicaSets[:0]
+	for _, rs := range c.replicaSets {
+		if rs.Namespace == namespace && ownedByDeployment(rs, name) && rs.Revision == revision {
+			continue
+		}
+		kept = append(kept, rs)
+	}
+	c.replicaSets = kept
+}
+
+// rollBackTo models what the deployment controller does when a previous revision's pod
+// template is restored: it finds the ReplicaSet that ALREADY has that template and
+// re-uses it, annotating it with the next revision number rather than creating a new
+// one. So the revision number that was rolled back to disappears, the object carrying
+// it does not, and the deployment's highest revision still moves — which is what makes
+// rolloutRestartConverged the right convergence check for a rollback.
+func (c *clusterModel) rollBackTo(namespace, name string, revision int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var highest int64
+	restored := -1
+	for i, rs := range c.replicaSets {
+		if rs.Namespace != namespace || !ownedByDeployment(rs, name) {
+			continue
+		}
+		if rs.Revision > highest {
+			highest = rs.Revision
+		}
+		if rs.Revision == revision {
+			restored = i
+		}
+	}
+	if restored < 0 {
+		return
+	}
+	c.replicaSets[restored].Revision = highest + 1
+
+	dep := c.deployments[namespace+"/"+name]
+	dep.UpdatedReplicas = dep.DesiredReplicas
+	dep.ReadyReplicas = dep.DesiredReplicas
+	dep.AvailableReplicas = dep.DesiredReplicas
+	c.nextVersion++
+	dep.ResourceVersion = versionString(c.nextVersion)
+	c.deployments[namespace+"/"+name] = dep
+}
+
+// currentReplicaSetName returns the name of the ReplicaSet carrying the deployment's
+// highest revision — the model's own answer to "which pod template is it running?",
+// derived independently of clusterIndex so an assertion about the cluster is not an
+// assertion about the code under test.
+func (c *clusterModel) currentReplicaSetName(namespace, name string) (string, int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var (
+		current  string
+		revision int64
+	)
+	for _, rs := range c.replicaSets {
+		if rs.Namespace != namespace || !ownedByDeployment(rs, name) {
+			continue
+		}
+		if rs.Revision > revision {
+			current, revision = rs.Name, rs.Revision
+		}
+	}
+	return current, revision
+}
+
+// ownedByDeployment reports whether the ReplicaSet's controller owner is the named
+// deployment, matching how clusterIndex resolves the same link.
+func ownedByDeployment(rs health.ReplicaSetSignal, name string) bool {
+	for _, owner := range rs.Owners {
+		if owner.Kind == "Deployment" && owner.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // removePod deletes a pod from the model.
@@ -301,6 +416,13 @@ type fakeMutator struct {
 	// many leading calls, so a test can express "fails once, then succeeds".
 	err       error
 	failFirst int
+
+	// beforeRollback runs at the start of RollbackDeploymentToRevision, before it looks
+	// for the revision. It exists for one race and is deliberately not a general hook on
+	// every method: the rollback primitive is the only one that READS before it writes,
+	// so it is the only one with a window between the runner's snapshot and its own
+	// lookup — the window in which Kubernetes can prune the revision history.
+	beforeRollback func()
 }
 
 func newFakeMutator(model *clusterModel) *fakeMutator {
@@ -362,6 +484,28 @@ func (m *fakeMutator) PatchDeployment(_ context.Context, namespace, name string,
 		Verb: "patchdeployment", Namespace: namespace, Name: name,
 		Patch: string(patch), ResourceVersion: resourceVersion,
 	}, "deployment/"+namespace+"/"+name, nil)
+}
+
+// RollbackDeploymentToRevision models the two-step shape of the real primitive: the
+// revision is resolved by a READ, and only then is a patch composed and sent. So a
+// pruned revision returns [kube.ErrRevisionNotFound] having recorded no call at all —
+// which is what lets a test assert that the abort sent nothing, rather than merely that
+// it failed.
+func (m *fakeMutator) RollbackDeploymentToRevision(_ context.Context, namespace, name string, revision int64, resourceVersion string) (*kube.Outcome, error) {
+	m.mu.Lock()
+	prune := m.beforeRollback
+	m.mu.Unlock()
+	if prune != nil {
+		prune()
+	}
+	if !m.model.hasRevision(namespace, name, revision) {
+		return nil, fmt.Errorf("%w: revision %d of deployment %s/%s has no surviving replicaset",
+			kube.ErrRevisionNotFound, revision, namespace, name)
+	}
+	return m.record(call{
+		Verb: "rollback", Namespace: namespace, Name: name,
+		Revision: revision, ResourceVersion: resourceVersion,
+	}, "deployment/"+namespace+"/"+name, func() { m.model.rollBackTo(namespace, name, revision) })
 }
 
 func (m *fakeMutator) CordonNode(_ context.Context, name, resourceVersion string) (*kube.Outcome, error) {
@@ -691,8 +835,15 @@ func deletePodProposal() remediate.Proposal {
 	}
 }
 
-// revisionRollbackProposal is the operation this layer deliberately refuses; see the
-// note on [operationPlans].
+// rollbackModel is the cluster a revision rollback is proposed against: deployment
+// shop/web running revision 5, with revision 4's ReplicaSet still in its history.
+func rollbackModel() *clusterModel {
+	return newClusterModel().withDeployment("shop", "web", 3, 5).withRevision("shop", "web", 4)
+}
+
+// revisionRollbackProposal rolls deployment shop/web back to revision 4 — the fixture
+// pairs with a model at revision 5, so the approved action genuinely restores an older
+// pod template rather than re-asserting the current one.
 func revisionRollbackProposal() remediate.Proposal {
 	target := remediate.Target{Cluster: testCluster, Kind: "deployment", Namespace: "shop", Name: "web", ResourceVersion: "2002"}
 	return remediate.Proposal{
