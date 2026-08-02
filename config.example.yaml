@@ -45,3 +45,56 @@ clusters:
 #   export MAKLAUDE_LLM_TIMEOUT=20s           # per-call timeout (Go duration)
 # With the flag unset (the default), diagnosis behaves exactly as without T5.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# REMEDIATION (Milestone 4) — OFF, AND NOT CONFIGURABLE FROM THIS FILE.
+#
+# MaKlaude can carry out four remediations a human approved: rolloutrestart,
+# rollbackrevision, cordonnode, deletepod. There is deliberately NO key in this
+# file that turns any of that on, and there is no environment variable either.
+# Off is not a default someone could flip by accident here — the shipped binary
+# has two commands (`version`, `scan`) and nothing in it constructs an executor,
+# so the write path is unreachable from a running MaKlaude. Wiring it up is a
+# separate, deliberate code change.
+#
+# When it is wired up, an action still has to pass five independent gates. Each
+# is opened by a different person doing a different thing, and none implies
+# another:
+#
+#   1. RBAC        `kubectl apply -k deploy/rbac/write` — a SEPARATE bundle
+#                  binding a SEPARATE ServiceAccount (maklaude-executor). Not
+#                  installed by `kubectl apply -k deploy/rbac`. Deleting it is
+#                  the cheapest kill: writes stop at the API server, and the
+#                  read / diagnose / propose path keeps working untouched.
+#   2. KILL SWITCH `kube.ExecuteMode`, fixed when the executor is constructed.
+#                  disabled (zero value, default) | dry-run | enabled.
+#                  Under `disabled`, kube.NewExecutor refuses to build anything,
+#                  so an opted-out deployment holds no write-capable object.
+#                  NOTE: a dry run still needs the write RBAC verb — Kubernetes
+#                  authorizes dryRun=All with the identical verb.
+#   3. APPROVAL    an `approved` LABEL EVENT on the proposal issue, from an
+#                  identity MaKlaude cannot forge. Scope-bound and single-use:
+#                  one operation, one object, one resourceVersion, once.
+#   4. PRECONDITIONS re-checked against a fresh cluster read immediately before
+#                  the request is sent.
+#   5. resourceVersion injected by the executor and enforced by the API server.
+#                  A target that moved since the proposal fails and applies
+#                  nothing.
+#
+# The approval flow is configured by ENVIRONMENT VARIABLES, not this file:
+#   export MAKLAUDE_GITHUB_REPO=owner/repo    # where proposal artifacts live
+#   export MAKLAUDE_GITHUB_TOKEN=...          # token with issues:write
+#   export MAKLAUDE_GITHUB_SELF_LOGIN=...     # the login that token belongs to;
+#                                             # REQUIRED with a live gate, so a
+#                                             # label MaKlaude applied to its own
+#                                             # artifact is recognized + refused
+#
+# And there is exactly one supported way to waive the human requirement — it
+# waives CONSENT and nothing else (gates 1, 2, 4 and 5 above all still apply):
+#   export MAKLAUDE_DANGEROUSLY_AUTO_APPROVE=1
+# Strict values: 1/true on, 0/false/unset off, anything else is a fatal startup
+# error rather than a guess. Every action it waives is recorded as unreviewed.
+# Read docs/autonomous-mode.md BEFORE setting it.
+#
+# Full story: docs/remediation.md. Access model: docs/rbac.md.
+# ---------------------------------------------------------------------------

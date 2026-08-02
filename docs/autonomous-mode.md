@@ -152,6 +152,9 @@ What is no longer available is the silent middle, where the gate looks armed and
 - [`rbac.md`](rbac.md) — the separate, least-privilege identity that can execute the
   approved actions at all. Autonomous mode changes who authorizes an action, never what
   MaKlaude is permitted to do.
+- [`remediation.md`](remediation.md) — the whole gated-write path. Autonomous mode opens
+  exactly one of its five gates; the RBAC bundle, the `kube.ExecuteMode` kill switch, the
+  precondition re-check, and the `resourceVersion` enforcement are all untouched by it.
 
 ## Where this lives in the code
 

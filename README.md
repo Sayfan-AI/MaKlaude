@@ -18,7 +18,7 @@ Treat the well-known "multi-agent Kubernetes DevOps" pattern (a coordinator dele
 
 Full operator and architecture docs live in [`docs/`](docs/index.md). Start with [`docs/index.md`](docs/index.md) for the doc map and a suggested reading order.
 
-**Safety posture, stated accurately.** MaKlaude's observation path never mutates a cluster — that part is unconditional and proven four ways ([no-writes guarantee](docs/no-writes.md)). Every *mutating* action is gated on an explicit, attributable human approval **by default**, and there is exactly one supported way out of that gate: an operator deliberately setting `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE=1`, which waives the requirement for consent and nothing else, and records every action it waives as unreviewed in the artifact, the chat notice, the process log, and the audit trail. See [Approval gate & autonomous mode](#approval-gate--autonomous-mode) and [`docs/autonomous-mode.md`](docs/autonomous-mode.md).
+**Safety posture, stated accurately.** MaKlaude's observation path never mutates a cluster — that part is unconditional and proven four ways ([no-writes guarantee](docs/no-writes.md)). MaKlaude as a *whole* is not read-only: since Milestone 4 there is a separate, opt-in write path for remediation a human approved. It is off by default in the strongest available sense — the shipped binary has no command or config key that reaches it — and when wired up it stays gated on a separately-installed RBAC bundle, an in-process kill switch, an attributable approval, and preconditions re-checked against a fresh read. Every *mutating* action needs an explicit, attributable human approval **by default**, and there is exactly one supported way out of *that* gate: an operator deliberately setting `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE=1`, which waives the requirement for consent and nothing else, and records every action it waives as unreviewed in the artifact, the chat notice, the process log, and the audit trail. See [Gated remediation](#gated-remediation), [Approval gate & autonomous mode](#approval-gate--autonomous-mode), [`docs/remediation.md`](docs/remediation.md), and [`docs/autonomous-mode.md`](docs/autonomous-mode.md).
 
 
 ## Architecture posture — deterministic product, AI dev system
@@ -50,9 +50,11 @@ This repo runs autonomously via GitHub Actions, but **genesis ships those workfl
 
 If you just want to point MaKlaude at a cluster and run a read-only scan, follow
 the three-step **[operator quickstart](docs/quickstart.md)**: grant read-only
-RBAC, register the cluster, and run `maklaude scan`. MaKlaude only ever *reads*
-your clusters — see the **[no-writes guarantee](docs/no-writes.md)** for how that
-is enforced and tested.
+RBAC, register the cluster, and run `maklaude scan`. Everything `scan` does is a
+read — see the **[no-writes guarantee](docs/no-writes.md)** for how that is
+enforced and tested. The separate write path is not reachable from the binary and
+takes a deliberate opt-in to enable at all; see
+**[Gated remediation](#gated-remediation)**.
 
 ## Development
 
@@ -218,6 +220,75 @@ is exhaustively unit-tested with a fake in-memory sink. The package touches
 GitHub and **never** a Kubernetes cluster, keeping MaKlaude's read-only safety
 boundary intact.
 
+## Gated remediation
+
+Since Milestone 4, MaKlaude can carry out a fix — but only one a human approved,
+on the object they approved it for, through a path that shares nothing with the
+observation path.
+
+**It is off by default, and "off" is stronger than a setting.** The shipped
+binary has two commands, `version` and `scan`. Nothing in the config file, the
+CLI, or a scheduled loop constructs an executor, so there is currently no way to
+reach the write path from a running MaKlaude at all. Wiring it up is a separate,
+deliberate step — which is why the sections below describe gates rather than
+enabling instructions: there is no `remediation:` block to add to your config,
+and no environment variable that turns writes on.
+
+### The catalog is closed
+
+Four operations, each one API call against one object:
+
+| Operation | Reversibility | What it does |
+| --------- | ------------- | ------------ |
+| `rolloutrestart` | reversible | `kubectl rollout restart` at the API level — stamps `restartedAt` on a Deployment's pod template; the update strategy governs the replacement |
+| `rollbackrevision` | reversible | `kubectl rollout undo` — replaces `/spec/template` with a previous revision's pod template |
+| `cordonnode` | reversible | Sets `spec.unschedulable`. Cordoning is **not** draining; running pods are left alone |
+| `deletepod` | recreated-by-controller | Deletes one already-failed pod whose controller will recreate it |
+
+### Five independent gates
+
+An action reaches a cluster only if all of these are open, and each is opened by
+a different person doing a different thing:
+
+| Gate | Default | Notes |
+| ---- | ------- | ----- |
+| RBAC bundle `deploy/rbac/write` | not installed | binds a **separate** ServiceAccount, `maklaude-executor`. Deleting it is the cheapest revocation: writes stop at the API server, and read/diagnose/propose keeps working |
+| Kill switch `kube.ExecuteMode` | `disabled` (the zero value) | `kube.NewExecutor` refuses to build anything under it, so an opted-out deployment holds no write-capable object |
+| Human approval | none | an `approved` **label event** on the proposal artifact, from an identity MaKlaude cannot forge — see below |
+| Preconditions | must hold | re-checked against a fresh cluster read immediately before the request |
+| `resourceVersion` | must match | injected by the executor, enforced by the API server; a target that moved fails the action and applies nothing |
+
+Installing the RBAC bundle does not enable execution, and enabling execution does
+not grant permission.
+
+### The kill switch has three positions
+
+| Mode | Effect |
+| ---- | ------ |
+| `disabled` | Nothing runs; no executor is built. Shipped default |
+| `dry-run` | Previews only. Every action carries `dryRun=All`, and the transport **refuses** a mutating request that lacks it, so the API server validates against real admission controllers and discards |
+| `enabled` | Real, approved mutations. The only mode under which a cluster changes |
+
+A dry run still needs the write verb — Kubernetes authorizes `dryRun=All` with
+the identical verb it would use for a real request. Preview-only is enforced by
+the mode and the transport, never by RBAC. See
+[`docs/rbac.md`](docs/rbac.md#dry-run-still-needs-the-write-verb).
+
+### Reversibility and the audit trail
+
+`Execute` captures the target's pre-state and reports that a rollback is
+*available*; it never performs one on its own, because an unbidden rollback is
+itself an unapproved mutating action. `Rollback` runs only when asked, under the
+same permission slip that authorized the action being undone.
+
+Every lifecycle event appends one immutable, self-contained record — `proposed`,
+`approved`, `executed`, `verified`, `failed`, `rolledback` — sequenced under a
+lock so ordering is a fact rather than a race, with free text redacted before
+storage and structured identifiers deliberately kept intact. The durable copy is
+the approval artifact itself, which outlives the process.
+
+Full detail: **[docs/remediation.md](docs/remediation.md)**.
+
 ## Approval gate & autonomous mode
 
 Mutating actions do not travel on the escalation trail. They get their own
@@ -318,16 +389,29 @@ cluster names, and any referenced kubeconfig file that does not exist on disk.
 
 Each successfully validated cluster resolves to an isolated `Handle` (name,
 kubeconfig path, context) with **no shared or global mutable state** across
-clusters — a later milestone turns a handle into a live Kubernetes client.
+clusters. A handle becomes a live read-only `kube.Client` — and, only under the
+opt-in write path, a per-action `kube.Executor` scoped to that one cluster, so
+clusters cannot cross-contaminate in either direction.
+
+There is deliberately **no remediation section in this file.** Enabling writes is
+not a config-file decision: it takes a separately-installed RBAC bundle plus an
+explicitly-constructed executor, and neither is reachable from here. See
+[Gated remediation](#gated-remediation).
 
 ### Read-only access (RBAC)
 
-MaKlaude only ever reads a cluster. The least-privilege RBAC bundle in
+The scan path only ever reads a cluster. The least-privilege RBAC bundle in
 [`deploy/rbac/`](deploy/rbac/) grants its ServiceAccount exactly the
 `get`/`list`/`watch` access the code needs and **no mutating verbs**. Apply it
 with `kubectl apply -k deploy/rbac`. See [`docs/rbac.md`](docs/rbac.md) for the
 full access model, how to mint a kubeconfig for the ServiceAccount and register
 it above, and how to verify the access is truly read-only.
+
+Remediation needs a second identity, and it lives in a **separate** bundle
+(`deploy/rbac/write/`) binding a separate ServiceAccount, `maklaude-executor`.
+Applying the base bundle alone leaves MaKlaude unable to change anything at the
+API server, which is the intended default. See
+[`docs/rbac.md`](docs/rbac.md#the-optional-minimal-write-bundle).
 
 ### Task runner
 
