@@ -48,6 +48,17 @@
 //   - The action has not already run. An artifact whose execution is recorded is
 //     never authorized a second time (see [ReasonAlreadyExecuted]).
 //
+// # There is exactly one way out, and it is loud
+//
+// [Policy.AutoApprove] — the autonomous-mode bypass an operator turns on with
+// [AutoApproveEnv] — waives the FIRST of those five conditions and nothing else. The
+// other four still refuse, a human's `rejected` label still wins, and the resulting
+// [Authorization] carries [AuthorityPolicy] with a policy marker for an approver, so
+// no artifact and no audit record ever claims a person reviewed what nobody saw. It
+// exists because a safety mechanism people fork out of the codebase is worse than one
+// with a documented exit; autoapprove.go carries the full argument, including why it
+// had to ship together with making an unknown self-identity a hard error.
+//
 // # Dedup, recurrence, and self-healing mirror the escalation trail
 //
 // The artifact is keyed on [remediate.ProposalIdentity], which is stable across
@@ -246,6 +257,23 @@ type PendingAction struct {
 	// "unknown", which refreshes: re-rendering a current body is cheap, and showing a
 	// stale one is what this field exists to prevent.
 	PreviewedState string
+
+	// GateMode is the approval posture the artifact's body currently DESCRIBES — one
+	// of the tokens [gateModeToken] renders — recovered from the body's hidden gate
+	// marker, and empty when no marker is present.
+	//
+	// It is here for the same reason PreviewedState is, applied to the one thing that
+	// can change without the cluster changing at all: an operator turning the
+	// autonomous-mode bypass on. Every open artifact's body then says "Nothing runs
+	// until a human adds the `approved` label", and MaKlaude proceeds to run it. Making
+	// the mode part of what "current" means forces one refresh pass, so the body a
+	// person reads states the posture MaKlaude is actually operating under before it
+	// acts on that posture — rather than the artifact lying at the exact moment its
+	// wording matters most.
+	//
+	// An empty value is "unknown" and refreshes, so a body written before this marker
+	// existed re-renders rather than being assumed current.
+	GateMode string
 }
 
 // ActionKind enumerates what a reconciliation pass can decide to do about one
@@ -341,6 +369,13 @@ const (
 	// ReasonApprovalValid — every condition holds; the action is authorized.
 	ReasonApprovalValid
 
+	// ReasonAutoApproved — every condition except a human's consent holds, and consent
+	// was waived by [Policy.AutoApprove]. It is a SEPARATE reason from
+	// [ReasonApprovalValid] rather than a flag on it, because the reason token is what
+	// lands in the trail and in logs, and "approval-valid" on an action nobody
+	// approved is the one sentence this bypass must never be able to write.
+	ReasonAutoApproved
+
 	// ReasonDrift — the target's resourceVersion changed since the preview the
 	// approval was given against. The approved action and the possible action are no
 	// longer the same action.
@@ -408,6 +443,8 @@ func (r Reason) String() string {
 		return "preview-current"
 	case ReasonApprovalValid:
 		return "approval-valid"
+	case ReasonAutoApproved:
+		return "auto-approved-no-human-review"
 	case ReasonDrift:
 		return "drift"
 	case ReasonApprovalPredatesPreview:
@@ -471,13 +508,34 @@ type Action struct {
 }
 
 // Policy is the operator-tunable part of the gate: how long consent stays good
-// for, and whether an unanswered question eventually expires.
+// for, whether an unanswered question eventually expires, and whether consent is
+// required at all.
 //
-// Both knobs are [time.Duration] rather than integer seconds so a unit confusion
-// cannot survive compilation, and the nullable one is a pointer rather than a
-// zero sentinel — see [Policy.PendingTTL] for why that distinction is
-// load-bearing here rather than stylistic.
+// The two duration knobs are [time.Duration] rather than integer seconds so a unit
+// confusion cannot survive compilation, and the nullable one is a pointer rather than
+// a zero sentinel — see [Policy.PendingTTL] for why that distinction is load-bearing
+// here rather than stylistic.
 type Policy struct {
+	// AutoApprove waives the requirement for a human decision. It is the autonomous
+	// mode bypass, off by default, and it is the only field here whose zero value is a
+	// safety property rather than a convenience: everything else in this struct
+	// degrades to a shipped default when forgotten, and this one degrades to "keep
+	// asking a human", which is the posture MaKlaude ships in.
+	//
+	// It is a plain bool rather than a nullable or a tri-state on purpose. The other
+	// knobs are pointers or fall back to defaults because "unset" and "zero" mean
+	// different things for a duration; here they mean the same thing and it is the
+	// safe one, so there is nothing for a richer type to disambiguate — and a knob that
+	// turns the gate off should be as hard to set accidentally as possible, which
+	// includes having exactly one way to set it.
+	//
+	// What it waives is CONSENT and nothing else: drift, a failed dry-run, a missing
+	// rollback plan, the executed-label idempotency flag, a human's `rejected` label,
+	// the executor's precondition re-check, and the [kube] kill switch all still apply.
+	// See autoapprove.go for the full argument, and [AutoApproveEnv] for how an
+	// operator turns it on.
+	AutoApprove bool
+
 	// ApprovalTTL bounds how long an approval remains honorable after it was
 	// recorded. Consent to mutate a live system is perishable: an operator who
 	// approved a pod deletion on Monday did not approve deleting whatever occupies
@@ -513,8 +571,8 @@ type Policy struct {
 // they gave it against.
 const DefaultApprovalTTL = 2 * time.Hour
 
-// DefaultPolicy returns the shipped policy: approvals expire after
-// [DefaultApprovalTTL], and undecided proposals wait indefinitely.
+// DefaultPolicy returns the shipped policy: a human decision is required, approvals
+// expire after [DefaultApprovalTTL], and undecided proposals wait indefinitely.
 func DefaultPolicy() Policy { return Policy{ApprovalTTL: DefaultApprovalTTL} }
 
 // normalized returns the policy with a usable ApprovalTTL, substituting the

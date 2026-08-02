@@ -328,6 +328,101 @@ func TestExecute_DryRunPreviewsWithoutExecutingOrRecording(t *testing.T) {
 	}
 }
 
+// TestExecute_AutoApprovedActionStillAbortsOnPreconditionDrift is the executor's half
+// of "the bypass waives consent and nothing else".
+//
+// The precondition re-check is the last thing standing between an approval and a
+// cluster, and it is the one that matters MOST under autonomous mode rather than least:
+// with a human in the loop, somebody looked at the world a moment ago; with the bypass
+// on, this re-read is the only look anything takes. So the assertion is made on the
+// write path — zero requests sent — rather than on the report, because a report is what
+// a buggy implementation would still get right.
+func TestExecute_AutoApprovedActionStillAbortsOnPreconditionDrift(t *testing.T) {
+	model := newClusterModel().withNode("node-a")
+	h := newHarness(t, model, fastPolicy())
+	p := cordonProposal()
+
+	// The node recovered between the proposal and the action. Nobody was asked, so
+	// nobody could notice; the re-check has to.
+	model.mutateNode("node-a", func(n *health.NodeSignal) { n.Ready = true })
+
+	rep, err := h.executeAutoApproved(p)
+	if !errors.Is(err, ErrPreconditionDrift) {
+		t.Fatalf("expected ErrPreconditionDrift, got: %v", err)
+	}
+	if got := h.mutator.callCount(); got != 0 {
+		t.Fatalf("an auto-approved action with a drifted precondition still sent %d mutating requests: %+v", got, h.mutator.recorded())
+	}
+	if model.node("node-a").Unschedulable {
+		t.Fatal("an auto-approved action cordoned a node that had already recovered")
+	}
+	if rep.Failure != FailureDrifted || !rep.CleanAbort() {
+		t.Fatalf("failure = %s cleanAbort = %t, want a clean drifted abort", rep.Failure, rep.CleanAbort())
+	}
+	if rep.Executed || rep.Recorded || rep.Attempts != 0 {
+		t.Fatalf("an aborted action reports executed=%t recorded=%t attempts=%d", rep.Executed, rep.Recorded, rep.Attempts)
+	}
+
+	// The abandonment is audited, and audited as unreviewed. "MaKlaude was authorized
+	// to cordon this node and did not, because the node had recovered" is exactly the
+	// record an operator running unattended needs to be able to find.
+	failed := h.recordFor(audit.PhaseFailed)
+	if failed.Approver.Authority != audit.AuthorityPolicy {
+		t.Errorf("authority = %s, want %s", failed.Approver.Authority, audit.AuthorityPolicy)
+	}
+	if !failed.Outcome.CleanAbort || failed.Change.Sent {
+		t.Errorf("the record says cleanAbort=%t sent=%t, want an abort that sent nothing", failed.Outcome.CleanAbort, failed.Change.Sent)
+	}
+}
+
+// TestExecute_AutoApprovedDryRunStillOnlyPreviews is the composition property the
+// autonomous-mode bypass has to hold: the approval gate and the write-path kill switch
+// are two INDEPENDENT gates, and waiving the first does not touch the second.
+//
+// The failure it guards against is the natural mental slip — "autonomous mode means
+// MaKlaude acts on its own", read as "MaKlaude acts". They answer different questions.
+// One asks whether this may run at all; the other asks whether a real write is
+// permitted, and it is set by the operator on the write client, not by the approval
+// policy. An operator who turns the bypass on while the executor is still in dry-run
+// has asked for an unattended REHEARSAL, and getting that wrong would mutate a
+// production cluster on a configuration that promised it would not.
+func TestExecute_AutoApprovedDryRunStillOnlyPreviews(t *testing.T) {
+	model := newClusterModel().withNode("node-a")
+	h := newHarness(t, model, fastPolicy())
+	h.mutator.mode = kube.ExecuteDryRun
+
+	rep, err := h.executeAutoApproved(cordonProposal())
+	if err != nil {
+		t.Fatalf("previewing: %v", err)
+	}
+
+	if model.node("node-a").Unschedulable {
+		t.Fatal("an auto-approved action changed the cluster while the write path was in dry-run")
+	}
+	if !rep.DryRun || rep.Executed {
+		t.Fatalf("report says dryRun=%t executed=%t, want a preview", rep.DryRun, rep.Executed)
+	}
+	if rep.Recorded || h.recorder.count() != 0 {
+		t.Fatal("a preview was recorded on the approval trail as an execution, which would permanently block the real one")
+	}
+	if rep.Mode != kube.ExecuteDryRun {
+		t.Errorf("report mode = %s, want the kill switch's posture to be recorded as it was read", rep.Mode)
+	}
+
+	// The audit trail must show both facts at once: nobody reviewed it, and nothing
+	// was applied. Either alone would be a misleading record.
+	exec := h.recordFor(audit.PhaseExecuted)
+	if exec.Approver.Authority != audit.AuthorityPolicy {
+		t.Errorf("authority = %s, want %s", exec.Approver.Authority, audit.AuthorityPolicy)
+	}
+	if exec.Change.Applied || !exec.Change.DryRun {
+		t.Errorf("the record says applied=%t dryRun=%t, want a preview", exec.Change.Applied, exec.Change.DryRun)
+	}
+	if rendered := audit.Lifecycle(h.records()); !strings.Contains(rendered, "previewed") {
+		t.Errorf("the rendered lifecycle does not say the action was only previewed:\n%s", rendered)
+	}
+}
+
 // TestExecute_RefusesAnIrreversibleAction covers the guard that fires only once the
 // catalog grows an irreversible operation — which is exactly when it needs to
 // already be there. The unclassified case is the same guard from the other side: a

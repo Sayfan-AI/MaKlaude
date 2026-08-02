@@ -411,6 +411,81 @@ func TestExecutionRecords_AlwaysProduceAtLeastOneRecord(t *testing.T) {
 	}
 }
 
+// TestExecute_AuditTrailNeverClaimsAHumanReviewedAWaivedAction is the audit half of
+// the autonomous-mode change. The bypass's one unbreakable rule is that no record it
+// produces may read as though a person approved the action, and the audit trail is
+// where getting that wrong is permanent: it is the artifact an incident review trusts,
+// months later, with no access to the process that wrote it.
+//
+// It asserts on the RENDERED lifecycle as well as on the fields, because the fields
+// being right buys nothing if the renderer prints them as a login anyway — and the
+// rendering is what a human actually reads.
+func TestExecute_AuditTrailNeverClaimsAHumanReviewedAWaivedAction(t *testing.T) {
+	model := newClusterModel().withNode("node-a")
+	h := newHarness(t, model, fastPolicy())
+	p := cordonProposal()
+
+	if _, err := h.executeAutoApproved(p); err != nil {
+		t.Fatalf("executing: %v", err)
+	}
+
+	if got := h.phases(); !equalStrings(got, []string{"approved", "executed", "verified"}) {
+		t.Fatalf("the trail holds phases %v, want the full lifecycle — a waived action is still audited in full", got)
+	}
+
+	for i, rec := range h.records() {
+		if rec.Approver.Authority != audit.AuthorityPolicy {
+			t.Errorf("record %d carries authority %s, want %s", i, rec.Approver.Authority, audit.AuthorityPolicy)
+		}
+		if rec.Approver.Authority.HumanReviewed() {
+			t.Errorf("record %d reports that a human reviewed an action nobody saw", i)
+		}
+		if rec.Approver.Identity != approve.AutoApprovePolicy {
+			t.Errorf("record %d names %q as the approver, want the policy marker %q", i, rec.Approver.Identity, approve.AutoApprovePolicy)
+		}
+		if !rec.Approver.ApprovedAt.IsZero() {
+			t.Errorf("record %d stamps a decision time on an action nobody decided: %s", i, rec.Approver.ApprovedAt)
+		}
+		// It is still ATTRIBUTED — to a policy — because an unattributed record is what
+		// a refused execution carries, and conflating "waived" with "refused" would lose
+		// the approved phase entirely.
+		if !rec.Approver.Attributed() {
+			t.Errorf("record %d reports no authority at all, which is the shape of a REFUSED action", i)
+		}
+	}
+
+	rendered := audit.Lifecycle(h.records())
+	for _, want := range []string{"policy waived approval", "No human reviewed this action"} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("the rendered lifecycle is missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "(human approval)") {
+		t.Errorf("the rendered lifecycle describes a waived action as a human approval:\n%s", rendered)
+	}
+	// A zero ApprovedAt must be dropped from the sentence rather than printed, or the
+	// trail reads "the decision was recorded not recorded".
+	if strings.Contains(rendered, "0001-01-01") || strings.Contains(rendered, "recorded not recorded") {
+		t.Errorf("the rendered lifecycle printed a decision instant that never happened:\n%s", rendered)
+	}
+}
+
+// TestAuthorityOfDegradesTowardPolicyNotHuman pins the direction the enum translation
+// fails in. Only the gate's human authority may become the trail's; anything else,
+// including a value this function has never heard of, records as policy-waived —
+// because the opposite default would let an unrecognized authority silently claim a
+// review that did not happen.
+func TestAuthorityOfDegradesTowardPolicyNotHuman(t *testing.T) {
+	if got := authorityOf(approve.AuthorityHuman); got != audit.AuthorityHuman {
+		t.Errorf("authorityOf(human) = %s, want %s", got, audit.AuthorityHuman)
+	}
+	for _, a := range []approve.Authority{approve.AuthorityPolicy, approve.AuthorityNone, approve.Authority(99)} {
+		if got := authorityOf(a); got != audit.AuthorityPolicy {
+			t.Errorf("authorityOf(%s) = %s, want %s", a, got, audit.AuthorityPolicy)
+		}
+	}
+}
+
 // refusingSink is an [audit.Sink] that stores nothing, standing in for a durable
 // sink whose backing store is unreachable.
 type refusingSink struct{}

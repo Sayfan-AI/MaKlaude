@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -46,6 +47,7 @@ type Gatekeeper struct {
 	notifier notify.Notifier
 	policy   Policy
 	now      func() time.Time
+	logger   *log.Logger
 }
 
 // NewGatekeeper builds a gatekeeper over the given sink.
@@ -74,6 +76,27 @@ func (g *Gatekeeper) WithClock(now func() time.Time) *Gatekeeper {
 		g.now = now
 	}
 	return g
+}
+
+// WithLogger replaces the destination for the gate's warnings, which today means the
+// one it emits for every auto-approved action. Nil leaves the standard logger in place.
+// It returns the receiver so it can be chained onto construction.
+func (g *Gatekeeper) WithLogger(logger *log.Logger) *Gatekeeper {
+	if logger != nil {
+		g.logger = logger
+	}
+	return g
+}
+
+// warn writes one line to the gate's logger, defaulting to the standard logger. It
+// matches [aidiagnose.LogAuditor]'s posture: MaKlaude leans on the standard toolchain
+// rather than a bespoke logging stack, so a warning reaches stderr with no wiring.
+func (g *Gatekeeper) warn(format string, args ...any) {
+	logger := g.logger
+	if logger == nil {
+		logger = log.Default()
+	}
+	logger.Printf(format, args...)
 }
 
 // Policy returns the gate's effective policy, with defaults already applied.
@@ -184,6 +207,13 @@ func (g *Gatekeeper) Reconcile(ctx context.Context, reqs []Request) (Result, err
 			res.Withdrawn++
 
 		case ActionAuthorize:
+			// The warning is emitted BEFORE the trail is touched, and independently of
+			// whether touching it succeeds. The comment on the artifact is the durable
+			// record and the log line is the one that reaches an operator watching the
+			// process; a sink outage must not be able to make an unreviewed mutation
+			// silent in both places at once.
+			g.warnIfUnreviewed(a.Authorization)
+
 			// The artifact is annotated BEFORE the authorization is handed back, so a
 			// failure here means the caller never receives a slip whose trail does not
 			// record it. The audit record is not allowed to lag the permission.
@@ -207,14 +237,14 @@ func (g *Gatekeeper) Reconcile(ctx context.Context, reqs []Request) (Result, err
 func (g *Gatekeeper) open(ctx context.Context, a Action, now time.Time) error {
 	pending := PendingAction{State: StatePending}
 	title := Title(a.Request)
-	body := Body(a.Request, now)
+	body := Body(a.Request, now, g.policy)
 
 	ref, err := g.sink.Create(ctx, title, body, LabelsFor(pending))
 	if err != nil {
 		return fmt.Errorf("opening approval request for %q: %w", a.Identity, err)
 	}
 
-	threadTS, nerr := g.notifier.NotifyEscalation(ctx, g.notifyID(a.Identity), ApprovalSummary(a.Request), string(ref), true)
+	threadTS, nerr := g.notifier.NotifyEscalation(ctx, g.notifyID(a.Identity), ApprovalSummary(a.Request, g.policy), string(ref), true)
 	if nerr != nil {
 		return fmt.Errorf("announcing approval request for %q: %w", a.Identity, nerr)
 	}
@@ -236,7 +266,7 @@ func (g *Gatekeeper) open(ctx context.Context, a Action, now time.Time) error {
 // comment per pass would bury the human decision this issue exists to collect under
 // a stream of machine chatter.
 func (g *Gatekeeper) refresh(ctx context.Context, a Action, pending PendingAction, now time.Time) error {
-	body := withThreadMarker(Body(a.Request, now), a.ThreadTS)
+	body := withThreadMarker(Body(a.Request, now, g.policy), a.ThreadTS)
 	if err := g.sink.Update(ctx, a.Ref, Title(a.Request), body, LabelsFor(pending)); err != nil {
 		return fmt.Errorf("refreshing approval request %q for %q: %w", a.Ref, a.Identity, err)
 	}
@@ -263,7 +293,7 @@ func (g *Gatekeeper) refuse(ctx context.Context, a Action, pending PendingAction
 	// The artifact is pending again from here, so it is re-rendered and re-labelled
 	// as such.
 	reopened := PendingAction{State: StatePending}
-	body := withThreadMarker(Body(a.Request, now), a.ThreadTS)
+	body := withThreadMarker(Body(a.Request, now, g.policy), a.ThreadTS)
 	if err := g.sink.Update(ctx, a.Ref, Title(a.Request), body, LabelsFor(reopened)); err != nil {
 		return fmt.Errorf("refreshing refused request %q for %q: %w", a.Ref, a.Identity, err)
 	}
@@ -291,17 +321,33 @@ func (g *Gatekeeper) withdraw(ctx context.Context, a Action) error {
 	return nil
 }
 
-// recordAuthorization notes on the trail that the gate honored an approval, before
+// warnIfUnreviewed logs a warning for every action authorized without a human having
+// looked at it.
+//
+// It is unconditional on the authority rather than on [Policy.AutoApprove], which is
+// the difference between "the bypass is configured" and "the bypass was actually used
+// on this action" — a process running in autonomous mode still authorizes genuinely
+// human-approved artifacts as human, and warning on those would train an operator to
+// filter the line out before it ever carries real news.
+func (g *Gatekeeper) warnIfUnreviewed(auth *Authorization) {
+	if !auth.Valid() || auth.Authority().HumanReviewed() {
+		return
+	}
+	g.warn("maklaude/approve WARNING: AUTO-APPROVED WITHOUT HUMAN REVIEW — %s on %s (cluster %s, resourceVersion %s) authorized under %s=1; "+
+		"no person reviewed this action and none was asked",
+		auth.Operation(), auth.Target().String(), auth.Cluster(), auth.Target().ResourceVersion, AutoApproveEnv)
+}
+
+// recordAuthorization notes on the trail that the gate honored a decision, before
 // the permission slip leaves this package. It does NOT mark the artifact executed —
 // the action has not run yet, and claiming it did would break idempotency in the
 // dangerous direction if execution then failed and the proposal recurred.
+//
+// The wording lives in [AuthorizationComment] rather than here so the two authorities'
+// renderings sit next to each other in the file that owns every other piece of artifact
+// text, and so a test can assert them without driving a full pass.
 func (g *Gatekeeper) recordAuthorization(ctx context.Context, a Action) error {
-	auth := a.Authorization
-	note := fmt.Sprintf(
-		"**Approval honored.** MaKlaude is authorized to run `%s` on `%s` (cluster `%s`) at resourceVersion `%s`, "+
-			"on the approval recorded by @%s at %s.\n\nThe action has **not** run yet; its outcome will be recorded here.",
-		auth.Operation(), auth.Target().String(), auth.Cluster(), auth.Target().ResourceVersion,
-		auth.Approver(), auth.ApprovedAt().UTC().Format(time.RFC3339))
+	note := AuthorizationComment(a.Authorization)
 
 	if err := g.sink.Comment(ctx, a.Ref, note); err != nil {
 		return fmt.Errorf("recording authorization on %q for %q: %w", a.Ref, a.Identity, err)

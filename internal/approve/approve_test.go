@@ -77,7 +77,8 @@ func testRequest() Request {
 
 // approvedPending returns the artifact state for a request a human has legitimately
 // approved: current resourceVersion displayed, approval recorded after the preview,
-// by a named person who is not MaKlaude.
+// by a named person who is not MaKlaude, on a body that describes the human-gated
+// posture the default policy is in.
 func approvedPending(req Request) PendingAction {
 	return PendingAction{
 		Identity:                 req.Identity(),
@@ -88,7 +89,29 @@ func approvedPending(req Request) PendingAction {
 		PreviewedResourceVersion: req.Proposal.Target.ResourceVersion,
 		PreviewedAt:              previewAt,
 		PreviewedState:           previewStateToken(req.Preview),
+		GateMode:                 gateModeToken(DefaultPolicy()),
 	}
+}
+
+// autonomousPolicy is the shipped policy with the bypass switched on — the posture the
+// tests below exercise. It is a function rather than a var so no test can accidentally
+// hand a mutated copy to the next one.
+func autonomousPolicy() Policy {
+	p := DefaultPolicy()
+	p.AutoApprove = true
+	return p
+}
+
+// undecidedPending returns the artifact state for a request nobody has decided on,
+// with its body describing the given policy's posture — the arrangement the bypass
+// authorizes from, and the one a human-gated gate holds.
+func undecidedPending(req Request, policy Policy) PendingAction {
+	p := approvedPending(req)
+	p.State = StatePending
+	p.Approver = ""
+	p.DecidedAt = time.Time{}
+	p.GateMode = gateModeToken(policy)
+	return p
 }
 
 func TestStateStringIsStable(t *testing.T) {
@@ -154,7 +177,7 @@ func TestPolicyZeroValueTakesTheDefaultTTL(t *testing.T) {
 
 func TestBodyRoundTripsEveryMarker(t *testing.T) {
 	req := testRequest()
-	body := Body(req, previewAt)
+	body := Body(req, previewAt, DefaultPolicy())
 
 	id, ok := ParseProposalMarker(body)
 	if !ok || id != req.Identity() {
@@ -214,7 +237,7 @@ func TestParsePreviewMarkerSplitsOnTheLastSeparator(t *testing.T) {
 }
 
 func TestWithThreadMarkerReplacesRatherThanAccumulates(t *testing.T) {
-	body := Body(testRequest(), previewAt)
+	body := Body(testRequest(), previewAt, DefaultPolicy())
 
 	once := withThreadMarker(body, "1712.0001")
 	if ts, _ := ParseThreadMarker(once); ts != "1712.0001" {
@@ -244,7 +267,7 @@ func TestBodyStatesPlainlyThatNoDryRunWasPerformed(t *testing.T) {
 	// An omitted section reads as "nothing to worry about", and a missing dry-run is
 	// precisely something to worry about.
 	req := Request{Proposal: testProposal()}
-	body := Body(req, previewAt)
+	body := Body(req, previewAt, DefaultPolicy())
 
 	if !strings.Contains(body, "No dry-run was performed") {
 		t.Error("body does not say a dry-run was not performed")
@@ -257,7 +280,7 @@ func TestBodyStatesPlainlyThatNoDryRunWasPerformed(t *testing.T) {
 func TestBodyLeadsWithTheDryRunFailure(t *testing.T) {
 	req := testRequest()
 	req.Preview = Preview{Performed: true, Error: "admission webhook denied the request"}
-	body := Body(req, previewAt)
+	body := Body(req, previewAt, DefaultPolicy())
 
 	if !strings.Contains(body, "The dry-run FAILED") {
 		t.Error("body does not flag the failed dry-run")
@@ -274,7 +297,7 @@ func TestBodyCarriesEverySectionAnApproverNeeds(t *testing.T) {
 	// A human approves a production mutation on the strength of this text alone, so
 	// each of these is a section whose absence would let someone approve something
 	// they did not understand.
-	body := Body(testRequest(), previewAt)
+	body := Body(testRequest(), previewAt, DefaultPolicy())
 	for _, want := range []string{
 		"Exactly what will run",
 		"Dry-run preview",
@@ -310,7 +333,7 @@ func TestBodyWarnsWhenAnOperationHasNoRollbackPlan(t *testing.T) {
 	// will not honor. See TestDecideRefusesAnOperationWithNoRollbackPlan.
 	req := testRequest()
 	req.Proposal.Operation = remediate.Operation("scaletozero")
-	body := Body(req, previewAt)
+	body := Body(req, previewAt, DefaultPolicy())
 
 	if !strings.Contains(body, "No rollback plan is defined") {
 		t.Error("body does not warn that the operation has no rollback plan")

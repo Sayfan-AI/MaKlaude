@@ -1,6 +1,6 @@
 # MaKlaude documentation
 
-MaKlaude is an autonomous system for operating Kubernetes clusters on a human's behalf. It watches cluster health read-only, escalates problems as a durable GitHub-issue trail, and reaches you through the channels you configure, while every mutating action stays behind a human gate.
+MaKlaude is an autonomous system for operating Kubernetes clusters on a human's behalf. It watches cluster health read-only, escalates problems as a durable GitHub-issue trail, and reaches you through the channels you configure, while every mutating action stays behind a human gate **by default** — the one way to run it unattended is an explicit, off-by-default bypass that records every action it waives as unreviewed (see [autonomous-mode.md](autonomous-mode.md)).
 
 This is the map of the operator and architecture docs. If you just want to get MaKlaude running against a cluster, start with the quickstart and follow the reading order below.
 
@@ -11,7 +11,8 @@ This is the map of the operator and architecture docs. If you just want to get M
 | [architecture.md](architecture.md) | The two-layer posture: a deterministic Go product built and evolved by an AI dev system, with one optional gated LLM seam. Read this for the mental model. |
 | [quickstart.md](quickstart.md) | Operator setup end to end: grant read-only access, register a cluster, run the monitor, and optionally route escalations to GitHub. **Start here to run it.** |
 | [rbac.md](rbac.md) | The access model: the read-only ServiceAccount MaKlaude observes with, the separate optional identity that can execute three approved actions, and how to grant and verify each. |
-| [no-writes.md](no-writes.md) | The four-layer guarantee that MaKlaude never mutates a cluster, and how to re-verify it yourself. |
+| [no-writes.md](no-writes.md) | The four-layer guarantee that MaKlaude's observation path never mutates a cluster, and how to re-verify it yourself. |
+| [autonomous-mode.md](autonomous-mode.md) | The approval bypass: exactly what `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE` gives up, what it emphatically does not, and why `MAKLAUDE_GITHUB_SELF_LOGIN` became mandatory alongside it. **Read before running MaKlaude unattended.** |
 | [escalation.md](escalation.md) | How detected problems become a comms trail: one GitHub issue per problem, keyed by identity, with escalation, recurrence, and resolution. |
 | [slack.md](slack.md) | The optional Slack / ChatOps mirror of the escalation trail: threaded escalations, the `needs:human` mobile push, and inbound replies. |
 
@@ -22,6 +23,7 @@ This is the map of the operator and architecture docs. If you just want to get M
 3. **[rbac.md](rbac.md)** and **[no-writes.md](no-writes.md)** - the safety model the quickstart leans on: least privilege going in, and the proof that nothing goes out.
 4. **[escalation.md](escalation.md)** - how MaKlaude tells you what it found and keeps that trail honest as problems recur and clear.
 5. **[slack.md](slack.md)** - only if you want a real-time, team-visible channel on top of the GitHub trail.
+6. **[autonomous-mode.md](autonomous-mode.md)** - only if you want MaKlaude to act without asking. It is the one page that describes a safety property being deliberately switched off, so it is last for a reason: nothing else here assumes you have read it, and you should not read it first.
 
 The optional, gated **LLM-assisted diagnosis** layer (read-only, redacted, cost-bounded, off by default) is documented in [architecture.md](architecture.md#the-one-optional-ai-seam) and the [README](../README.md#llm-assisted-diagnosis-optional-gated); its safety posture is summarized in [no-writes.md](no-writes.md).
 

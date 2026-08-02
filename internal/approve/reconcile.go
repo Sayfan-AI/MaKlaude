@@ -26,6 +26,16 @@ import (
 // The one invariant that matters more than the ordering: every path that is not
 // the single authorize branch produces NO authorization, and the authorize branch
 // is reachable only when all of the conditions in the package doc hold.
+//
+// # Where the bypass fits into that order, and where it deliberately does not
+//
+// [Policy.AutoApprove] is read in exactly one place — the undecided branch, and the
+// consent half of [disqualify] — and it is read AFTER the three checks that outrank
+// consent entirely. An executed artifact is still held, a human's `rejected` label is
+// still honored, and an artifact whose displayed evidence has moved is still refreshed
+// before anything is authorized against it. Putting the bypass earlier would have been
+// simpler and would have made "policy says go" beat "a person said no", which is the
+// one ordering this gate can never have.
 func Decide(req Request, pending PendingAction, policy Policy, now time.Time) Action {
 	policy = policy.normalized()
 
@@ -73,13 +83,36 @@ func Decide(req Request, pending PendingAction, policy Policy, now time.Time) Ac
 			base.Reason = ReasonPendingExpired
 			return base
 		}
-		if !previewCurrent(req, pending) {
+		if !previewCurrent(req, pending, policy) {
 			base.Kind = ActionRefresh
 			base.Reason = ReasonPreviewChanged
 			return base
 		}
-		base.Kind = ActionHold
-		base.Reason = ReasonPreviewCurrent
+		if !policy.AutoApprove {
+			base.Kind = ActionHold
+			base.Reason = ReasonPreviewCurrent
+			return base
+		}
+
+		// Autonomous mode. Consent is waived; every other reason not to act still
+		// applies, so the same disqualification chain runs with only its consent half
+		// switched off.
+		//
+		// A disqualified auto-approval HOLDS rather than refuses, which is the one place
+		// the two paths differ in shape. Refusing exists to strip an approval label and
+		// tell the person who applied it why their decision was not honored, and here
+		// there is no label and no such person — while the artifact's body already states
+		// the problem prominently (a failed dry-run, a missing rollback plan) to whoever
+		// reads it. Refusing anyway would post an identical comment every reconciliation
+		// pass forever, which is how a trail teaches its readers to stop reading it.
+		if reason, ok := disqualify(req, pending, policy, now, true); !ok {
+			base.Kind = ActionHold
+			base.Reason = reason
+			return base
+		}
+		base.Kind = ActionAuthorize
+		base.Reason = ReasonAutoApproved
+		base.Authorization = grant(req, pending, AuthorityPolicy, now)
 		return base
 	}
 
@@ -87,16 +120,46 @@ func Decide(req Request, pending PendingAction, policy Policy, now time.Time) Ac
 	// honor it; each refuses, withdraws the approval, and re-asks with current
 	// evidence rather than closing, because the action may still be right against
 	// the state that actually exists now.
-	if reason, ok := disqualify(req, pending, policy, now); !ok {
+	if reason, ok := disqualify(req, pending, policy, now, policy.AutoApprove); !ok {
 		base.Kind = ActionRefuse
 		base.Reason = reason
 		return base
 	}
 
+	authority := authorityFor(pending)
 	base.Kind = ActionAuthorize
 	base.Reason = ReasonApprovalValid
-	base.Authorization = grant(req, pending, now)
+	if !authority.HumanReviewed() {
+		base.Reason = ReasonAutoApproved
+	}
+	base.Authorization = grant(req, pending, authority, now)
 	return base
+}
+
+// authorityFor decides what kind of authority an APPROVED artifact's label event
+// actually establishes.
+//
+// It is only ever called on the approved branch, and only after [disqualify] has
+// passed — which, with the bypass off, already guarantees a named non-self approver,
+// so it returns [AuthorityHuman] and the bypass changes nothing about a real human
+// approval. What it exists for is the case the bypass creates: with consent waived,
+// [Decide] reaches this point on artifacts whose approval is self-applied or carries no
+// recoverable actor, and those must not be recorded as human approvals merely because
+// a label happens to be present.
+//
+// The test is positive rather than negative — "a named actor who is demonstrably not
+// MaKlaude" rather than "not obviously MaKlaude" — because the two differ exactly where
+// it matters. Under `genesis serve`, MaKlaude acts as the operator's own account, so a
+// label it applied is indistinguishable from one the operator applied; the sink reports
+// ApproverIsSelf for both, and both correctly come out as policy-waived. Attributing a
+// human approval requires evidence, not the absence of counter-evidence. Giving the
+// local agent its own identity, which is what would make attribution possible there
+// again, is issue #125.
+func authorityFor(pending PendingAction) Authority {
+	if pending.Approver != "" && !pending.ApproverIsSelf {
+		return AuthorityHuman
+	}
+	return AuthorityPolicy
 }
 
 // disqualify runs the checks that can invalidate an otherwise-approved artifact,
@@ -104,7 +167,22 @@ func Decide(req Request, pending PendingAction, policy Policy, now time.Time) Ac
 // control flow readable and makes the disqualification set enumerable in one place
 // — which matters, because a check that is accidentally dropped here is a check
 // that silently stops protecting anything.
-func disqualify(req Request, pending PendingAction, policy Policy, now time.Time) (Reason, bool) {
+//
+// # waived is the bypass, and it is scoped to four named checks
+//
+// When waived is true, the four checks that ask something about a HUMAN'S DECISION are
+// skipped: self-approval, attribution, approval-before-preview ordering, and approval
+// freshness. Each is meaningless without a decision to judge — there is no approver to
+// name, no approval instant to order against the preview, and nothing to go stale.
+//
+// Everything else runs unchanged, and the split is by question rather than by
+// convenience: a check belongs in the waivable set only if it answers "did somebody say
+// yes, and does that yes still count?". The failed dry-run, the missing rollback plan,
+// and the resourceVersion drift answer "does this still make sense to run?", which is
+// a question about the cluster, and no amount of configured trust makes it go away. The
+// relative ORDER of the surviving checks is unchanged too, so an artifact wrong in more
+// than one way reports the same reason with the bypass on as it would with it off.
+func disqualify(req Request, pending PendingAction, policy Policy, now time.Time, waived bool) (Reason, bool) {
 	// The API server already said this would fail. Nothing downstream improves that.
 	if req.Preview.Failed() {
 		return ReasonPreviewFailed, false
@@ -118,57 +196,72 @@ func disqualify(req Request, pending PendingAction, policy Policy, now time.Time
 		return ReasonNoRollbackPlan, false
 	}
 
-	// MaKlaude approving its own proposal is not a gate. This is checked before the
-	// attribution check because a self-approval DOES carry an identity — it is
-	// attributable and still worthless, so "we know who" is not the question here.
-	if pending.ApproverIsSelf {
-		return ReasonSelfApproval, false
-	}
+	if !waived {
+		// MaKlaude approving its own proposal is not a gate. This is checked before the
+		// attribution check because a self-approval DOES carry an identity — it is
+		// attributable and still worthless, so "we know who" is not the question here.
+		if pending.ApproverIsSelf {
+			return ReasonSelfApproval, false
+		}
 
-	// An approval nobody can be named for is not attributable, and attribution is
-	// the whole reason the signal is a label event rather than a comment.
-	if pending.Approver == "" {
-		return ReasonUnattributedApproval, false
+		// An approval nobody can be named for is not attributable, and attribution is
+		// the whole reason the signal is a label event rather than a comment.
+		if pending.Approver == "" {
+			return ReasonUnattributedApproval, false
+		}
 	}
 
 	// The object moved since the artifact displayed it. The approved action and the
-	// available action are no longer the same action.
+	// available action are no longer the same action — which is as true of an action
+	// policy waved through as of one a person approved, so this is never waived.
 	if pending.PreviewedResourceVersion != req.Proposal.Target.ResourceVersion {
 		return ReasonDrift, false
 	}
 
-	// The approval was recorded before the artifact last displayed this preview, so
-	// it is consent to something that has since been replaced. Without this check a
-	// body refreshed between "human reads" and "human clicks approve" would
-	// re-point a decision at a state nobody read — and drift detection alone would
-	// not notice, because by then the displayed and current versions agree.
-	if !pending.PreviewedAt.IsZero() && pending.DecidedAt.Before(pending.PreviewedAt) {
-		return ReasonApprovalPredatesPreview, false
-	}
+	if !waived {
+		// The approval was recorded before the artifact last displayed this preview, so
+		// it is consent to something that has since been replaced. Without this check a
+		// body refreshed between "human reads" and "human clicks approve" would
+		// re-point a decision at a state nobody read — and drift detection alone would
+		// not notice, because by then the displayed and current versions agree.
+		if !pending.PreviewedAt.IsZero() && pending.DecidedAt.Before(pending.PreviewedAt) {
+			return ReasonApprovalPredatesPreview, false
+		}
 
-	// Consent to mutate a live system is perishable.
-	if !pending.DecidedAt.IsZero() && now.Sub(pending.DecidedAt) > policy.ApprovalTTL {
-		return ReasonApprovalExpired, false
+		// Consent to mutate a live system is perishable.
+		if !pending.DecidedAt.IsZero() && now.Sub(pending.DecidedAt) > policy.ApprovalTTL {
+			return ReasonApprovalExpired, false
+		}
 	}
 
 	return ReasonApprovalValid, true
 }
 
 // previewCurrent reports whether the artifact already displays what a reader needs
-// to see: the target at its current resourceVersion, and the current dry-run
-// outcome.
+// to see: the target at its current resourceVersion, the current dry-run outcome, and
+// the approval posture the gate is actually operating under.
 //
-// Both halves fail CLOSED — an unrecoverable marker leaves its field empty, which
-// matches no real resourceVersion and no state token, so an unparseable body
-// re-renders rather than being assumed current. The alternative failure direction
-// would freeze a corrupt artifact in place forever.
+// All three halves fail CLOSED — an unrecoverable marker leaves its field empty, which
+// matches no real resourceVersion and no token, so an unparseable body re-renders
+// rather than being assumed current. The alternative failure direction would freeze a
+// corrupt artifact in place forever.
 //
 // It deliberately does not compare the dry-run's wording. A summary or diff that
 // changes while the object does not is the same state described slightly
 // differently, and re-rendering on it would put this back to refreshing every pass —
 // which is exactly what [ReasonPreviewCurrent] exists to stop.
-func previewCurrent(req Request, pending PendingAction) bool {
+//
+// The gate-mode half is the one thing here that can change while the CLUSTER does not:
+// an operator turning the autonomous-mode bypass on rewrites what every open artifact
+// means without touching a single object. Including it costs one refresh pass across
+// the trail at the moment the mode flips, and buys the guarantee that no artifact ever
+// promises "nothing runs until a human adds the `approved` label" while MaKlaude is
+// about to run it unattended. See [PendingAction.GateMode].
+func previewCurrent(req Request, pending PendingAction, policy Policy) bool {
 	if pending.PreviewedResourceVersion != req.Proposal.Target.ResourceVersion {
+		return false
+	}
+	if pending.GateMode != gateModeToken(policy) {
 		return false
 	}
 	return pending.PreviewedState == previewStateToken(req.Preview)

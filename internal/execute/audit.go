@@ -215,24 +215,41 @@ func actionOf(rep Report) audit.Action {
 
 // approverOf reads the permission slip.
 //
-// Authority is [audit.AuthorityHuman] because that is the only authority the gate
-// can currently issue: an approval with no identifiable approver is refused before a
-// slip exists (approve's ReasonUnattributedApproval), and one applied by MaKlaude's
-// own account is refused as self-approval. When the planned bypass (issue #124)
-// adds a second kind, this is the single line that learns to ask the authorization
-// which one it is — the record's shape, the renderer, and every record already
-// written are unaffected. That is what [audit.Authority] is for.
+// The gate can issue two kinds of authority now that the autonomous-mode bypass exists,
+// and this is the single line that asks which — exactly as [audit.Authority] was
+// written in anticipation of. The record's shape, the renderer, and every record
+// already written are unaffected: a policy-waived action gets [audit.AuthorityPolicy]
+// with a marker for an identity, [audit.Approver.String] renders it as waived, and
+// [audit.Lifecycle] states in so many words that nobody reviewed it.
 func approverOf(auth *approve.Authorization) audit.Approver {
 	if !auth.Valid() {
 		return audit.Approver{}
 	}
 	return audit.Approver{
-		Authority:    audit.AuthorityHuman,
+		Authority:    authorityOf(auth.Authority()),
 		Identity:     auth.Approver(),
 		ApprovedAt:   auth.ApprovedAt(),
 		AuthorizedAt: auth.AuthorizedAt(),
 		Ref:          string(auth.Ref()),
 	}
+}
+
+// authorityOf translates the gate's authority into the audit trail's.
+//
+// The two enums are separate because each package owns the concept at its own layer —
+// the gate decides on what authority an action runs, the trail decides how that reads
+// six months later — and the same split already applies to this package's own failure
+// and convergence enums. What matters is the direction the translation degrades in:
+// only [approve.AuthorityHuman] maps to [audit.AuthorityHuman], and everything else,
+// including any authority a future gate grows that this function has never heard of,
+// records as policy-waived. Getting that backwards would let an unrecognized authority
+// silently claim a human reviewed the action, which is the exact record this whole
+// change exists to prevent.
+func authorityOf(a approve.Authority) audit.Authority {
+	if a == approve.AuthorityHuman {
+		return audit.AuthorityHuman
+	}
+	return audit.AuthorityPolicy
 }
 
 // changeOf reads what was actually sent off the report.

@@ -138,6 +138,7 @@ func (s *MemorySink) ListOpen(_ context.Context) ([]PendingAction, error) {
 		pa.ThreadTS, _ = ParseThreadMarker(a.body)
 		pa.PreviewedResourceVersion, pa.PreviewedAt, _ = ParsePreviewMarker(a.body)
 		pa.PreviewedState = ParsePreviewStateMarker(a.body)
+		pa.GateMode = ParseGateMarker(a.body)
 		d := decisionFrom(a.labels, a.events)
 		pa.State, pa.Approver, pa.DecidedAt, pa.ApproverIsSelf = d.state, d.approver, d.decidedAt, d.isSelf
 		out = append(out, pa)

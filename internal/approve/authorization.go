@@ -2,16 +2,78 @@ package approve
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/remediate"
 )
 
-// Authorization is the permission slip for exactly one mutating action: proof
-// that a named human explicitly allowed this [remediate.Operation] against this
-// [remediate.Target] at this observed cluster state, and that every condition in
-// the package doc held when the gate checked. It is the ONLY thing an executor may
-// act on.
+// Authority is the KIND of thing that authorized an action, as distinct from which
+// particular one did.
+//
+// It exists because "approved by" stopped meaning one thing when the autonomous-mode
+// bypass landed (see autoapprove.go). Almost every authorization traces to a person
+// who applied a label; one does not. The difference has to be a FIELD rather than
+// something a reader infers from whether [Authorization.Approver] happens to look like
+// a login, because the inference is exactly what a policy-waived action would get
+// wrong — and getting it wrong writes "a human reviewed this" into an audit trail
+// where no human did.
+//
+// The zero value is [AuthorityNone], so an [Authorization] that was never granted
+// reports no authority at all rather than defaulting to the reassuring answer.
+type Authority int
+
+const (
+	// AuthorityNone means the authorization grants nothing. It is the zero value and
+	// what every accessor on an invalid or nil [Authorization] reports.
+	AuthorityNone Authority = iota
+
+	// AuthorityHuman means a named person applied the approval label from an account
+	// that is not MaKlaude's. [Authorization.Approver] is their login and
+	// [Authorization.ApprovedAt] is when they recorded the decision.
+	AuthorityHuman
+
+	// AuthorityPolicy means configured policy waived the approval requirement and NO
+	// person reviewed the action. [Authorization.Approver] is [AutoApprovePolicy] — a
+	// marker naming the policy — and [Authorization.ApprovedAt] is the zero time,
+	// because nothing was decided and there is no instant to record.
+	AuthorityPolicy
+)
+
+// String renders the authority as a stable lowercase token. The tokens land in logs
+// and rendered artifacts, so they are part of the package's contract.
+func (a Authority) String() string {
+	switch a {
+	case AuthorityNone:
+		return "none"
+	case AuthorityHuman:
+		return "human"
+	case AuthorityPolicy:
+		return "policy"
+	default:
+		return "authority(" + strconv.Itoa(int(a)) + ")"
+	}
+}
+
+// HumanReviewed reports whether a person actually looked at the action.
+//
+// It is a method rather than a comparison spelled out at each call site because every
+// renderer that names an approver has to make this distinction, and the one that
+// forgets is the one that claims a human reviewed a policy-waived action. Phrasing it
+// as "is human" rather than "is not policy" is also deliberate: a future authority
+// nobody has thought of yet defaults to NOT human-reviewed, which is the direction
+// that cannot launder an unreviewed action.
+func (a Authority) HumanReviewed() bool { return a == AuthorityHuman }
+
+// Authorization is the permission slip for exactly one mutating action: proof that
+// this [remediate.Operation] against this [remediate.Target] at this observed cluster
+// state was explicitly allowed, and that every condition in the package doc held when
+// the gate checked. It is the ONLY thing an executor may act on.
+//
+// "Explicitly allowed" is normally a named human. It is a configured policy when the
+// autonomous-mode bypass is on, and the two are never conflated: [Authorization.Authority]
+// says which, [Authorization.Approver] returns a marker rather than a login for the
+// second, and every renderer in this package asks the authority before it names anybody.
 //
 // # It cannot be forged outside this package
 //
@@ -49,6 +111,7 @@ type Authorization struct {
 	// built by any other package is invalid by construction.
 	granted bool
 
+	authority     Authority
 	identity      remediate.ProposalIdentity
 	cluster       string
 	operation     remediate.Operation
@@ -61,14 +124,22 @@ type Authorization struct {
 	ref           ActionRef
 }
 
-// grant builds a valid Authorization. It is unexported on purpose: this function
-// is the single place in MaKlaude where permission to mutate a cluster comes into
-// existence, and it is called from exactly one place — the authorize branch of
-// [Decide], after every condition has been checked.
-func grant(req Request, pending PendingAction, now time.Time) *Authorization {
+// grant builds a valid Authorization on the given authority. It is unexported on
+// purpose: this function is the single place in MaKlaude where permission to mutate a
+// cluster comes into existence, and it is called from exactly one place — the
+// authorize branch of [Decide], after every condition has been checked.
+//
+// The authority is passed in rather than derived here because deciding it requires
+// facts [Decide] holds and this function does not: whether the bypass is on, and
+// whether the label event that reached the artifact was attributable to somebody other
+// than MaKlaude. Deriving it from `pending` alone would have to guess, and the guess
+// that fails safe ("assume policy") would understate a real human approval on every
+// pass.
+func grant(req Request, pending PendingAction, authority Authority, now time.Time) *Authorization {
 	p := req.Proposal
-	return &Authorization{
+	a := &Authorization{
 		granted:       true,
+		authority:     authority,
 		identity:      p.Identity,
 		cluster:       p.Cluster,
 		operation:     p.Operation,
@@ -80,6 +151,16 @@ func grant(req Request, pending PendingAction, now time.Time) *Authorization {
 		authorizedAt:  now,
 		ref:           pending.Ref,
 	}
+	if authority != AuthorityHuman {
+		// Nobody decided this, so there is no login to name and no decision instant to
+		// record. Both are overwritten rather than merely left alone: an artifact the
+		// bypass acted on may still carry a label event — MaKlaude's own, or one whose
+		// actor could not be told apart from MaKlaude's — and carrying that login
+		// forward would put a person's name on an authorization they did not give.
+		a.approver = AutoApprovePolicy
+		a.approvedAt = time.Time{}
+	}
+	return a
 }
 
 // Valid reports whether this is a real authorization issued by the gate. A nil
@@ -164,9 +245,24 @@ func (a *Authorization) Preconditions() []remediate.Precondition {
 	return append([]remediate.Precondition(nil), a.preconditions...)
 }
 
-// Approver returns the login of the human who approved the action. It is never
-// empty on a valid authorization: an unattributed approval is refused rather than
-// granted (see [ReasonUnattributedApproval]).
+// Authority returns the KIND of authority this permission slip rests on, which every
+// consumer that names an approver must consult before it names one. An invalid or nil
+// authorization reports [AuthorityNone].
+func (a *Authorization) Authority() Authority {
+	if !a.Valid() {
+		return AuthorityNone
+	}
+	return a.authority
+}
+
+// Approver returns who allowed the action: the login of the human who approved it
+// under [AuthorityHuman], or [AutoApprovePolicy] — a policy marker that cannot be a
+// login — under [AuthorityPolicy].
+//
+// It is never empty on a valid authorization: an unattributed approval is refused
+// rather than granted (see [ReasonUnattributedApproval]), and a waived one names the
+// policy. So a caller can render it unconditionally; what a caller must NOT do is
+// render it as a person without first asking [Authorization.Authority].
 func (a *Authorization) Approver() string {
 	if !a.Valid() {
 		return ""
@@ -176,6 +272,11 @@ func (a *Authorization) Approver() string {
 
 // ApprovedAt returns when the human recorded the approval, from the artifact's
 // label event.
+//
+// It is the zero time under [AuthorityPolicy], because no decision was made and
+// stamping one would assert an instant that never happened. Renderers drop the clause
+// rather than printing a zero timestamp; see [audit.stampedPhrase], which exists for
+// exactly this case.
 func (a *Authorization) ApprovedAt() time.Time {
 	if !a.Valid() {
 		return time.Time{}
@@ -206,9 +307,18 @@ func (a *Authorization) Ref() ActionRef {
 // String renders a compact, log-friendly audit line. An invalid authorization
 // renders as such rather than as an empty-looking valid one, so a log never
 // suggests a grant that does not exist.
+//
+// A policy-waived grant renders differently and says so in capitals. This line is what
+// ends up in process logs, where nobody has the struct to inspect and nobody is
+// reading carefully — so the one fact that must survive being skimmed is that no
+// person reviewed the action.
 func (a *Authorization) String() string {
 	if !a.Valid() {
 		return "authorization: INVALID (not granted by the approval gate)"
+	}
+	if !a.authority.HumanReviewed() {
+		return fmt.Sprintf("authorization: %s on cluster %s target %s rv=%s AUTO-APPROVED by %s — NO HUMAN REVIEWED THIS",
+			a.operation, a.cluster, a.target.String(), a.target.ResourceVersion, a.approver)
 	}
 	return fmt.Sprintf("authorization: %s on cluster %s target %s rv=%s approved by %s at %s",
 		a.operation, a.cluster, a.target.String(), a.target.ResourceVersion,

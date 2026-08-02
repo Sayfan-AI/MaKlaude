@@ -18,6 +18,8 @@ Treat the well-known "multi-agent Kubernetes DevOps" pattern (a coordinator dele
 
 Full operator and architecture docs live in [`docs/`](docs/index.md). Start with [`docs/index.md`](docs/index.md) for the doc map and a suggested reading order.
 
+**Safety posture, stated accurately.** MaKlaude's observation path never mutates a cluster — that part is unconditional and proven four ways ([no-writes guarantee](docs/no-writes.md)). Every *mutating* action is gated on an explicit, attributable human approval **by default**, and there is exactly one supported way out of that gate: an operator deliberately setting `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE=1`, which waives the requirement for consent and nothing else, and records every action it waives as unreviewed in the artifact, the chat notice, the process log, and the audit trail. See [Approval gate & autonomous mode](#approval-gate--autonomous-mode) and [`docs/autonomous-mode.md`](docs/autonomous-mode.md).
+
 
 ## Architecture posture — deterministic product, AI dev system
 
@@ -177,8 +179,11 @@ ongoing incident yields the same identity every cycle):
   complete and self-explanatory.
 - **`needs:human` gating.** Warning- and critical-severity incidents are labelled
   `needs:human` (in addition to the `maklaude` management label) to flag that a
-  decision is wanted. Info-level incidents are recorded but not gated. MaKlaude
-  never takes a mutating action on a cluster — escalation is purely informational.
+  decision is wanted. Info-level incidents are recorded but not gated. **The
+  escalation trail itself is purely informational** — it never proposes or performs
+  a mutating action, and its issue bodies never claim MaKlaude will change anything.
+  Mutating actions live on a separate trail behind the approval gate; see
+  [Approval gate & autonomous mode](#approval-gate--autonomous-mode).
 - **Restart-safe.** Each issue embeds its incident identity in a hidden marker
   (`<!-- maklaude:identity=… -->`). The escalator rediscovers which open issue
   maps to which incident by listing issues, so it stays correct even if the
@@ -212,6 +217,69 @@ sits behind the small `escalate.IssueSink` interface, so the interesting logic
 is exhaustively unit-tested with a fake in-memory sink. The package touches
 GitHub and **never** a Kubernetes cluster, keeping MaKlaude's read-only safety
 boundary intact.
+
+## Approval gate & autonomous mode
+
+Mutating actions do not travel on the escalation trail. They get their own
+artifact — a `maklaude-proposal` issue carrying the exact operation, the target,
+the dry-run preview, the reversibility class and rollback plan, the diagnosis
+behind it, and the preconditions that will be re-checked — and nothing runs until
+that artifact carries an `approved` label. The signal is a **label event**, not
+prose, because GitHub records who applied it and when, from an identity MaKlaude
+cannot forge and did not supply.
+
+An approval is scope-bound and single-use: it covers one operation, on one object,
+at one observed `resourceVersion`, once. It stops applying if the object moves, if
+the artifact is refreshed with a newer preview after the approval, if it goes
+stale, or if the problem clears on its own — in which case the request is withdrawn
+**without running anything**. A pending approval is not a queued job. The gate lives
+in [`internal/approve`](internal/approve); it holds no cluster client and cannot
+execute what it authorizes.
+
+### Autonomous mode (dangerous, off by default)
+
+An operator who has watched MaKlaude propose actions for a while and wants the loop
+to close unattended can waive the human requirement:
+
+```bash
+export MAKLAUDE_DANGEROUSLY_AUTO_APPROVE=1
+```
+
+It is named the way it is on purpose. It waives **consent and nothing else** — a
+human's `rejected` label still stops the action, `resourceVersion` drift still
+refuses, a failed dry-run still blocks, the executed-label idempotency flag still
+holds across restarts, preconditions are still re-checked against a fresh cluster
+read immediately before the action, and the write-path kill switch
+(`kube.ExecuteMode`) is a separate gate that must open independently: auto-approval
+while the executor is in dry-run produces an unattended *rehearsal*, not a change.
+
+It never fakes a human. An auto-approved action's permission slip carries a policy
+marker rather than a login, and the artifact, the chat notice, the process log, and
+the audit trail each say **"no human reviewed this"** in those words. A trail that
+overstates human involvement is worse than no trail.
+
+Values are strict: `1`/`true` on, `0`/`false`/unset off, and **anything else is a
+fatal startup error** rather than a guess — the lazy "non-empty is truthy" parse
+would turn `=no` into an armed autonomous mode set by somebody trying to disable it.
+
+### `MAKLAUDE_GITHUB_SELF_LOGIN` is required when the gate is on
+
+The gate's self-approval defense needs to know which account MaKlaude *is*.
+
+| Variable | Description |
+| -------------------------------- | ---------------------------------------------------------- |
+| `MAKLAUDE_GITHUB_SELF_LOGIN`     | The login MaKlaude's `MAKLAUDE_GITHUB_TOKEN` belongs to, so a decision label it applied to its own artifact is recognized and refused. **Required** when a live comms trail is configured and `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE` is off. |
+| `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE` | Waives the human approval requirement. Off unless set to `1` or `true`. |
+
+Starting a live gate with neither set is a **fatal error**, not a warning. Without
+the login, MaKlaude running under a person's own token cannot tell its own label
+events from a human's — so the gate would look armed and quietly approve everything
+MaKlaude asked for, with nothing in the trail saying otherwise. Either name the
+identity or say out loud that no approval promise is being made; the silent middle
+is what this refuses.
+
+Full detail, including the exact list of what the bypass gives up:
+**[docs/autonomous-mode.md](docs/autonomous-mode.md)**.
 
 ## Cluster configuration
 
