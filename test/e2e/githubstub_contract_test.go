@@ -19,6 +19,7 @@ import (
 	"context"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/approve"
 	"github.com/Sayfan-AI/MaKlaude/internal/escalate"
@@ -138,6 +139,81 @@ func TestStubTrailSatisfiesTheLiveSink(t *testing.T) {
 
 	if n := stub.unauthorizedCount(); n != 0 {
 		t.Errorf("%d request(s) arrived without the bearer token", n)
+	}
+}
+
+// TestStubTrailDecisionsCannotPredateTheArtifactTheyDecide pins the one property of the
+// stub's clock that the gate reads as a safety signal.
+//
+// approve.Body stamps a preview instant from the REAL clock the binary runs on, and
+// disqualify refuses an approval recorded before it (approve.ReasonApprovalPredatesPreview)
+// because such a decision is consent to a body that has since been replaced. The stub
+// invents its own timestamps for label events, so if that invented clock sits behind the
+// real one, every simulated human approval predates the artifact it is deciding and the
+// gate correctly refuses all of them — forever, on a wedge that no re-approval can clear.
+//
+// That is not a hypothetical: the first version of this stub anchored its clock one minute
+// in the past, and TestE2E_BinaryTwoPassGatedRemediation could not authorize anything.
+// The property is cheap to state and needs no cluster, so it is stated here rather than
+// discovered again as a six-minute red e2e whose cause is in a different file.
+func TestStubTrailDecisionsCannotPredateTheArtifactTheyDecide(t *testing.T) {
+	const (
+		self     = "stub-clock-bot"
+		human    = "stub-clock-operator"
+		identity = "clock-identity-1"
+	)
+	ctx := context.Background()
+	stub := newGitHubStub(t, "owner", "repo", "clock-token", self)
+
+	sink, ok := approve.NewGitHubSink(escalate.GitHubConfig{
+		Owner: "owner", Repo: "repo", Token: "clock-token", APIBase: stub.apiBase(),
+	}, self)
+	if !ok {
+		t.Fatal("NewGitHubSink refused a configured config")
+	}
+
+	// The instant approve.Body would stamp, at the precision the marker round-trips at:
+	// RFC3339 is second-resolution, and the gate compares the parsed values, so the
+	// comparison this test makes is exactly the comparison disqualify makes.
+	previewedAt := time.Now().UTC().Truncate(time.Second)
+	body := "Rollback of deployment/ns/thing.\n\n" +
+		"<!-- maklaude:proposal=" + identity + " -->\n" +
+		"<!-- maklaude:preview=4242@" + previewedAt.Format(time.RFC3339) + " -->\n"
+
+	ref, err := sink.Create(ctx, "[APPROVAL] clock", body, []string{approve.ManagedLabel})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// A person approves AFTER the artifact was rendered — the only ordering a real
+	// approval can have, since the human reads the body before deciding.
+	stub.decideAs(t, issueNumber(t, ref), approve.ApprovedLabel, human)
+
+	pending := soleOpen(ctx, t, sink)
+	if !pending.PreviewedAt.Equal(previewedAt) {
+		t.Fatalf("the sink recovered preview instant %s, want %s — the marker written here is not the one it parses",
+			pending.PreviewedAt, previewedAt)
+	}
+	if pending.DecidedAt.Before(pending.PreviewedAt) {
+		t.Fatalf("the stub stamped a decision at %s against an artifact previewed at %s (%s earlier). "+
+			"approve.disqualify refuses that as ReasonApprovalPredatesPreview, so no simulated approval in this "+
+			"package can ever authorize an action",
+			pending.DecidedAt, pending.PreviewedAt, pending.PreviewedAt.Sub(pending.DecidedAt))
+	}
+
+	// The other half of the clock's contract, which the ordering fix must not break:
+	// distinct events get distinct, increasing timestamps at the resolution the wire
+	// format carries. Equal stamps would make "which approval currently stands" depend on
+	// something other than the order the events happened in.
+	if err := sink.RemoveLabel(ctx, ref, approve.ApprovedLabel); err != nil {
+		t.Fatalf("RemoveLabel: %v", err)
+	}
+	stub.decideAs(t, issueNumber(t, ref), approve.ApprovedLabel, human)
+	reDecided := soleOpen(ctx, t, sink)
+	if !reDecided.DecidedAt.After(pending.DecidedAt) {
+		t.Errorf("a re-application stamped %s, which is not after the first decision at %s; "+
+			"the stub's timestamps must strictly increase",
+			reDecided.DecidedAt, pending.DecidedAt)
 	}
 }
 

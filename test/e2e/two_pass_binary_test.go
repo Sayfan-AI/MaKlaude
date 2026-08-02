@@ -382,6 +382,13 @@ func runApprovedPass(t *testing.T, bin, cfgPath string, passEnv []string, stub *
 	identity string, artifact int, previewed map[string]bool) approvedPass {
 	t.Helper()
 
+	// lastExplanation is the gate's OWN account of why the most recent cycle did not
+	// authorize. It is carried out of the loop because the report says only that a
+	// refusal happened, while the reason is posted on the artifact — so a loop that
+	// recovers without reading it can do nothing but guess, and the guess is what gets
+	// printed when the loop finally gives up.
+	lastExplanation := "no explanation was recorded on the artifact"
+
 	for cycle := 1; cycle <= binaryApprovalCycles; cycle++ {
 		stub.decideAs(t, artifact, approve.ApprovedLabel, binaryApprover)
 
@@ -409,6 +416,7 @@ func runApprovedPass(t *testing.T, bin, cfgPath string, passEnv []string, stub *
 
 		case len(mine) == 1 && mine[0].CleanAbort:
 			// The target moved between the preview and the send. Re-propose and re-approve.
+			lastExplanation = "the executor aborted cleanly: " + mine[0].Failure
 			t.Logf("%s aborted cleanly (%s); the target moved, so re-approving against the state that exists now",
 				label, mine[0].Failure)
 
@@ -423,9 +431,14 @@ func runApprovedPass(t *testing.T, bin, cfgPath string, passEnv []string, stub *
 				label, cr.Gate.Authorized)
 
 		default:
-			// Refused or refreshed without authorizing: drift caught one layer earlier,
-			// at the gate rather than at the executor. Same recovery.
-			t.Logf("%s did not authorize (gate %+v); the preview was superseded, so re-approving", label, cr.Gate)
+			// Refused or refreshed without authorizing: something was caught one layer
+			// earlier, at the gate rather than at the executor. Same recovery — but the
+			// reason is READ off the artifact rather than assumed. Drift is only one of the
+			// things this branch can mean, and a refusal the harness itself causes (a stale
+			// simulated approval, say) looks identical from the report alone.
+			lastExplanation = latestComment(t, stub, artifact)
+			t.Logf("%s did not authorize (gate %+v), so re-approving. The gate's own explanation:\n%s",
+				label, cr.Gate, lastExplanation)
 		}
 
 		// The refusal withdrew the label; the next cycle re-applies it. Re-confirm the
@@ -437,9 +450,20 @@ func runApprovedPass(t *testing.T, bin, cfgPath string, passEnv []string, stub *
 		}
 	}
 
-	t.Fatalf("the approved rollback of %s/%s did not execute within %d cycles",
-		e2eNamespace, stuckDeploy, binaryApprovalCycles)
+	t.Fatalf("the approved rollback of %s/%s did not execute within %d cycles. The last cycle's reason was:\n%s",
+		e2eNamespace, stuckDeploy, binaryApprovalCycles, lastExplanation)
 	return approvedPass{}
+}
+
+// latestComment returns the most recent comment on an artifact, which after a
+// non-authorizing pass is the refusal the gate just posted.
+func latestComment(t *testing.T, stub *githubStub, artifact int) string {
+	t.Helper()
+	snap := stub.snapshotIssue(t, artifact)
+	if len(snap.comments) == 0 {
+		return "(the artifact carries no comments)"
+	}
+	return snap.comments[len(snap.comments)-1]
 }
 
 // --- Assertions on a pass. ---

@@ -112,12 +112,9 @@ type githubStub struct {
 	next   int
 	issues map[int]*stubIssue
 
-	// clock hands out strictly increasing timestamps. Real GitHub events are ordered,
-	// and approve.GitHubSink relies on it: later events overwrite earlier ones for the
-	// same label, so a stub that stamped two events identically would make "which
-	// approval currently stands" depend on map iteration order.
-	clockBase time.Time
-	tick      int
+	// lastStamp is the most recent timestamp handed out. See now() for the two
+	// properties it enforces and why both are load-bearing.
+	lastStamp time.Time
 
 	// unauthorized counts requests that arrived without the expected bearer token. The
 	// test asserts it is zero — a stub that answered unauthenticated requests would
@@ -135,7 +132,6 @@ func newGitHubStub(t *testing.T, owner, repo, token, selfLogin string) *githubSt
 		selfLogin: selfLogin,
 		next:      1,
 		issues:    map[int]*stubIssue{},
-		clockBase: time.Now().UTC().Add(-time.Minute),
 	}
 	s.srv = httptest.NewServer(http.HandlerFunc(s.serve))
 	t.Cleanup(s.srv.Close)
@@ -145,10 +141,32 @@ func newGitHubStub(t *testing.T, owner, repo, token, selfLogin string) *githubSt
 // apiBase is the value MAKLAUDE_GITHUB_API is set to.
 func (s *githubStub) apiBase() string { return s.srv.URL }
 
-// now returns the next distinct timestamp. Caller holds the lock.
+// now returns the timestamp for the next event. Caller holds the lock.
+//
+// It enforces two properties, and dropping either one breaks a different thing:
+//
+//   - It never runs BEHIND the real clock. approve.Body stamps its preview instant from
+//     the binary's own time.Now, and approve.disqualify refuses an approval recorded
+//     before the body it decides (ReasonApprovalPredatesPreview). An invented clock
+//     sitting in the past therefore makes every simulated approval a stale one, and no
+//     amount of re-approving clears it — the gate is right and the harness is lying about
+//     when the human decided. TestStubTrailDecisionsCannotPredateTheArtifactTheyDecide
+//     holds this, because the symptom (a two-pass test that refuses four times and gives
+//     up) points nowhere near the clock.
+//   - It strictly increases, at whole-second resolution. Real GitHub timestamps are
+//     RFC3339 with no sub-second part and listEvents serializes them that way, so two
+//     events stamped within the same second would arrive indistinguishable. Running the
+//     stamp AHEAD of real time when events come in faster than one per second is the
+//     right direction to fail: a decision in the near future still postdates every
+//     artifact rendered before it, and nothing in the gate refuses a decision for being
+//     recent.
 func (s *githubStub) now() time.Time {
-	s.tick++
-	return s.clockBase.Add(time.Duration(s.tick) * time.Second)
+	t := time.Now().UTC().Truncate(time.Second)
+	if !t.After(s.lastStamp) {
+		t = s.lastStamp.Add(time.Second)
+	}
+	s.lastStamp = t
+	return t
 }
 
 func (s *githubStub) serve(w http.ResponseWriter, r *http.Request) {
