@@ -373,9 +373,18 @@ func (s *githubStub) removeLabel(w http.ResponseWriter, issue *stubIssue, label 
 func (s *githubStub) listEvents(w http.ResponseWriter, issue *stubIssue) {
 	out := make([]map[string]any, 0, len(issue.events))
 	for _, ev := range issue.events {
+		// An actorless event is serialised as a JSON null, not as an object with empty
+		// strings in it. That is the shape api.github.com actually returns when the
+		// account behind an event is deleted or anonymised, and it is the shape
+		// approve.GitHubSink's `ev.Actor != nil` branch exists to survive — an
+		// {"login":""} object would take the other branch and prove the wrong thing.
+		var actor any
+		if ev.actor != "" {
+			actor = map[string]any{"login": ev.actor, "type": ev.actorType}
+		}
 		out = append(out, map[string]any{
 			"event":      ev.kind,
-			"actor":      map[string]any{"login": ev.actor, "type": ev.actorType},
+			"actor":      actor,
 			"label":      map[string]any{"name": ev.label},
 			"created_at": ev.createdAt.Format(time.RFC3339),
 		})
@@ -436,6 +445,26 @@ func (s *githubStub) decideAs(t *testing.T, number int, label, login string) {
 		t.Fatalf("stub trail: no issue #%d to label %q", number, label)
 	}
 	s.applyLabel(issue, label, login, "User")
+}
+
+// decideAsNobody applies a decision label whose `labeled` event names no actor at
+// all.
+//
+// This is not a malformed event: GitHub serves `"actor": null` on the timeline once
+// the account behind an entry is deleted or anonymised, so a label really can arrive
+// with a valid timestamp and no recoverable identity. The gate's contract is that such
+// an approval is refused rather than honoured anonymously
+// ([approve.ReasonUnattributedApproval]) — an approval nobody can be named for defeats
+// the reason the signal is a label EVENT rather than the label alone.
+func (s *githubStub) decideAsNobody(t *testing.T, number int, label string) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	issue, ok := s.issues[number]
+	if !ok {
+		t.Fatalf("stub trail: no issue #%d to label %q", number, label)
+	}
+	s.applyLabel(issue, label, "", "")
 }
 
 // snapshotIssue copies one artifact out for assertions.

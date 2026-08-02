@@ -20,18 +20,25 @@
 //
 // # The shape
 //
-// Four things, in order, all against one seeded fault (`stuck`, a Deployment wedged on
+// Six things, in order, all against one seeded fault (`stuck`, a Deployment wedged on
 // an unpullable image — see manifests/stuck-deploy.yaml for why it is a second fault
-// rather than a shared one):
+// rather than a shared one). Three of the five passes are negative, which is the
+// deliberate ratio: a test that only proves approved actions execute is the half of the
+// test that would still pass with the gate deleted.
 //
 //	Pass 1 — `maklaude remediate` with the kill switch ARMED (MAKLAUDE_EXECUTE_MODE
 //	         =enabled). It must propose, open an artifact, and change NOTHING. An
 //	         artifact with no decision on it is never consent.
-//	Pass 2 — the NEGATIVE CONTROL, and the subtle one. The approval label is recorded
-//	         attributed to MAKLAUDE_GITHUB_SELF_LOGIN — MaKlaude approving itself. The
-//	         run must refuse it and change nothing. #124 closed this hole with unit
-//	         coverage; nothing until now proved it closed through the binary.
-//	Pass 3 — the approval label attributed to a login that is NOT the self login: a
+//	Pass 2 — NEGATIVE CONTROL: self-approval. The approval label is recorded attributed
+//	         to MAKLAUDE_GITHUB_SELF_LOGIN — MaKlaude approving itself. The run must
+//	         refuse it and change nothing. #124 closed this hole with unit coverage;
+//	         nothing until now proved it closed through the binary.
+//	Pass 3 — NEGATIVE CONTROL: no decision at all, over an artifact that already exists.
+//	         Distinct from pass 1, which had no artifact to recover a decision from.
+//	Pass 4 — NEGATIVE CONTROL: an approval whose `labeled` event names no actor. Refused
+//	         as unattributable — `isSelfActor("")` is false, so pass 2's check does not
+//	         cover this one.
+//	Pass 5 — the approval label attributed to a login that is NOT the self login: a
 //	         person. Exactly one mutation lands, the cluster converges on an
 //	         independent re-scan, and the trail reads proposed → approved → executed →
 //	         verified with the approver named.
@@ -101,13 +108,13 @@ const (
 	binarySelfLogin = "maklaude-e2e-binary-bot"
 
 	// binaryApprover is the person. It is provably not binarySelfLogin, which is what
-	// makes pass 3 an approval and pass 2 a forgery.
+	// makes pass 5 an approval and pass 2 a forgery.
 	binaryApprover = "maklaude-e2e-binary-operator"
 
 	// binaryCluster is the registry name in the config file handed to the binary.
 	binaryCluster = "maklaude-e2e-binary"
 
-	// binaryApprovalCycles bounds how many times pass 3 is re-driven when the target
+	// binaryApprovalCycles bounds how many times pass 5 is re-driven when the target
 	// moves underneath it. A wedged Deployment's resourceVersion legitimately advances
 	// between the preview a human saw and the moment the write would be sent, and every
 	// layer is built to notice that and abandon cleanly; re-proposing against the state
@@ -126,11 +133,19 @@ const (
 	// than the whole of it so a reworded explanation does not fail the test, but it is
 	// specific enough that no other refusal reason produces it.
 	selfApprovalRefusalMarker = "applied by MaKlaude's own account"
+
+	// unattributedRefusalMarker is the same idea for approve.ReasonUnattributedApproval.
+	// It is what makes pass 4 a control rather than an observation: disqualify() checks
+	// attribution BEFORE drift (reconcile.go:209 precedes :218), so an unattributed
+	// approval that was refused for drift instead would mean the attribution check no
+	// longer runs — and a refusal count alone cannot tell those apart.
+	unattributedRefusalMarker = "cannot attribute to a person"
 )
 
 // TestE2E_BinaryTwoPassGatedRemediation drives `maklaude remediate` through the full
-// gated cycle across three separate processes: propose, refuse a self-approval, then
-// execute exactly what a person approved.
+// gated cycle across five separate processes: propose, refuse a self-approval, refuse
+// to act on an undecided artifact, refuse an unattributable approval, then execute
+// exactly what a person approved.
 func TestE2E_BinaryTwoPassGatedRemediation(t *testing.T) {
 	bin := buildMaklaudeBinary(t)
 	stub := newGitHubStub(t, binaryTrailOwner, binaryTrailRepo, binaryTrailToken, binarySelfLogin)
@@ -209,11 +224,68 @@ func TestE2E_BinaryTwoPassGatedRemediation(t *testing.T) {
 	}
 	t.Logf("pass 2: the self-applied approval was refused as a self-approval and withdrawn, and the cluster is untouched")
 
-	// --- Pass 3: a person approves, and exactly that action runs. ---
+	// --- Pass 3: the artifact exists, is pending, and carries no decision. Nothing runs. ---
+	//
+	// This is the control that would survive the gate being deleted outright, and it is
+	// NOT the same assertion pass 1 makes. Pass 1 had no artifact, so "nothing executed"
+	// there is satisfied by the ReasonNewProposal branch, which never consults a label.
+	// Here the artifact is on the trail and pass 2 just withdrew its label, so the gate
+	// has to re-derive "undecided" from the labels-plus-events it recovers — the same
+	// code path that says "approved", reached with the opposite answer. A sink that
+	// mistook the existence of a pending artifact for consent would pass pass 1 and
+	// fail only here.
+	p3 := runRemediatePass(t, bin, cfgPath, passEnv, "pass 3 (pending, undecided)")
+	assertLiveArmedPass(t, p3, "pass 3")
+	collectProposedTargets(p3, previewed)
+	assertNothingExecuted(t, p3, "pass 3")
+	if p3.Clusters[0].Gate.Authorized != 0 {
+		t.Fatalf("GATE BYPASS: pass 3 authorized %d action(s) on an artifact carrying no decision label at all",
+			p3.Clusters[0].Gate.Authorized)
+	}
+	if afterP3 := stub.snapshotIssue(t, artifact); afterP3.hasLabel(approve.ApprovedLabel) {
+		t.Errorf("pass 3 put %q back on artifact #%d; nobody applied it", approve.ApprovedLabel, artifact)
+	}
+	assertStuckUnchanged(t, reader, before, "pass 3 ran against an undecided artifact; an undecided proposal authorizes nothing")
+	t.Logf("pass 3: an existing pending artifact with no decision authorized nothing, and the cluster is untouched")
+
+	// --- Pass 4: an approval nobody can be named for. The gate refuses. ---
+	//
+	// The label is real and its timestamp is fine; only the identity is gone. That is a
+	// state GitHub genuinely serves (see decideAsNobody), and it is the one an
+	// attribution check exists for: `isSelfActor("")` is false, so the self-approval
+	// check of pass 2 does not catch this one.
+	stub.decideAsNobody(t, artifact, approve.ApprovedLabel)
+	p4 := runRemediatePass(t, bin, cfgPath, passEnv, "pass 4 (unattributed approval)")
+	assertLiveArmedPass(t, p4, "pass 4")
+	collectProposedTargets(p4, previewed)
+	assertNothingExecuted(t, p4, "pass 4")
+	if p4.Clusters[0].Gate.Authorized != 0 {
+		t.Fatalf("UNATTRIBUTED APPROVAL HONORED: pass 4 authorized %d action(s) from a label with no identifiable approver",
+			p4.Clusters[0].Gate.Authorized)
+	}
+	if p4.Clusters[0].Gate.Refused < 1 {
+		t.Errorf("pass 4 recorded %d refusal(s), want at least 1 — an unattributable approval must be refused explicitly, not merely ignored",
+			p4.Clusters[0].Gate.Refused)
+	}
+	afterP4 := stub.snapshotIssue(t, artifact)
+	if afterP4.hasLabel(approve.ApprovedLabel) {
+		t.Errorf("after refusing the unattributed approval the gate left %q on artifact #%d; a refused decision must be withdrawn",
+			approve.ApprovedLabel, artifact)
+	}
+	if !strings.Contains(strings.Join(afterP4.comments, "\n"), unattributedRefusalMarker) {
+		t.Errorf("UNATTRIBUTED-APPROVAL HOLE: pass 4's refusal on artifact #%d never says the approver could not be named; "+
+			"it was refused for some other reason and the attribution check is unproven.\n%s",
+			artifact, strings.Join(afterP4.comments, "\n---\n"))
+	}
+	assertStuckUnchanged(t, reader, before,
+		"pass 4's approval named nobody; the attribution refusal must have stopped it")
+	t.Logf("pass 4: an approval with no identifiable actor was refused as unattributable and withdrawn, and the cluster is untouched")
+
+	// --- Pass 5: a person approves, and exactly that action runs. ---
 	done := runApprovedPass(t, bin, cfgPath, passEnv, stub, identity, artifact, previewed)
 
 	if !done.exec.Executed {
-		t.Fatalf("pass 3's execution did not apply: %+v", done.exec)
+		t.Fatalf("pass 5's execution did not apply: %+v", done.exec)
 	}
 	if done.exec.Approver != binaryApprover {
 		t.Errorf("the executed action names approver %q, want %q — the trail must carry the person who decided",
@@ -228,7 +300,7 @@ func TestE2E_BinaryTwoPassGatedRemediation(t *testing.T) {
 			done.exec.Attempts)
 	}
 	if done.report.Clusters[0].Gate.Authorized != 1 {
-		t.Errorf("pass 3 authorized %d action(s), want exactly 1", done.report.Clusters[0].Gate.Authorized)
+		t.Errorf("pass 5 authorized %d action(s), want exactly 1", done.report.Clusters[0].Gate.Authorized)
 	}
 	// "we looked and it had not happened yet" is a verdict the independent re-scan below
 	// settles, and a slow CI runner is entitled to produce it. "we could not look at all"
@@ -237,7 +309,7 @@ func TestE2E_BinaryTwoPassGatedRemediation(t *testing.T) {
 	if done.exec.Convergence == execute.ConvergenceUnobservable.String() {
 		t.Errorf("the binary could not observe the cluster at all after executing: %+v", done.exec)
 	}
-	t.Logf("pass 3: %s on %s executed under %s authority from %q — convergence %q",
+	t.Logf("pass 5: %s on %s executed under %s authority from %q — convergence %q",
 		done.exec.Operation, done.exec.Target, done.exec.Authority, done.exec.Approver,
 		done.exec.Convergence)
 
@@ -392,7 +464,7 @@ func runApprovedPass(t *testing.T, bin, cfgPath string, passEnv []string, stub *
 	for cycle := 1; cycle <= binaryApprovalCycles; cycle++ {
 		stub.decideAs(t, artifact, approve.ApprovedLabel, binaryApprover)
 
-		label := fmt.Sprintf("pass 3 (human approval, cycle %d/%d)", cycle, binaryApprovalCycles)
+		label := fmt.Sprintf("pass 5 (human approval, cycle %d/%d)", cycle, binaryApprovalCycles)
 		report := runRemediatePass(t, bin, cfgPath, passEnv, label)
 		assertLiveArmedPass(t, report, label)
 		collectProposedTargets(report, previewed)

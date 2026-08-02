@@ -217,6 +217,67 @@ func TestStubTrailDecisionsCannotPredateTheArtifactTheyDecide(t *testing.T) {
 	}
 }
 
+// TestStubTrailServesAnActorlessDecisionAsUnattributed pins the precondition that
+// pass 4 of TestE2E_BinaryTwoPassGatedRemediation depends on and cannot itself
+// distinguish.
+//
+// That pass asserts the gate REFUSES an approval nobody can be named for. But a refusal
+// is also what the gate produces when it never saw the approval at all, so if the stub
+// served an actorless event in a shape the sink drops on the floor, pass 4 would go
+// green against a gate that was never asked the question. The fact under test is
+// therefore not the refusal but the input to it: the artifact must read as APPROVED with
+// an EMPTY approver — approved, so disqualify() is reached, and unnamed, so it reaches
+// ReasonUnattributedApproval rather than authorizing.
+//
+// It also pins the branch: an empty login must not be mistaken for MaKlaude's own
+// (approve.isSelfActor returns false on ""), or the refusal would arrive under the wrong
+// reason and pass 4's comment assertion would fail a hundred lines from the cause.
+func TestStubTrailServesAnActorlessDecisionAsUnattributed(t *testing.T) {
+	const (
+		self     = "stub-actorless-bot"
+		identity = "actorless-identity-1"
+	)
+	ctx := context.Background()
+	stub := newGitHubStub(t, "owner", "repo", "actorless-token", self)
+
+	sink, ok := approve.NewGitHubSink(escalate.GitHubConfig{
+		Owner: "owner", Repo: "repo", Token: "actorless-token", APIBase: stub.apiBase(),
+	}, self)
+	if !ok {
+		t.Fatal("NewGitHubSink refused a configured config")
+	}
+
+	body := "Rollback of deployment/ns/thing.\n\n<!-- maklaude:proposal=" + identity + " -->\n"
+	ref, err := sink.Create(ctx, "[APPROVAL] actorless", body, []string{approve.ManagedLabel})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	stub.decideAsNobody(t, issueNumber(t, ref), approve.ApprovedLabel)
+
+	got := soleOpen(ctx, t, sink)
+	if got.State != approve.StateApproved {
+		t.Fatalf("an actorless approval label reads as %v, want approved — the gate must REACH the attribution "+
+			"check to refuse there, and an artifact that reads as pending never does", got.State)
+	}
+	if got.Approver != "" {
+		t.Errorf("recovered approver %q from an event serving `\"actor\": null`, want empty; "+
+			"approve.ReasonUnattributedApproval fires on an empty approver and nothing else", got.Approver)
+	}
+	if got.ApproverIsSelf {
+		t.Error("an actorless approval is being read as MaKlaude's own; it would be refused as a self-approval " +
+			"and the attribution check would stay unproven")
+	}
+	if got.DecidedAt.IsZero() {
+		t.Error("the actorless event carries no timestamp, so it is malformed in a second way and would not " +
+			"isolate the attribution check")
+	}
+
+	if n := stub.unauthorizedCount(); n != 0 {
+		t.Errorf("%d request(s) arrived without the bearer token", n)
+	}
+}
+
 // soleOpen requires exactly one open artifact and returns it.
 func soleOpen(ctx context.Context, t *testing.T, sink *approve.GitHubSink) approve.PendingAction {
 	t.Helper()
