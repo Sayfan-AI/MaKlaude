@@ -118,7 +118,11 @@ the separate trail mutating actions travel on.
 ## Next steps
 
 - [`docs/no-writes.md`](no-writes.md) — the documented, test-backed guarantee that
-  MaKlaude issues no mutating API calls.
+  the observation path issues no mutating API calls, and precisely what that
+  guarantee does and does not cover.
+- [`docs/remediation.md`](remediation.md) — the separate, opt-in write path: what
+  MaKlaude can fix once approved, and the five gates it has to pass first. Nothing
+  in this quickstart enables any of it.
 - [`docs/rbac.md`](rbac.md) — the full read-only access model and verification.
 - [`docs/slack.md`](slack.md) — optional Slack / ChatOps notifications; unset by
   default and degrades cleanly to GitHub + email with zero behavior change.

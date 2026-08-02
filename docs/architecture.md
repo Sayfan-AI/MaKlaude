@@ -23,6 +23,24 @@ The practical upshot for an operator: what runs against your clusters is determi
 
 `diagnose.Diagnose(snap, incident)` is a pure function: no I/O, no clock, no cluster access, no LLM. Given the same inputs it always returns the same ranked hypotheses in the same order. That is why the same code can back the unit tests, the `kind` e2e, and production unchanged. The read-only guarantee that wraps all of this is documented in [no-writes.md](no-writes.md) and [rbac.md](rbac.md).
 
+## The gated-write seam
+
+Milestone 4 added the ability to *act*, and it is a seam in the same sense the AI one is: a separate boundary with its own identity, its own client type, and its own gates, deliberately not an extension of the path above.
+
+| Stage | Package | What it does | Model in the path? | Can it change a cluster? |
+| ----- | ------- | ------------ | ------------------ | ------------------------ |
+| Propose | `internal/remediate` | Turn a diagnosed root cause into typed, previewable proposals by rule | No | No |
+| Approve | `internal/approve` | Publish a proposal and wait for an attributable decision | No | No |
+| Execute | `internal/execute` | Re-check preconditions, send exactly one request, watch for convergence | No | Yes |
+| Audit | `internal/audit` | Append one immutable record per lifecycle event | No | No |
+
+Two structural properties carry the safety, and both are about types rather than discipline:
+
+- **The write path is a sibling of the read path, not a mode of it.** `kube.Client` and `kube.Executor` build their `rest.Config`s through different functions that install different transport guards. The observation path's guard is unconditional and unparameterised, so nothing an operator does to enable execution — and no future refactor of the write path — can loosen it.
+- **Off by default means unreachable, not unset.** `kube.ExecuteMode`'s zero value is `disabled`, under which `kube.NewExecutor` refuses to build anything at all: a deployment that has not opted in holds no write-capable object. And as of today nothing in the binary constructs one — `maklaude` has `version` and `scan`, and no configuration surface reaches the executor.
+
+Beyond those, an action needs a separately-installed RBAC bundle bound to a separate ServiceAccount, an `approved` label event from an identity MaKlaude cannot forge, preconditions that still hold against a fresh read, and a matching `resourceVersion`. The seam stays deterministic throughout: proposals are computed by rule, and no model participates in deciding what to change or whether to change it. See [remediation.md](remediation.md).
+
 ## The one optional AI seam
 
 There is exactly one place a model can run at runtime: `internal/aidiagnose` (Milestone 3, T5). It can call a model to *refine* a diagnosis - sharpen a low-confidence hypothesis, or propose a cause the rules cannot express - for the cases the deterministic rules handle poorly. It is a strict, isolated safety boundary:

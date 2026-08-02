@@ -1,16 +1,32 @@
-# MaKlaude's no-writes guarantee
+# MaKlaude's no-writes guarantee — what it covers, and what it does not
 
-MaKlaude's foundational safety promise is simple: **its observation layer never
-mutates a cluster.** It reads health signals, detects problems, and escalates to
-humans — it does not create, update, patch, or delete anything in any cluster it
-watches. (Its only writes are to the *comms trail* — GitHub issues — and even
-those degrade to an in-memory dry-run unless GitHub is explicitly configured; see
-the [README](../README.md). No cluster is ever touched.)
+MaKlaude's foundational safety promise is precise, and the precision matters:
+**its observation layer never mutates a cluster.** The path that reads health
+signals, detects problems, diagnoses causes, and escalates to humans does not
+create, update, patch, or delete anything in any cluster it watches. That part is
+unconditional — no flag, mode, or configuration loosens it. (Its only writes are
+to the *comms trail* — GitHub issues — and even those degrade to an in-memory
+dry-run unless GitHub is explicitly configured; see the [README](../README.md).)
+
+**Since Milestone 4, MaKlaude as a whole is not read-only.** There is a second,
+opt-in write path with its own identity, its own client type, and its own
+transport guard, which exists to carry out remediation a human explicitly
+approved. It is off by default in the strongest available sense — the shipped
+binary contains no way to reach it — and it is separately gated on RBAC, an
+in-process kill switch, an attributable approval, and preconditions re-checked
+against a fresh read. [`remediation.md`](remediation.md) is the whole story;
+[`rbac.md`](rbac.md#the-optional-minimal-write-bundle) is the access model.
+
+So the accurate one-line posture is **"reads are guaranteed, writes are gated"**,
+not "nothing is ever touched". The distinction is the entire subject of this
+document: everything below is about the **observation identity**, and every layer
+of it still holds exactly as it did before the write path existed.
 
 This document explains how that promise is enforced and, crucially, **cites the
 exact code and tests that back each layer** so the guarantee stays verifiable
 rather than aspirational. The design is belt-and-suspenders: four independent
-layers would all have to fail before MaKlaude could mutate a cluster.
+layers would all have to fail before MaKlaude's observation path could mutate a
+cluster.
 
 > **The optional LLM-assisted diagnosis layer (T5) does not weaken this promise.**
 > When enabled (see the [README](../README.md#llm-assisted-diagnosis-optional-gated)),
@@ -132,7 +148,8 @@ the log is unavailable the check skips with a warning — layers 1–3 still hol
 > log will show you a `patch`.** Since Milestone 4 MaKlaude has a *second*
 > identity, `system:serviceaccount:maklaude:maklaude-executor`, which exists only
 > to carry out an action a human explicitly approved (see
-> [`docs/rbac.md`](rbac.md) for the access model and
+> [`docs/remediation.md`](remediation.md) for the whole gated-write story,
+> [`docs/rbac.md`](rbac.md) for the access model, and
 > [`docs/autonomous-mode.md`](autonomous-mode.md) for the one documented way the
 > approval requirement can be waived). The four layers above are about the
 > **observation** identity, and every one of them still holds: the write bundle is
