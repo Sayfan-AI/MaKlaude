@@ -75,6 +75,17 @@ jobs:
               bash .genesis/scripts/checkpoint.sh "what I intend to do, and why"
             If this run later dies at max-turns, that checkpoint is the only record
             of your reasoning a human gets. One turn, before the unbounded work.
+
+            Immediately BEFORE you merge a PR or close a task issue, re-check for
+            a human comment nothing has answered:
+              bash .genesis/scripts/issues.sh unanswered-comments
+            A comment attaching conditions to work in flight is part of that
+            work's done criteria — satisfy them, or say which you are not
+            satisfying and why, before merging. `issues.sh summary` prints the
+            same section every run, but a comment can land in the minutes
+            between the summary you read and the merge you make: on #141 that
+            window was 2m25s and two of three requested cases never shipped.
+            See #156.
           # 60, not 40: this is the only workflow that must BOTH assess full
           # project state AND complete a unit of work in the same run, and it is
           # the loop's last line of defence — the tick that picks up whatever the

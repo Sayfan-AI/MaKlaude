@@ -105,6 +105,17 @@ jobs:
               bash .genesis/scripts/checkpoint.sh "what I intend to do, and why"
             If this run later dies at max-turns, that checkpoint is the only record
             of your reasoning a human gets. One turn, before the unbounded work.
+
+            Immediately BEFORE you merge a PR or close a task issue, re-check for
+            a human comment nothing has answered:
+              bash .genesis/scripts/issues.sh unanswered-comments
+            A comment attaching conditions to work in flight is part of that
+            work's done criteria — satisfy them, or say which you are not
+            satisfying and why, before merging. `issues.sh summary` prints the
+            same section every run, but a comment can land in the minutes
+            between the summary you read and the merge you make: on #141 that
+            window was 2m25s and two of three requested cases never shipped.
+            See #156.
           # 60 is the orchestrator-class floor (#89, raised in #96): this runs
           # the same agent definition as the scheduled/events orchestrators, and
           # reading a failing run's logs then fixing on the PR branch is not
