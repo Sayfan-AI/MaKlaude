@@ -67,6 +67,7 @@ import (
 
 	"github.com/Sayfan-AI/MaKlaude/internal/approve"
 	"github.com/Sayfan-AI/MaKlaude/internal/audit"
+	"github.com/Sayfan-AI/MaKlaude/internal/budget"
 	"github.com/Sayfan-AI/MaKlaude/internal/cluster"
 	"github.com/Sayfan-AI/MaKlaude/internal/correlate"
 	"github.com/Sayfan-AI/MaKlaude/internal/detect"
@@ -121,6 +122,17 @@ type Cycle struct {
 	// is NOT an authorization policy; see [execute.Policy].
 	policy execute.Policy
 
+	// budget is the blast-radius ceiling on unattended actions: caps, cooldowns and the
+	// per-cluster circuit breaker. It is nil when autonomy has not been wired, which is
+	// the shipped posture, and a nil budget is not a permissive one — with no ceiling
+	// there is nothing to auto-apply through, so every proposal takes the human gate.
+	//
+	// The cycle owns the budget's pass lifecycle ([budget.Budget.Begin] in [Cycle.Run])
+	// rather than leaving it to a caller. A per-pass cap depends on somebody declaring
+	// where a pass starts, and a caller that forgot would get a cap that never refills
+	// or one that refills on every call; neither is a bound.
+	budget *budget.Budget
+
 	// live reports whether the approval gate is backed by a real comms system rather
 	// than the in-memory dry-run sink. Surfaced in the report because "nobody can
 	// approve anything" is a materially different posture from "waiting on a human".
@@ -141,6 +153,13 @@ func (c *Cycle) Run(ctx context.Context, reg *cluster.Registry) (*Report, error)
 		return nil, fmt.Errorf("operate: nil registry")
 	}
 
+	// One Run is one pass, which is the unit the per-cluster auto-apply cap is measured
+	// over. Beginning it here — before any cluster is touched, on the only path that
+	// runs a cycle — is what stops the cap depending on a caller remembering to say so.
+	if c.budget != nil {
+		c.budget.Begin()
+	}
+
 	report := &Report{
 		GeneratedAt: c.now().UTC(),
 		Mode:        c.mode.String(),
@@ -149,6 +168,8 @@ func (c *Cycle) Run(ctx context.Context, reg *cluster.Registry) (*Report, error)
 	for _, h := range reg.Handles() {
 		report.Clusters = append(report.Clusters, c.runCluster(ctx, h))
 	}
+	// Taken after the clusters have run, so the suppressions reported are this pass's.
+	report.Autonomy = autonomyReport(c.budget)
 	report.finalize()
 	return report, nil
 }
