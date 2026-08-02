@@ -136,8 +136,35 @@ type Authorization struct {
 // that fails safe ("assume policy") would understate a real human approval on every
 // pass.
 func grant(req Request, pending PendingAction, authority Authority, now time.Time) *Authorization {
+	approver, approvedAt := pending.Approver, pending.DecidedAt
+	if authority != AuthorityHuman {
+		// Nobody decided this, so there is no login to name and no decision instant to
+		// record. Both are overwritten rather than merely left alone: an artifact the
+		// bypass acted on may still carry a label event — MaKlaude's own, or one whose
+		// actor could not be told apart from MaKlaude's — and carrying that login
+		// forward would put a person's name on an authorization they did not give.
+		//
+		// The policy named here is the blanket bypass, because that is the only policy
+		// that reaches this path: [Decide] runs over artifacts on the approval trail, and
+		// an earned autonomy rule never opens one. A rule-specific grant is minted by
+		// [GrantAutonomous] instead, and it names the rule.
+		approver, approvedAt = AutoApprovePolicy, time.Time{}
+	}
+	return grantAs(req, authority, approver, approvedAt, pending.Ref, now)
+}
+
+// grantAs is the single constructor behind every valid [Authorization]: it sets the
+// unforgeable marker and copies the proposal's fields onto the slip.
+//
+// It takes the attribution as plain arguments rather than as a [PendingAction] so that
+// a grant which has no pending artifact behind it — an auto-applied action, which was
+// never put to anybody — can be minted without inventing a decision to point at. Both
+// callers are in this package and both are named; see [grant] and [GrantAutonomous].
+func grantAs(req Request, authority Authority, approver string, approvedAt time.Time,
+	ref ActionRef, now time.Time) *Authorization {
+
 	p := req.Proposal
-	a := &Authorization{
+	return &Authorization{
 		granted:       true,
 		authority:     authority,
 		identity:      p.Identity,
@@ -146,21 +173,11 @@ func grant(req Request, pending PendingAction, authority Authority, now time.Tim
 		target:        p.Target,
 		reversibility: p.Reversibility,
 		preconditions: append([]remediate.Precondition(nil), p.Preconditions...),
-		approver:      pending.Approver,
-		approvedAt:    pending.DecidedAt,
+		approver:      approver,
+		approvedAt:    approvedAt,
 		authorizedAt:  now,
-		ref:           pending.Ref,
+		ref:           ref,
 	}
-	if authority != AuthorityHuman {
-		// Nobody decided this, so there is no login to name and no decision instant to
-		// record. Both are overwritten rather than merely left alone: an artifact the
-		// bypass acted on may still carry a label event — MaKlaude's own, or one whose
-		// actor could not be told apart from MaKlaude's — and carrying that login
-		// forward would put a person's name on an authorization they did not give.
-		a.approver = AutoApprovePolicy
-		a.approvedAt = time.Time{}
-	}
-	return a
 }
 
 // Valid reports whether this is a real authorization issued by the gate. A nil

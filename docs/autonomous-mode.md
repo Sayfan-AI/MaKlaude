@@ -15,6 +15,15 @@ what it does not.
 > They are independent gates and both must open. Auto-approval while the executor is
 > in `ExecuteDryRun` produces an unattended *rehearsal*, not an unattended change.
 
+> **This is not the only way MaKlaude can act unattended, and it is the blunt one.**
+> [`unattended-actions.md`](unattended-actions.md) documents *earned* autonomy: a rule
+> scoped to one cluster, namespace and operation, which fires only because the recorded
+> history says a person approved that exact shape repeatedly and it converged every time.
+> This page's switch waives review for **everything** and cites nothing; an earned rule
+> waives it for one shape and must cite the history that earned it. The audit trail keeps
+> them apart by name — `policy:MAKLAUDE_DANGEROUSLY_AUTO_APPROVE` here,
+> `policy:<rule-name>` there — and a renderer that collapsed the two would be a bug.
+
 ---
 
 ## What it gives up

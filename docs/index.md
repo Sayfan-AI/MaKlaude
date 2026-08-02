@@ -14,6 +14,7 @@ This is the map of the operator and architecture docs. If you just want to get M
 | [no-writes.md](no-writes.md) | The four-layer guarantee that MaKlaude's **observation** path never mutates a cluster, what that guarantee does and does not cover now that a write path exists, and how to re-verify it yourself. |
 | [remediation.md](remediation.md) | The gated-write seam end to end: the closed four-action catalog, the five independent gates, the `kube.ExecuteMode` kill switch, the scoped single-request write, rollback, and the audit trail. |
 | [autonomous-mode.md](autonomous-mode.md) | The approval bypass: exactly what `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE` gives up, what it emphatically does not, and why `MAKLAUDE_GITHUB_SELF_LOGIN` became mandatory alongside it. **Read before running MaKlaude unattended.** |
+| [unattended-actions.md](unattended-actions.md) | The other way to run unattended, and the narrow one: *earned* autonomy, scoped per cluster/namespace/operation and granted only by a recorded history. Covers the one-issue-per-action disclosure trail, the single `autonomy:revoked` label that takes a shape's permission away, and how the trust ledger is rebuilt from the artifacts. |
 | [escalation.md](escalation.md) | How detected problems become a comms trail: one GitHub issue per problem, keyed by identity, with escalation, recurrence, and resolution. |
 | [slack.md](slack.md) | The optional Slack / ChatOps mirror of the escalation trail: threaded escalations, the `needs:human` mobile push, and inbound replies. |
 
@@ -26,6 +27,7 @@ This is the map of the operator and architecture docs. If you just want to get M
 5. **[slack.md](slack.md)** - only if you want a real-time, team-visible channel on top of the GitHub trail.
 6. **[remediation.md](remediation.md)** - only when you want MaKlaude to *fix* things and not just report them. It is the counterpart to no-writes.md: what the write path can do, and every gate it has to pass first.
 7. **[autonomous-mode.md](autonomous-mode.md)** - only if you want MaKlaude to act without asking. It is the one page that describes a safety property being deliberately switched off, so it is last for a reason: nothing else here assumes you have read it, and you should not read it first.
+8. **[unattended-actions.md](unattended-actions.md)** - the same question answered narrowly instead of bluntly. Read it after autonomous-mode.md, because its whole point is the contrast: a blanket switch that cites nothing, against a per-shape rule that must cite the history that earned it and that one label revokes.
 
 The optional, gated **LLM-assisted diagnosis** layer (read-only, redacted, cost-bounded, off by default) is documented in [architecture.md](architecture.md#the-one-optional-ai-seam) and the [README](../README.md#llm-assisted-diagnosis-optional-gated); its safety posture is summarized in [no-writes.md](no-writes.md).
 

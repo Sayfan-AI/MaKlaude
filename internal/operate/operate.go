@@ -67,11 +67,13 @@ import (
 
 	"github.com/Sayfan-AI/MaKlaude/internal/approve"
 	"github.com/Sayfan-AI/MaKlaude/internal/audit"
+	"github.com/Sayfan-AI/MaKlaude/internal/autonomy"
 	"github.com/Sayfan-AI/MaKlaude/internal/budget"
 	"github.com/Sayfan-AI/MaKlaude/internal/cluster"
 	"github.com/Sayfan-AI/MaKlaude/internal/correlate"
 	"github.com/Sayfan-AI/MaKlaude/internal/detect"
 	"github.com/Sayfan-AI/MaKlaude/internal/diagnose"
+	"github.com/Sayfan-AI/MaKlaude/internal/disclose"
 	"github.com/Sayfan-AI/MaKlaude/internal/execute"
 	"github.com/Sayfan-AI/MaKlaude/internal/health"
 	"github.com/Sayfan-AI/MaKlaude/internal/kube"
@@ -133,6 +135,28 @@ type Cycle struct {
 	// or one that refills on every call; neither is a bound.
 	budget *budget.Budget
 
+	// rules and oracle are the two halves of "may this run without asking?": the
+	// operator's allowlist, and the recorded history that says whether a shape has
+	// earned it. Both are nil in the shipped posture and both are required — see
+	// [Cycle.autonomyWired] — so nothing is auto-applied until an operator has written
+	// rules AND a ledger says the shape earned them.
+	//
+	// They are not read from the environment by [New]. Where the bytes come from is the
+	// configuration surface, which task T7 (#147) owns along with the documentation that
+	// describes it; this file owns what happens once they are here.
+	rules  autonomy.Ruleset
+	oracle autonomy.TrustOracle
+
+	// disclosure is the trail every unattended action is recorded on. It is nil when
+	// autonomy is not wired, and its absence blocks auto-apply outright rather than
+	// downgrading it: an unattended mutation with no record is the one outcome this
+	// milestone forbids, so "nowhere to disclose" means "nothing to disclose".
+	disclosure *disclose.Trail
+
+	// ledger is the trust ledger's write side, used ONLY to demote a shape after an
+	// unattended failure. See [Cycle.demoteIfAsked] for why a success is never recorded.
+	ledger Demoter
+
 	// live reports whether the approval gate is backed by a real comms system rather
 	// than the in-memory dry-run sink. Surfaced in the report because "nobody can
 	// approve anything" is a materially different posture from "waiting on a human".
@@ -165,18 +189,30 @@ func (c *Cycle) Run(ctx context.Context, reg *cluster.Registry) (*Report, error)
 		Mode:        c.mode.String(),
 		Live:        c.live,
 	}
+
+	// Read once, before any cluster is touched, so a person's revocation cannot race the
+	// pass that would act on it. A read FAILURE disqualifies the unattended half of the
+	// whole pass rather than being tolerated: acting unattended because the list of
+	// things a person forbade could not be fetched would turn a network blip into a grant
+	// of authority. The gated half is unaffected — every proposal simply takes the human
+	// gate, which is the posture an operator who never enabled autonomy already has.
+	revoked := c.revocations(ctx)
 	for _, h := range reg.Handles() {
-		report.Clusters = append(report.Clusters, c.runCluster(ctx, h))
+		report.Clusters = append(report.Clusters, c.runCluster(ctx, h, revoked))
 	}
 	// Taken after the clusters have run, so the suppressions reported are this pass's.
+	// The revocation failure is stamped on afterwards rather than up front, because this
+	// line replaces the whole struct — an assignment before it would be silently lost,
+	// which is the failure mode of reporting a failure.
 	report.Autonomy = autonomyReport(c.budget)
+	report.Autonomy.RevocationError = revoked.err
 	report.finalize()
 	return report, nil
 }
 
 // runCluster runs the whole cycle for one cluster, always returning a populated
 // [ClusterReport] — including on failure, where Error explains what went wrong.
-func (c *Cycle) runCluster(ctx context.Context, h *cluster.Handle) ClusterReport {
+func (c *Cycle) runCluster(ctx context.Context, h *cluster.Handle, revoked revocationView) ClusterReport {
 	cr := ClusterReport{Cluster: h.Name()}
 
 	proposals, err := c.propose(ctx, h)
@@ -196,6 +232,20 @@ func (c *Cycle) runCluster(ctx context.Context, h *cluster.Handle) ClusterReport
 	if len(proposals) == 0 {
 		// Nothing to ask about. Building an executor to do nothing with would hold
 		// write authority open for no reason.
+		return cr
+	}
+
+	// The unattended half runs BEFORE the gate, and what it hands back is everything a
+	// person still has to decide. Running it first is what stops an action being both
+	// auto-applied and put to a human on the same pass; handing the remainder to the
+	// unchanged gate is what keeps "not auto-applied" meaning "gated as before" rather
+	// than "dropped".
+	pass := c.autoApply(ctx, h, proposals, revoked)
+	cr.AutoApplied = pass.Applied
+	cr.RefusedByPolicy = pass.Refused
+	cr.RevokedByHuman = pass.Revoked
+	proposals = pass.Deferred
+	if len(proposals) == 0 {
 		return cr
 	}
 
