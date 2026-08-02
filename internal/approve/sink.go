@@ -5,6 +5,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/Sayfan-AI/MaKlaude/internal/audit"
 )
 
 // ApprovalSink is the narrow, side-effecting boundary between the pure decision
@@ -46,6 +48,25 @@ type ApprovalSink interface {
 	// AddLabel adds a single label without disturbing the others. It is how an
 	// execution is recorded durably.
 	AddLabel(ctx context.Context, ref ActionRef, label string) error
+
+	// SetLifecycleMarker attaches the machine-readable lifecycle a rebuild reads
+	// ([audit.LifecycleMarker]) to an artifact, replacing any marker already there and
+	// changing nothing else — not the title, not the rendered prose, and above all not
+	// the labels.
+	//
+	// It is the same "one thing, disturb nothing else" shape as [ApprovalSink.AddLabel]
+	// rather than a body rewrite through [ApprovalSink.Update], and for a sharper reason
+	// than tidiness: Update takes the full intended label set, so routing this through it
+	// would make recording an action's history capable of erasing a human's decision
+	// label. An implementation is expected to read the current body, replace the marker,
+	// and write back only the body.
+	//
+	// The approval trail carries this marker for the same reason the disclosure trail
+	// does, and the reason is specifically about THIS trail: the ledger's promotion
+	// arithmetic counts human-approved executions, so a format that marked up only
+	// unattended actions would make the evidence FOR autonomy the one thing that cannot
+	// be rebuilt.
+	SetLifecycleMarker(ctx context.Context, ref ActionRef, marker string) error
 
 	// RemoveLabel removes a single label without disturbing the others. It is how an
 	// approval that cannot be honored is withdrawn, leaving the artifact and its
@@ -235,6 +256,20 @@ func (s *MemorySink) AddLabel(_ context.Context, ref ActionRef, label string) er
 	}
 	a.labels[label] = true
 	a.events[label] = labelEvent{actor: s.SelfLogin, at: time.Now().UTC(), isSelf: true}
+	return nil
+}
+
+// SetLifecycleMarker replaces the stored body's lifecycle marker, leaving the title,
+// the labels, the comments and every other marker alone.
+func (s *MemorySink) SetLifecycleMarker(_ context.Context, ref ActionRef, marker string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	a, ok := s.artifacts[ref]
+	if !ok {
+		return &NotFoundError{Ref: ref}
+	}
+	a.body = audit.WithLifecycleMarker(a.body, marker)
 	return nil
 }
 

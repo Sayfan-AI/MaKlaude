@@ -114,7 +114,7 @@ func BodyWithOutcome(a Action, o Outcome) string {
 
 	writeConsequence(&b, o)
 
-	marker, err := LifecycleMarker(o.Records)
+	marker, err := audit.LifecycleMarker(o.Records)
 	if err != nil {
 		fmt.Fprintf(&b, "\n> **This action's history cannot be rebuilt from this artifact.** The machine-readable lifecycle marker could not be written: %s\n",
 			redact.String(err.Error()))

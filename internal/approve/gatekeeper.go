@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sayfan-AI/MaKlaude/internal/audit"
 	"github.com/Sayfan-AI/MaKlaude/internal/detect"
 	"github.com/Sayfan-AI/MaKlaude/internal/notify"
 	"github.com/Sayfan-AI/MaKlaude/internal/remediate"
@@ -436,6 +437,49 @@ func (g *Gatekeeper) RecordOutcome(ctx context.Context, auth *Authorization, not
 	}
 	if err := g.sink.Comment(ctx, ref, note); err != nil {
 		return fmt.Errorf("recording outcome on %q: %w", ref, err)
+	}
+	return nil
+}
+
+// RecordLifecycle attaches the machine-readable lifecycle marker to the approval
+// artifact, so a finished GATED action can be read back off the trail and re-projected
+// onto a trust entry.
+//
+// # Why the approval trail carries it and not only the disclosure trail
+//
+// The marker was built for unattended actions, where the artifact is the entire oversight
+// surface. That placement was incomplete for a reason specific to THIS trail: the ledger's
+// promotion arithmetic counts human-approved executions, so a format that marked up only
+// autonomous actions would make the evidence FOR autonomy the one thing a rebuild cannot
+// reconstruct. A ledger rebuilt from artifacts would then show every failure that re-gates
+// a shape and none of the approvals that earn it — a rebuild biased in the direction that
+// silently withholds autonomy is the safe direction, but it is still a rebuild that does
+// not reproduce the truth, and this criterion is that it does.
+//
+// # It is the last write, and it is best-effort in one direction only
+//
+// It is called after everything that can add to the lifecycle — the execution and any
+// rollback — because the marker is written whole rather than accumulated, and a marker
+// written before the rollback would describe an action that never reached its end state.
+//
+// An empty lifecycle is refused rather than written as an empty marker. Absence of a
+// marker means "still in flight" to a rebuild, which is the correct reading of an action
+// whose records could not be recovered; a marker carrying nothing would instead be
+// history that exists and says nothing, which a rebuild is required to fail on.
+func (g *Gatekeeper) RecordLifecycle(ctx context.Context, auth *Authorization, recs []audit.Record) error {
+	if !auth.Valid() {
+		return errors.New("approve: refusing to record a lifecycle against an authorization the gate did not issue")
+	}
+	ref := auth.Ref()
+	if ref == "" {
+		return errors.New("approve: authorization carries no artifact reference to record against")
+	}
+	marker, err := audit.LifecycleMarker(recs)
+	if err != nil {
+		return fmt.Errorf("approve: marking the lifecycle of %q: %w", ref, err)
+	}
+	if err := g.sink.SetLifecycleMarker(ctx, ref, marker); err != nil {
+		return fmt.Errorf("approve: attaching the lifecycle marker to %q: %w", ref, err)
 	}
 	return nil
 }

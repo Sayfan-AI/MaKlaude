@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/approve"
+	"github.com/Sayfan-AI/MaKlaude/internal/audit"
 	"github.com/Sayfan-AI/MaKlaude/internal/autonomy"
 	"github.com/Sayfan-AI/MaKlaude/internal/budget"
 	"github.com/Sayfan-AI/MaKlaude/internal/detect"
@@ -273,7 +274,7 @@ func TestComplete_RecordsTheOutcomeAndAnnouncesIt(t *testing.T) {
 	if view.HasLabel(NeedsHumanLabel) {
 		t.Error("a successful unattended action was marked needs:human")
 	}
-	if _, err := ParseLifecycleMarker(view.Body); err != nil {
+	if _, err := audit.ParseLifecycleMarker(view.Body); err != nil {
 		t.Errorf("the completed body carries no readable lifecycle marker: %v", err)
 	}
 	if len(view.Comments) != 1 {
