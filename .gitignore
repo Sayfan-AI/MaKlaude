@@ -23,8 +23,19 @@ go.work.sum
 # direnv: pins gh to the personal account for this OSS repo (see genesis)
 .envrc
 
-# genesis local control plane runtime state (genesis serve)
-.genesis/.disabled-by-genesis
-.genesis/.orchestrator.lock
-.genesis/.poll-etag
-.genesis/.poll-highwater
+# genesis local control plane runtime state (genesis serve).
+#
+# A pattern, not an enumeration. This used to list four names
+# (.disabled-by-genesis, .orchestrator.lock, .poll-etag, .poll-highwater) and
+# genesis serve then started writing a fifth, .trigger-state, which nothing
+# ignored — so every local run left a dirty working tree for the next agent to
+# read, or to sweep into a commit with `git add -A`.
+#
+# The convention the framework already follows is what the pattern encodes: a
+# dotfile directly under .genesis/ is per-machine runtime state, everything
+# tracked here (config.toml, onboarding.md, design/, scripts/) is not a dotfile.
+# Pinned by TestGenesisRuntimeStateIsIgnoredByPattern.
+#
+# An already-tracked file is unaffected by gitignore, and a future .genesis
+# dotfile that genuinely belongs in the repo can still be added with `git add -f`.
+.genesis/.*
