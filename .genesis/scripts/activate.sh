@@ -4,11 +4,11 @@
 # Genesis ships a dev repo's workflows DISABLED and with no secrets. Run this once
 # from a clone of the dev repo, after you've populated ~/.config/genesis/.env, and
 # it does every remaining step in one go:
-#   1. reads ANTHROPIC_API_KEY / GENESIS_GITHUB_APP_ID / GENESIS_GITHUB_APP_SECRET
+#   1. reads CLAUDE_CODE_OAUTH_TOKEN / GENESIS_GITHUB_APP_ID / GENESIS_GITHUB_APP_SECRET
 #      from ~/.config/genesis/.env  (shared across all your genesis projects),
 #   2. verifies the genesis GitHub App is actually installed on this repo,
 #   3. sets the values as THIS repo's GitHub Actions secrets
-#      (ANTHROPIC_API_KEY, GENESIS_APP_ID, GENESIS_APP_PRIVATE_KEY),
+#      (CLAUDE_CODE_OAUTH_TOKEN, GENESIS_APP_ID, GENESIS_APP_PRIVATE_KEY),
 #   4. seeds the OPTIONAL Loki secrets when the .env has them
 #      (GENESIS_LOKI_URL, GENESIS_LOKI_USER, GENESIS_LOKI_TOKEN) so the activity
 #      logging hooks reach Grafana from Actions runs, not just local ones,
@@ -35,7 +35,7 @@ is_placeholder() {
 }
 validate_values() {
     local v missing=()
-    for v in ANTHROPIC_API_KEY GENESIS_GITHUB_APP_ID GENESIS_GITHUB_APP_SECRET; do
+    for v in CLAUDE_CODE_OAUTH_TOKEN GENESIS_GITHUB_APP_ID GENESIS_GITHUB_APP_SECRET; do
         is_placeholder "${!v:-}" && missing+=("$v")
     done
     if [ "${#missing[@]}" -gt 0 ]; then
@@ -107,7 +107,13 @@ verify_app_installed
 # --- 3. seed the repo's Actions secrets -----------------------------------------
 echo "Seeding secrets onto $REPO ..."
 # Pipe via stdin (printf is a builtin) so values never reach the process arg list.
-printf '%s' "$ANTHROPIC_API_KEY"         | gh secret set ANTHROPIC_API_KEY
+#
+# The Claude credential is a subscription OAuth token (`claude setup-token`), NOT
+# an API key. It must stay in lockstep with what the workflows read: seeding a
+# secret no workflow references leaves every Claude run dying at validate-env,
+# and seeding the wrong one is the #150 outage with extra steps. That agreement
+# is pinned by TestActivateSeedsTheCredentialWorkflowsRead.
+printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN"   | gh secret set CLAUDE_CODE_OAUTH_TOKEN
 printf '%s' "$GENESIS_GITHUB_APP_ID"     | gh secret set GENESIS_APP_ID
 printf '%s' "$GENESIS_GITHUB_APP_SECRET" | gh secret set GENESIS_APP_PRIVATE_KEY
 
