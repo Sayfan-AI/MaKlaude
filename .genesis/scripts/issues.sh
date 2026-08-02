@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Genesis issue manager — abstraction over gh CLI
-# Supports: create, list, gates, stale-gates, red-prs, ready-prs, close, assign, comment,
-#           label, view
+# Supports: create, list, gates, stale-gates, red-prs, ready-prs,
+#           unanswered-comments, close, assign, comment, label, view
 set -euo pipefail
 
 CMD="${1:-help}"
@@ -22,6 +22,12 @@ NUDGE_LABEL="nudged:stale"
 # orchestrator ticks every 6h, so 3 days is ~12 ticks — comfortably past the
 # "stuck for more than 2 cycles" guideline without being twitchy.
 DEFAULT_STALE_DAYS="${GENESIS_GATE_STALE_DAYS:-3}"
+
+# How far back a trailing human comment is still worth reporting as unanswered.
+# A week-old comment on a thread nothing replied to has either been handled out
+# of band or stopped mattering, and a section that keeps printing it forever is
+# the noise that gets the whole report skipped.
+DEFAULT_COMMENT_WINDOW_DAYS="${GENESIS_COMMENT_WINDOW_DAYS:-7}"
 
 format_issues() {
     python3 -c "
@@ -224,6 +230,169 @@ for age, p in rows:
 "
 }
 
+# A human said something and nothing has answered it.
+#
+# Why this exists — the window, measured on #141 (2026-08-02, UTC):
+#
+#   06:18:37  bot: "the last done criterion is implemented — PR #154", CI running
+#   06:29:18  HUMAN approves the approach and attaches two conditions
+#   06:31:43  PR #154 merged by genesis-dev-bot[bot] on its own green checks
+#   06:31:44  #141 closed
+#
+# The comment sat unread for 2m25s and then the work it constrained was merged
+# and its issue closed. Two of the three negative cases it asked for were absent
+# from what shipped. No existing net could have caught it: every one of them keys
+# on CI state, issue/PR state, or run outcome, and none keys on *a person having
+# said something*. `genesis-merge.yml` gates on exactly two facts (bot author,
+# green checks) and never reads a comment; `ready-prs` excludes `needs:human` but
+# a person who comments without labelling is invisible; `red-prs`, `stale-gates`,
+# `escalate.sh` and `run-outcome.sh` are all about failure, and this was not a
+# failure — PR #154 was correct, green, and correctly merged on the evidence its
+# merger had.
+#
+# So this is the invisible-nothing-happened class again, with the sign flipped
+# the same way #112 flipped it: a gate that waits forever (#84), a triage event
+# dropped by supersession (#100), a run that dies mid-task (#97/#106/#110), a
+# green PR nobody merges (#112). Same treatment as all four — derive it from repo
+# state, print it unconditionally, empty means all-clear. Not a new label
+# convention: "humans must label a comment that carries conditions" is an opt-in
+# invariant, and the member who forgets is exactly the case it exists for.
+#
+# The rule, which needs no judgment: a thread's NEWEST comment is human-authored.
+# The exclusions are where the care goes, because this prints every tick:
+#
+#   - bot-authored newest comment  — the loop has replied; nothing is waiting.
+#   - older than the window        — see DEFAULT_COMMENT_WINDOW_DAYS.
+#   - closed, comment AFTER close  — that is a closing note ("LGTM", "signed
+#                                    off"), the single largest false-positive
+#                                    class in this repo's history.
+#   - closed by a human            — a person who comments and then closes their
+#                                    own thread has answered themselves.
+#
+# which leaves exactly one reportable closed shape: the human spoke, and then the
+# LOOP closed the thread over them. That is #141 precisely, and it stays
+# actionable after the close (reopen, or answer and reopen).
+#
+# Known boundary, stated rather than silently missed: only conversation comments
+# are read (`issues/N/comments`, which covers PRs). Inline review comments and
+# review bodies live on a different endpoint; a review that requests changes is
+# already visible as a non-CLEAN mergeStateStatus, which `ready-prs` excludes.
+#
+# Known limitation, from #156: "newer than the last bot comment" is a proxy for
+# "unanswered". A bot reply that does not actually address the human's point
+# clears the flag. Acknowledging is one comment, so clearing it deliberately is
+# cheap; clearing it accidentally requires the loop to have said something.
+#
+# Prints nothing when nothing is waiting. If the API cannot be read it says so
+# rather than printing nothing, because silence here would mean "all clear".
+format_unanswered_comments() {
+    python3 - "$1" <<'PY'
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+window_days = int(sys.argv[1])
+now = datetime.now(timezone.utc)
+
+
+def ts(value):
+    return datetime.fromisoformat(value.replace('Z', '+00:00'))
+
+
+def gh_json(path):
+    proc = subprocess.run(['gh', 'api', path], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        return None
+
+
+# GitHub App comments carry type "Bot"; the [bot] login suffix is the belt to
+# that suspenders, matching how format_ready_prs identifies a bot author.
+#
+# One historical caveat worth knowing rather than encoding: before
+# 2026-08-02T03:39Z local `genesis serve` sessions commented as the human's own
+# account, so comments older than that can be agent output wearing a User type.
+# No cutoff constant is needed — every such thread was also *closed* by that same
+# account, and the closed branch below requires a bot closer.
+def is_bot(actor):
+    if not isinstance(actor, dict):
+        return False
+    return actor.get('type') == 'Bot' or str(actor.get('login', '')).endswith('[bot]')
+
+
+def ago(delta):
+    secs = int(delta.total_seconds())
+    if secs >= 86400:
+        return '%dd' % (secs // 86400)
+    if secs >= 3600:
+        return '%dh' % (secs // 3600)
+    return '%dm' % max(secs // 60, 0)
+
+
+# One repo-wide call for the most recent comments. This is also the bound on the
+# work: a thread whose newest comment falls outside this page has had no recent
+# conversation, which is the same thing the window means.
+comments = gh_json('repos/{owner}/{repo}/issues/comments?sort=created&direction=desc&per_page=100')
+if comments is None:
+    print('(the comments API could not be read, so this check did not run — '
+          'do NOT read the empty section above it as all-clear)')
+    sys.exit(0)
+
+# Newest comment per thread. The feed is served newest-first, but ordering is
+# re-established here rather than assumed: taking the wrong comment as "newest"
+# would silently invert every verdict below.
+newest = {}
+for c in comments:
+    if not isinstance(c, dict) or not c.get('created_at'):
+        continue
+    tail = str(c.get('issue_url', '')).rsplit('/', 1)[-1]
+    if not tail.isdigit():
+        continue
+    num = int(tail)
+    prior = newest.get(num)
+    if prior is None or ts(c['created_at']) > ts(prior['created_at']):
+        newest[num] = c
+
+rows = []
+for num, c in newest.items():
+    if is_bot(c.get('user')):
+        continue
+    created = ts(c['created_at'])
+    age = now - created
+    if age.total_seconds() >= window_days * 86400:
+        continue
+
+    thread = gh_json('repos/{owner}/{repo}/issues/%d' % num)
+    if thread is None:
+        continue
+
+    note = ''
+    if thread.get('state') != 'open':
+        closed_at = thread.get('closed_at')
+        if not closed_at or ts(closed_at) <= created:
+            continue
+        if not is_bot(thread.get('closed_by')):
+            continue
+        note = '  [the loop closed this over them — reopen or answer]'
+
+    rows.append((age, num, c, thread, note))
+
+# Stalest first, matching gates, red-prs and ready-prs: the comment that has gone
+# unanswered longest is the one being forgotten.
+rows.sort(key=lambda r: -r[0].total_seconds())
+
+for age, num, c, thread, note in rows:
+    kind = 'PR' if thread.get('pull_request') else 'issue'
+    print('#%d  unanswered %s — @%s on %s "%s"%s\n      %s' % (
+        num, ago(age), (c.get('user') or {}).get('login', '?'),
+        kind, thread.get('title', ''), note, c.get('html_url', '')))
+PY
+}
+
 # Open PRs plus everything format_red_prs and format_ready_prs filter on. One
 # query serves both so `summary` pays for a single PR round-trip.
 fetch_prs() {
@@ -337,6 +506,20 @@ json.dump(filtered, sys.stdout)
         fetch_prs | format_ready_prs
         ;;
 
+    unanswered-comments)
+        # Threads whose newest comment is a person's, that the loop has not
+        # answered (empty = nothing waiting on a reply). State-derived, so it
+        # does not depend on a run having been handed the comment as a trigger.
+        WINDOW_DAYS="$DEFAULT_COMMENT_WINDOW_DAYS"
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --window-days) WINDOW_DAYS="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        format_unanswered_comments "$WINDOW_DAYS"
+        ;;
+
     blocked)
         # Shortcut: list all blocked issues
         gh issue list --state open --label "blocked" --json "$FIELDS" --limit 100 | format_issues
@@ -380,6 +563,14 @@ json.dump(filtered, sys.stdout)
         # waiting on a merge.
         echo "=== Ready to Merge (green, clean, unmerged — merge or say why not) ==="
         fetch_prs | format_ready_prs
+        echo ""
+        # Unconditional for the fourth time, and for the one input none of the
+        # other three can see: a person having spoken. Every other section is
+        # derived from CI state, issue/PR state or run outcome, so a comment
+        # carrying conditions on work in flight reaches no run unless it happens
+        # to be that run's trigger. Empty here means nobody is waiting on a reply.
+        echo "=== Unanswered Human Comments (a person spoke; answer before acting) ==="
+        format_unanswered_comments "$DEFAULT_COMMENT_WINDOW_DAYS"
         echo ""
         echo "=== Blocked ==="
         gh issue list --state open --label "blocked" --json "$FIELDS" --limit 100 | format_issues
@@ -485,6 +676,11 @@ Commands:
   ready-prs   List open PRs where merging is the only remaining step — green,
               MERGEABLE/CLEAN, not draft, no needs:human, non-bot author —
               stalest first (empty = nothing waiting on a merge)
+  unanswered-comments
+              List issues/PRs whose newest comment is a person's and that the
+              loop has not answered, stalest first. Closed threads are reported
+              only when the loop closed them AFTER the comment (empty = nothing
+              waiting on a reply)
   blocked   List all blocked issues
   recent    List recently updated issues (default: last 24h)
   summary   Overview of project state
@@ -507,6 +703,10 @@ Gate filters (gates / stale-gates):
   --stale-days N       Staleness threshold in days (default 3, or
                        GENESIS_GATE_STALE_DAYS)
   --format text|tsv    tsv emits number<TAB>age<TAB>title for scripting
+
+Comment filters (unanswered-comments):
+  --window-days N      How far back a trailing human comment still counts as
+                       unanswered (default 7, or GENESIS_COMMENT_WINDOW_DAYS)
 EOF
         exit 1
         ;;
