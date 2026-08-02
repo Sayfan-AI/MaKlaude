@@ -52,7 +52,7 @@ fi
 #
 # Prints the human-readable log line first, then the JSON payload.
 BUILD_OUT=$(printf '%s' "$STDIN_DATA" | python3 -c '
-import json, sys, time
+import json, re, sys, time
 
 hook, project = sys.argv[1], sys.argv[2]
 raw = sys.stdin.read()
@@ -78,6 +78,63 @@ for key, name in (("session_id", "session"), ("tool_name", "tool"), ("agent_type
     value = ctx.get(key)
     if value:
         fields.append((name, str(value)))
+
+# Secrets before anything else. A Bash command is the single most useful field
+# here and also the most likely to carry a credential — `curl -u user:token`,
+# an inline API key, a `gh` call with a PAT. Logs are not a safe place for those,
+# and Loki has no delete.
+SECRET_RE = re.compile(
+    r"(glc_[A-Za-z0-9+/=_-]+|glsa_[A-Za-z0-9_-]+|sk-ant-[A-Za-z0-9_-]+"
+    r"|gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|AKIA[0-9A-Z]{16}"
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"
+)
+
+
+def scrub(text):
+    text = SECRET_RE.sub("<redacted>", text)
+    # user:password in a URL or a -u/--user flag, which the pattern list cannot
+    # anticipate because the secret has no recognisable prefix.
+    text = re.sub(r"(-u|--user)\s+\S+:\S+", r"\1 <redacted>", text)
+    text = re.sub(r"://[^/\s:@]+:[^/\s@]+@", "://<redacted>@", text)
+    return text
+
+
+def brief(value, limit=180):
+    """One short, safe line describing what a tool call actually did."""
+    if isinstance(value, dict):
+        for key in ("command", "file_path", "pattern", "path", "url", "query", "description"):
+            inner = value.get(key)
+            if isinstance(inner, str) and inner.strip():
+                value = inner
+                break
+        else:
+            value = " ".join(f"{k}={v}" for k, v in list(value.items())[:3])
+    text = " ".join(str(value).split())
+    text = scrub(text)
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+target = brief(ctx.get("tool_input"))
+if target:
+    fields.append(("target", target))
+
+# Post hooks carry the result. Capture whether it failed and why — not the body,
+# which for a Bash call is entire command output and would balloon both cost and
+# the chance of logging something sensitive.
+response = ctx.get("tool_response")
+if isinstance(response, dict):
+    failed = response.get("is_error") or response.get("error") or response.get("interrupted")
+    if failed:
+        fields.append(("status", "error"))
+        detail = response.get("error") or response.get("stderr") or ""
+        if detail:
+            fields.append(("error", brief(str(detail), 160)))
+    else:
+        fields.append(("status", "ok"))
+    for key, name in (("exitCode", "exit_code"), ("exit_code", "exit_code")):
+        if isinstance(response.get(key), int):
+            fields.append((name, response[key]))
+            break
 
 def fmt(value):
     # logfmt: quote only when the value would otherwise break parsing.
