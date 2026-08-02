@@ -135,17 +135,24 @@ the log is unavailable the check skips with a warning — layers 1–3 still hol
 > [`docs/rbac.md`](rbac.md) for the access model and
 > [`docs/autonomous-mode.md`](autonomous-mode.md) for the one documented way the
 > approval requirement can be waived). The four layers above are about the
-> **observation** identity, and every one of them still holds verbatim: the write
-> bundle is never bound to it, and `assertNoMutatingAudit` is re-run *after* the
-> approved mutation lands to prove the point rather than assume it.
+> **observation** identity, and every one of them still holds: the write bundle is
+> never bound to it, and layer 2 is what makes that true at the API server rather
+> than by convention.
 >
-> The executor identity is held to its own, differently-shaped assertion, because
-> "zero" is the wrong number for an account whose job is to perform one approved
-> action. `assertOnlyTheApprovedWriteLanded` in
+> The gated-remediation e2e holds both identities to a differently-shaped
+> assertion, because "zero mutating verbs" is not quite the property either one
+> has. `assertOnlyTheApprovedWriteLanded` in
 > [`test/e2e/remediation_test.go`](../test/e2e/remediation_test.go) classifies
-> *every* mutating request the apiserver attributed to it — server-side previews,
-> requests the server rejected, and requests that landed — and fails the build
-> unless exactly one landed and it is the object a human approved.
+> *every* mutating request the apiserver attributed to a MaKlaude identity —
+> server-side previews, requests the server rejected, and requests that landed —
+> and fails the build unless **nothing the observation identity sent was accepted**
+> and **exactly one executor request landed**, on the object a human approved.
+>
+> The observation identity does appear in that log with one `patch`, and it is
+> supposed to: `TestE2E_ObservationIdentityCannotExecute` aims a dry-run patch at a
+> Deployment precisely so RBAC can refuse it, and the apiserver audits the attempt
+> whatever it answers. A refusal recorded there is layer 2 working, which is why
+> the assertion is about what was *accepted* rather than about what was tried.
 
 ---
 

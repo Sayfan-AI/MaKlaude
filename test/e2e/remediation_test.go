@@ -41,14 +41,16 @@
 //	    dies with the process and the artifact is what an operator actually reads;
 //	(d) NO UNAPPROVED WRITE ever reached the cluster.
 //
-// (d) is where the work is. The M1 assertion — zero mutating verbs attributed to the
-// observation ServiceAccount — still holds verbatim and is re-run here AFTER the
-// approved mutation lands. What is new is the executor identity, which by design now
-// has one real write to its name, so "zero" is the wrong shape for it. Instead every
-// mutating request the apiserver audit log attributes to the executor is classified,
-// and exactly one is allowed to have landed: assertOnlyTheApprovedWriteLanded carries
-// the full reasoning, including the one request whose dry-run marker the audit log
-// physically cannot see and what is used to cover it instead.
+// (d) is where the work is, and "zero mutating verbs" is the wrong shape for it twice
+// over. The executor identity has one real write to its name by design. The observation
+// identity has none — but by the time this test runs, the apiserver has recorded one
+// mutating ATTEMPT from it, because TestE2E_ObservationIdentityCannotExecute makes one
+// on purpose so RBAC can refuse it. So every mutating request the audit log attributes
+// to either identity is classified instead of counted: nothing the observation identity
+// sent may have been accepted, and exactly one executor request may have landed.
+// assertOnlyTheApprovedWriteLanded carries the full reasoning, including the one request
+// whose dry-run marker the audit log physically cannot see and what is used to cover it
+// instead.
 //
 // # Ordering and independence
 //
@@ -64,6 +66,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -196,9 +199,6 @@ func TestE2E_GatedRemediation(t *testing.T) {
 	// --- (d) Only the approved write ever landed. ---
 	assertUntouched(t, reader, untouched)
 	assertTargetWasMutated(t, reader, untouched)
-	// The M1 assertion, re-run AFTER a real mutation: the observation identity's
-	// zero-writes guarantee is not weakened by the executor identity gaining one.
-	assertNoMutatingAudit(t)
 	assertOnlyTheApprovedWriteLanded(t, "deployments/"+e2eNamespace+"/"+wedgedDeploy)
 }
 
@@ -487,6 +487,22 @@ func assertConverged(t *testing.T, rep execute.Report) {
 	if !rep.PreState.Captured {
 		t.Errorf("no pre-state was captured for the mutated object")
 	}
+
+	// The scope is checked HERE, on the report, rather than on the audit record derived
+	// from it. It is the one field that says which exact request went on the wire, and
+	// the trail's copy of it is deliberately redacted: audit.Record.redacted runs the
+	// scope through the high-entropy sweep, whose 24-character rule matches the whole
+	// unbroken `/apis/apps/v1/namespaces/…/deployments/wedged` run, so the stored record
+	// reads `PATCH /[REDACTED]`. That is the audit package's own documented, tested
+	// choice (a scope carrying a query token must not survive), not something to work
+	// around from here — so the check goes where the value is intact.
+	if rep.Outcome == nil {
+		t.Fatalf("the report carries no outcome for an executed action")
+	}
+	if !strings.Contains(rep.Outcome.Scope, "/namespaces/"+e2eNamespace+"/deployments/"+wedgedDeploy) {
+		t.Errorf("the request's scope %q does not name the approved object", rep.Outcome.Scope)
+	}
+
 	t.Logf("converged in %s: %s", rep.ObservedFor.Round(time.Second), rep.ConvergenceDetail)
 }
 
@@ -603,7 +619,12 @@ func assertAuditTrailComplete(t *testing.T, trail *audit.Trail, done remediation
 			t.Errorf("record %d describes %s on %s, not the action that ran (%s on %s)",
 				i, rec.Action.Cluster, rec.Action.Target.String(), done.proposal.Cluster, done.proposal.Target.String())
 		}
-		if rec.Change.Applied {
+		// Counted on the EXECUTED phase specifically. Every record carries the same
+		// Change block — a verified record restates what was applied, which is what makes
+		// a record readable in isolation — so counting Change.Applied across all phases
+		// counts one execution several times. The executed record is the one that means
+		// "a request was sent", and there must be exactly one of those.
+		if rec.Phase == audit.PhaseExecuted && rec.Change.Applied {
 			applied++
 		}
 		if rec.Phase == audit.PhaseFailed && !rec.Outcome.CleanAbort {
@@ -611,7 +632,7 @@ func assertAuditTrailComplete(t *testing.T, trail *audit.Trail, done remediation
 		}
 	}
 	if applied != 1 {
-		t.Errorf("the audit trail records %d applied change(s) for %s, want exactly 1 — one approval authorizes one action",
+		t.Errorf("the audit trail records %d applied execution(s) for %s, want exactly 1 — one approval authorizes one action",
 			applied, done.proposal.Identity)
 	}
 
@@ -656,8 +677,12 @@ func assertAuditTrailComplete(t *testing.T, trail *audit.Trail, done remediation
 	case !executed.Change.RecordedOnTrail:
 		t.Errorf("the executed record says the execution never reached the approval trail")
 	}
-	if !strings.Contains(executed.Change.Scope, "/namespaces/"+e2eNamespace+"/deployments/"+wedgedDeploy) {
-		t.Errorf("the executed record's scope %q does not name the approved object", executed.Change.Scope)
+	// Change.Scope is deliberately NOT asserted here; see assertConverged for why the
+	// trail's copy of it reads `PATCH /[REDACTED]` and where the intact value is
+	// checked instead. What the record must carry is the precondition the request was
+	// conditioned on, which redaction leaves alone.
+	if executed.Change.ResourceVersion == "" {
+		t.Errorf("the executed record does not say which resourceVersion the action was conditioned on")
 	}
 	if !executed.PreState.Captured || executed.PreState.Kind != "deployment" {
 		t.Errorf("the executed record carries no deployment pre-state: %+v", executed.PreState)
@@ -872,11 +897,21 @@ func (e mutatingAuditEvent) String() string {
 //
 // # Why this is not simply "zero mutating verbs" any more
 //
-// e2e_test.go's assertNoMutatingAudit still holds verbatim for the OBSERVATION identity
-// and is re-run by this test after the mutation lands. The executor identity is
-// different by design: it now has one real write to its name, plus the deliberate
-// server-side previews this suite sends. So its events are classified rather than
-// counted, and every class must be explained:
+// e2e_test.go's assertNoMutatingAudit counts mutating verbs ATTEMPTED by the
+// observation identity and requires zero, and it holds where it runs — in the M1 tests,
+// which execute before anything in this suite deliberately provokes the API server.
+// Re-running it here would fail, and not because of a regression:
+// TestE2E_ObservationIdentityCannotExecute aims a dry-run patch at the badimage
+// Deployment precisely so RBAC can refuse it, and the apiserver audits the ATTEMPT
+// whatever it answers. Verified the hard way — the first CI run of this test did exactly
+// that.
+//
+// So this ledger states the order-independent property instead: nothing the observation
+// identity sent was ever ACCEPTED, and the one attempt that exists must be the probe, in
+// the shape that proves the refusal. The executor identity is different again by design:
+// it has one real write to its name, plus the deliberate server-side previews this suite
+// sends. Its events are classified rather than counted, and every class must be
+// explained:
 //
 //   - a request carrying dryRun=All in its query is a preview, allowed only against an
 //     object this suite deliberately previews;
@@ -920,12 +955,21 @@ func assertOnlyTheApprovedWriteLanded(t *testing.T, approvedTarget string) {
 	}
 	// The single request whose dry-run marker the audit log cannot see. See above.
 	bodyPreviewedDelete := "pods/" + e2eNamespace + "/" + pendingPod
+	// The one mutating request the observation identity is expected to have ATTEMPTED:
+	// TestE2E_ObservationIdentityCannotExecute's probe, which exists to be refused.
+	rbacProbeTarget := "deployments/" + e2eNamespace + "/" + badImageDeploy
 
 	var landed []mutatingAuditEvent
 	for _, ev := range events {
 		switch {
 		case ev.user == observationUser:
-			t.Errorf("ZERO-WRITES VIOLATION: the observation identity issued a mutating request: %s", ev)
+			// Allowed only in the exact shape that proves RBAC held: forbidden, at the
+			// object the probe aims at. An ACCEPTED mutating request from this identity —
+			// or a refusal anywhere else, which would mean something tried to write and
+			// only RBAC stopped it — is the violation.
+			if ev.code != http.StatusForbidden || ev.target() != rbacProbeTarget {
+				t.Errorf("ZERO-WRITES VIOLATION: the observation identity issued a mutating request: %s", ev)
+			}
 
 		case ev.previewed():
 			if !previewTargets[ev.target()] {
