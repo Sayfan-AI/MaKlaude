@@ -41,7 +41,24 @@ import (
 // reported as [RollbackReport.AlreadyAtPreState]. A rollback that re-asserts a state
 // someone else has already restored is at best a redundant write in an audit log,
 // and at worst a machine and a person taking turns undoing each other.
+//
+// # It is audited exactly as an execution is
+//
+// A rollback is a mutating action, so the same rule applies to it: every path out
+// appends an audit record and renders the lifecycle onto the same approval artifact
+// the original action was recorded on. That is what lets the artifact read as one
+// story — approved, executed, verified, undone — rather than as two disconnected
+// events a reader has to correlate by hand.
 func (r *Runner) Rollback(ctx context.Context, auth *approve.Authorization, rep Report) (RollbackReport, error) {
+	rb, err := r.rollback(ctx, auth, rep)
+	r.recordRollback(ctx, auth, rep, rb)
+	return rb, err
+}
+
+// rollback is the attempt itself, separated from [Runner.Rollback] for the same
+// reason [Runner.execute] is separated from [Runner.Execute]: one emission point
+// that no return path can bypass.
+func (r *Runner) rollback(ctx context.Context, auth *approve.Authorization, rep Report) (RollbackReport, error) {
 	mode := r.mutator.Mode()
 	rb := RollbackReport{
 		Identity:  rep.Identity,

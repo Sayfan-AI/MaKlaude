@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/approve"
+	"github.com/Sayfan-AI/MaKlaude/internal/audit"
 	"github.com/Sayfan-AI/MaKlaude/internal/health"
 	"github.com/Sayfan-AI/MaKlaude/internal/kube"
 	"github.com/Sayfan-AI/MaKlaude/internal/notify"
@@ -385,10 +386,20 @@ func (m *fakeMutator) DeletePod(_ context.Context, namespace, name, resourceVers
 }
 
 // fakeRecorder stands in for the approval trail.
+//
+// Executions and outcome notes are kept in SEPARATE slices, mirroring the two
+// methods' different meanings: one applies the executed label and may happen once,
+// the other is the append-only audit note and may happen for attempts that never
+// executed. A fake that pooled them would let a test that asserts "recorded exactly
+// once" pass while the runner labelled an aborted action executed.
 type fakeRecorder struct {
-	mu      sync.Mutex
-	details []string
-	err     error
+	mu       sync.Mutex
+	details  []string
+	outcomes []string
+	err      error
+	// outcomeErr fails the audit note only, so a test can prove a failure to post the
+	// lifecycle does not change what the runner reports about the action itself.
+	outcomeErr error
 }
 
 func (r *fakeRecorder) RecordExecution(_ context.Context, auth *approve.Authorization, detail string) error {
@@ -401,6 +412,19 @@ func (r *fakeRecorder) RecordExecution(_ context.Context, auth *approve.Authoriz
 		return r.err
 	}
 	r.details = append(r.details, detail)
+	return nil
+}
+
+func (r *fakeRecorder) RecordOutcome(_ context.Context, auth *approve.Authorization, note string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !auth.Valid() {
+		panic("the runner recorded an outcome against an authorization the gate never issued")
+	}
+	if r.outcomeErr != nil {
+		return r.outcomeErr
+	}
+	r.outcomes = append(r.outcomes, note)
 	return nil
 }
 
@@ -417,6 +441,23 @@ func (r *fakeRecorder) last() string {
 		return ""
 	}
 	return r.details[len(r.details)-1]
+}
+
+// outcomeNotes returns every audit lifecycle note posted to the trail.
+func (r *fakeRecorder) outcomeNotes() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.outcomes...)
+}
+
+// lastOutcome returns the most recent audit lifecycle note, or "" if none was posted.
+func (r *fakeRecorder) lastOutcome() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.outcomes) == 0 {
+		return ""
+	}
+	return r.outcomes[len(r.outcomes)-1]
 }
 
 // fastPolicy keeps the bounded waits short enough that a test finishes in
@@ -440,6 +481,7 @@ type harness struct {
 	mutator  *fakeMutator
 	observer *fakeObserver
 	recorder *fakeRecorder
+	trail    *audit.Trail
 	runner   *Runner
 }
 
@@ -451,13 +493,48 @@ func newHarness(t *testing.T, model *clusterModel, policy Policy) *harness {
 		mutator:  newFakeMutator(model),
 		observer: &fakeObserver{model: model},
 		recorder: &fakeRecorder{},
+		trail:    audit.NewTrail(),
 	}
-	runner, err := New(h.mutator, h.observer, h.recorder, policy)
+	runner, err := New(h.mutator, h.observer, h.recorder, h.trail, policy)
 	if err != nil {
 		t.Fatalf("building runner: %v", err)
 	}
 	h.runner = runner
 	return h
+}
+
+// records returns every audit record the run appended, in trail order.
+func (h *harness) records() []audit.Record {
+	h.t.Helper()
+	return h.trail.Records()
+}
+
+// phases returns the phase tokens of the appended records, in order — the shape a
+// lifecycle assertion is usually about.
+func (h *harness) phases() []string {
+	h.t.Helper()
+	var out []string
+	for _, rec := range h.trail.Records() {
+		out = append(out, rec.Phase.String())
+	}
+	return out
+}
+
+// recordFor returns the single appended record of a phase, failing the test when
+// there is not exactly one. "Exactly one" is the assertion in almost every case: a
+// duplicated executed record would be as wrong as a missing one.
+func (h *harness) recordFor(phase audit.Phase) audit.Record {
+	h.t.Helper()
+	var found []audit.Record
+	for _, rec := range h.trail.Records() {
+		if rec.Phase == phase {
+			found = append(found, rec)
+		}
+	}
+	if len(found) != 1 {
+		h.t.Fatalf("the trail holds %d %s records, want exactly 1 (phases: %v)", len(found), phase, h.phases())
+	}
+	return found[0]
 }
 
 // execute runs the proposal with a real permission slip minted by the real approval

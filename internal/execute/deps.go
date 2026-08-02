@@ -71,19 +71,31 @@ type Observer interface {
 	Collect(ctx context.Context) (health.Snapshot, error)
 }
 
-// Recorder is the durable single-execution enforcement this package must not be
-// able to skip: after a real mutation lands, the approval artifact is marked
-// executed, and no later pass will authorize it again.
+// Recorder is this package's write access to the approval trail: the durable
+// single-execution enforcement it must not be able to skip, plus the follow-up
+// notes that make the artifact readable as a lifecycle.
 //
-// It is narrowed to the one gatekeeper method this package is allowed to call.
+// It is narrowed to the two gatekeeper methods this package is allowed to call.
 // Nothing here may open, refuse, or withdraw an approval — the gate decides, the
-// runner acts and reports back — and an interface with exactly one method is the
-// cheapest way to make that structural rather than conventional.
+// runner acts and reports back — and an interface listing exactly what may be
+// written is the cheapest way to make that structural rather than conventional.
+//
+// The two methods are separate because only one of them may run more than once. The
+// executed label is applied the instant a mutation lands and must mean exactly "a
+// real mutation landed"; the audit notes arrive afterwards, repeatedly, and for
+// attempts that never executed at all. Folding them into one method would either
+// re-label actions that did not run or drop the notes that say so.
 type Recorder interface {
 	// RecordExecution posts the outcome onto the approval trail and applies the
 	// executed label. See [approve.Gatekeeper.RecordExecution] for why it is called
 	// after the action rather than before.
 	RecordExecution(ctx context.Context, auth *approve.Authorization, detail string) error
+
+	// RecordOutcome posts a note onto the approval trail without touching any label.
+	// It is how the audit lifecycle — the convergence verdict, a clean abort, a
+	// rollback — reaches the artifact after the executed label has already been
+	// settled.
+	RecordOutcome(ctx context.Context, auth *approve.Authorization, note string) error
 }
 
 // The production implementations, asserted at compile time. If any of these three

@@ -73,6 +73,7 @@ import (
 	"time"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/approve"
+	"github.com/Sayfan-AI/MaKlaude/internal/audit"
 	"github.com/Sayfan-AI/MaKlaude/internal/kube"
 	"github.com/Sayfan-AI/MaKlaude/internal/remediate"
 )
@@ -147,22 +148,30 @@ type Runner struct {
 	mutator  Mutator
 	observer Observer
 	recorder Recorder
+	trail    audit.Sink
 	policy   Policy
 }
 
-// New builds a runner over the write path, the live cluster view, and the approval
-// trail.
+// New builds a runner over the write path, the live cluster view, the approval
+// trail, and the audit trail.
 //
-// All three dependencies are required and a missing one is an error rather than a
-// tolerated nil. The recorder in particular has no safe default: without it an
-// execution is never marked on the trail, so the next reconciliation pass would
-// authorize the same action again, and "exactly once" would quietly become "once
-// per cycle". A no-op recorder is a thing a caller must construct on purpose, not
-// something they get by leaving an argument out.
+// All four dependencies are required and a missing one is an error rather than a
+// tolerated nil. Two of them have no safe default at all.
+//
+// Without the recorder an execution is never marked on the approval trail, so the
+// next reconciliation pass would authorize the same action again and "exactly once"
+// would quietly become "once per cycle".
+//
+// Without the audit sink a mutation happens with no record of who authorized it or
+// what it did — and the failure is silent, which is what makes a nil-tolerating
+// default unacceptable here. An unaudited write path is not a degraded MaKlaude, it
+// is a different product. A caller that genuinely wants records discarded builds an
+// [audit.Trail] and drops it on the floor, which is an explicit act rather than an
+// omitted argument.
 //
 // A zero [Policy] takes the shipped defaults; see [Policy] for why a forgotten
 // field must not be read literally.
-func New(mutator Mutator, observer Observer, recorder Recorder, policy Policy) (*Runner, error) {
+func New(mutator Mutator, observer Observer, recorder Recorder, trail audit.Sink, policy Policy) (*Runner, error) {
 	switch {
 	case mutator == nil:
 		return nil, errors.New("execute: a runner requires a write client")
@@ -170,11 +179,14 @@ func New(mutator Mutator, observer Observer, recorder Recorder, policy Policy) (
 		return nil, errors.New("execute: a runner requires a cluster observer (preconditions and convergence cannot be checked without one)")
 	case recorder == nil:
 		return nil, errors.New("execute: a runner requires a recorder (single-execution is enforced on the approval trail, not in memory)")
+	case trail == nil:
+		return nil, errors.New("execute: a runner requires an audit sink (no mutating action is performed without a record of it)")
 	}
 	return &Runner{
 		mutator:  mutator,
 		observer: observer,
 		recorder: recorder,
+		trail:    trail,
 		policy:   policy.normalized(),
 	}, nil
 }
@@ -200,7 +212,22 @@ func (r *Runner) Policy() Policy { return r.policy }
 // second authorization for an artifact already marked executed. This function
 // enforces the "exactly" in "exactly once" by recording that mark; it cannot
 // enforce it by itself, and does not pretend to.
+//
+// Whatever it returns, it audits. The attempt is written to the audit trail and its
+// lifecycle rendered onto the approval artifact on every path out, including the
+// ones that sent nothing — an approved action that MaKlaude declined to run is a
+// thing an operator must be able to find out about, and silence is indistinguishable
+// from a run that never happened.
 func (r *Runner) Execute(ctx context.Context, auth *approve.Authorization, p remediate.Proposal) (Report, error) {
+	rep, err := r.execute(ctx, auth, p)
+	r.recordExecution(ctx, auth, rep)
+	return rep, err
+}
+
+// execute is the attempt itself. It is separated from [Runner.Execute] only so the
+// audit emission has exactly one place to live: every return below is a return from
+// this function, and none of them can skip the record.
+func (r *Runner) execute(ctx context.Context, auth *approve.Authorization, p remediate.Proposal) (Report, error) {
 	mode := r.mutator.Mode()
 	rep := Report{
 		Identity:      p.Identity,
@@ -209,6 +236,7 @@ func (r *Runner) Execute(ctx context.Context, auth *approve.Authorization, p rem
 		Target:        p.Target,
 		Reversibility: p.Reversibility,
 		Mode:          mode,
+		ProposedAt:    p.ProposedAt,
 		StartedAt:     time.Now().UTC(),
 	}
 	if auth.Valid() {

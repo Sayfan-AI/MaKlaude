@@ -349,6 +349,75 @@ func TestRecordExecutionRefusesAnAuthorizationTheGateNeverIssued(t *testing.T) {
 	}
 }
 
+// TestRecordOutcomeAppendsWithoutTouchingAnyLabel is why the audit trail has its
+// own recording method rather than reusing [Gatekeeper.RecordExecution].
+//
+// The executed label is applied once, the instant a mutation lands, and must mean
+// exactly "a real mutation landed". Audit notes arrive afterwards, repeatedly, and
+// for attempts that never executed at all — a drifted precondition, a refusal, a
+// rollback. Routing those through RecordExecution would label aborted actions
+// executed, which is the one label whose meaning has to stay exact.
+func TestRecordOutcomeAppendsWithoutTouchingAnyLabel(t *testing.T) {
+	h := newHarness(t)
+	req := testRequest()
+	h.pass(req)
+
+	opened := h.only()
+	approvedAt := h.at.Add(time.Second)
+	if err := h.sink.Decide(opened.Ref, ApprovedLabel, "the-gigi", approvedAt); err != nil {
+		t.Fatalf("approving: %v", err)
+	}
+	h.at = approvedAt.Add(time.Minute)
+	auth := h.pass(req).Authorized[0]
+
+	before := h.only()
+	if before.HasLabel(ExecutedLabel) {
+		t.Fatal("the artifact was already labelled executed before anything ran")
+	}
+
+	if err := h.gk.RecordOutcome(context.Background(), auth, "## Audit trail\n\nthe action was abandoned cleanly"); err != nil {
+		t.Fatalf("recording an outcome: %v", err)
+	}
+	if err := h.gk.RecordOutcome(context.Background(), auth, "## Audit trail\n\nand then it was rolled back"); err != nil {
+		t.Fatalf("recording a second outcome: %v", err)
+	}
+
+	after := h.only()
+	if after.HasLabel(ExecutedLabel) {
+		t.Fatalf("recording an audit note labelled an unexecuted action executed: %v", after.Labels)
+	}
+	if len(after.Labels) != len(before.Labels) {
+		t.Fatalf("recording an audit note changed the labels: %v → %v", before.Labels, after.Labels)
+	}
+	if !containsSubstring(after.Comments, "abandoned cleanly") || !containsSubstring(after.Comments, "rolled back") {
+		t.Fatalf("the trail did not append both notes: %v", after.Comments)
+	}
+}
+
+// TestRecordOutcomeRefusesWhatItCannotAttribute mirrors RecordExecution's guard: a
+// note on a trail the gate never authorized is a false entry, and an empty note is
+// a comment that tells a reader nothing while looking like it should.
+func TestRecordOutcomeRefusesWhatItCannotAttribute(t *testing.T) {
+	h := newHarness(t)
+
+	for _, tc := range []struct {
+		name string
+		auth *Authorization
+		note string
+	}{
+		{"a nil authorization", nil, "something happened"},
+		{"a struct literal from outside the gate", &Authorization{ref: ActionRef("1")}, "something happened"},
+		{"a granted slip with no artifact", &Authorization{granted: true}, "something happened"},
+		{"an empty note", &Authorization{granted: true, ref: ActionRef("1")}, "   "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := h.gk.RecordOutcome(context.Background(), tc.auth, tc.note); err == nil {
+				t.Fatal("RecordOutcome accepted something it should have refused")
+			}
+		})
+	}
+}
+
 // TestAPendingProposalThatSelfHealsIsWithdrawnNotExecuted is the guarantee that a
 // pending approval is not a queued job. The dangerous version of this bug is silent:
 // the problem clears, nobody notices the artifact, a human approves it later, and

@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/approve"
+	"github.com/Sayfan-AI/MaKlaude/internal/audit"
 	"github.com/Sayfan-AI/MaKlaude/internal/cluster"
 	"github.com/Sayfan-AI/MaKlaude/internal/health"
 	"github.com/Sayfan-AI/MaKlaude/internal/kube"
@@ -80,7 +81,7 @@ func TestRunner_AgainstTheRealWritePathAndCollector(t *testing.T) {
 	g := newGate(t, p)
 	auth := g.authorize()
 
-	runner, err := New(executor, collector, g.gk, fastPolicy())
+	runner, err := New(executor, collector, g.gk, audit.NewTrail(), fastPolicy())
 	if err != nil {
 		t.Fatalf("building runner: %v", err)
 	}
@@ -149,7 +150,7 @@ func TestRunner_DryRunAgainstTheRealWritePath(t *testing.T) {
 	p := cordonProposal()
 	sink := approve.NewMemorySink()
 	recorder := approve.NewGatekeeper(sink, notify.NewNopNotifier(), approve.DefaultPolicy())
-	runner, err := New(executor, health.NewCollector(kube.NewClientWithInterface(testCluster, clientset)), recorder, fastPolicy())
+	runner, err := New(executor, health.NewCollector(kube.NewClientWithInterface(testCluster, clientset)), recorder, audit.NewTrail(), fastPolicy())
 	if err != nil {
 		t.Fatalf("building runner: %v", err)
 	}
