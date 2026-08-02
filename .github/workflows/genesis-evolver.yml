@@ -57,7 +57,7 @@ jobs:
         with:
           # Subscription OAuth token (`claude setup-token`), not an API key:
           # ANTHROPIC_API_KEY went invalid and 401'd every run for 3.5 days (#150).
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ steps.app-token.outputs.token }}
           allowed_bots: "genesis-dev-bot[bot]"
           # Reaches the activity-logging hooks in .claude/settings.json. The
