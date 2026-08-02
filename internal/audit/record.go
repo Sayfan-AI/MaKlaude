@@ -109,7 +109,9 @@ type Change struct {
 	Mode string
 
 	// Scope is the rendered write scope the request travelled through — the exact
-	// method and path the transport admitted.
+	// method and path the transport admitted. It survives redaction intact; see
+	// [Record.redacted] for why a value that looks like free text is treated as a
+	// structured identifier.
 	Scope string
 
 	// ResourceVersion is the optimistic-concurrency token the request was conditioned
@@ -375,10 +377,10 @@ func (r Record) changeSummary() string {
 //
 // Redacted: the fields whose content originates in the cluster or in an API server
 // response and is therefore outside MaKlaude's control — the convergence detail, the
-// terminating error, the write scope, the pre-state values, the rollback note and
-// description, and the free-form Detail. Any of those can carry a credential that
-// leaked into a container message, an annotation, or an error string, and all of
-// them end up in a world-readable artifact.
+// terminating error, the pre-state values, the rollback note and description, and
+// the free-form Detail. Any of those can carry a credential that leaked into a
+// container message, an annotation, or an error string, and all of them end up in a
+// world-readable artifact.
 //
 // Not redacted: the structured identifiers — the proposal identity, cluster,
 // operation, target, reversibility, title, the approver's identity and authority,
@@ -388,11 +390,24 @@ func (r Record) changeSummary() string {
 // the high-entropy sweep would blank any object name over 24 characters, and a
 // record whose target reads "[REDACTED]" is not an audit record.
 //
+// [Change.Scope] is in that second group, and it is the one entry whose membership
+// is not obvious from its type, so it is argued rather than listed (#132). It looks
+// like free text and reads like a URL, but it is assembled by
+// [kube.WriteScope.String] from a mutating HTTP method and an API path built out of
+// a fixed group/version/resource triple plus a namespace and object name the API
+// server has already validated as DNS-1123 — and never a query string, which is
+// where a token-bearing parameter would live. So there is nothing in it for the
+// sweep to protect, while the sweep's own character class ([A-Za-z0-9+/_-]) matches
+// `/`, `_` and `-`, which makes every real path one unbroken 24+ character run. The
+// field that pins an action to a concrete request against a concrete resource
+// collapsed to "PATCH /[REDACTED]" in every record until this exemption; a trail
+// that can say a PATCH happened but not what it was addressed to answers half the
+// question the trail exists for.
+//
 // The split is a judgment, so it is stated here rather than left to be inferred
 // from the code, and it is asserted by test rather than by reading.
 func (r Record) redacted() Record {
 	r.Detail = redact.String(r.Detail)
-	r.Change.Scope = redact.String(r.Change.Scope)
 	r.Outcome.Detail = redact.String(r.Outcome.Detail)
 	r.Outcome.Error = redact.String(r.Outcome.Error)
 	r.Rollback.Note = redact.String(r.Rollback.Note)

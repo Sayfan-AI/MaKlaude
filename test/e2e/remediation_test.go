@@ -488,14 +488,13 @@ func assertConverged(t *testing.T, rep execute.Report) {
 		t.Errorf("no pre-state was captured for the mutated object")
 	}
 
-	// The scope is checked HERE, on the report, rather than on the audit record derived
-	// from it. It is the one field that says which exact request went on the wire, and
-	// the trail's copy of it is deliberately redacted: audit.Record.redacted runs the
-	// scope through the high-entropy sweep, whose 24-character rule matches the whole
-	// unbroken `/apis/apps/v1/namespaces/…/deployments/wedged` run, so the stored record
-	// reads `PATCH /[REDACTED]`. That is the audit package's own documented, tested
-	// choice (a scope carrying a query token must not survive), not something to work
-	// around from here — so the check goes where the value is intact.
+	// The scope is the one field that says which exact request went on the wire, so it
+	// is checked on the report here AND on the audit record derived from it (see
+	// assertTrailTellsTheWholeStory). Those were not always the same value: the trail's
+	// copy used to run through the high-entropy sweep, whose 24-character rule matches
+	// the whole unbroken `/apis/apps/v1/namespaces/…/deployments/wedged` run, so every
+	// stored record read `PATCH /[REDACTED]` (#132). Checking both ends is what makes
+	// the collapse impossible to reintroduce silently.
 	if rep.Outcome == nil {
 		t.Fatalf("the report carries no outcome for an executed action")
 	}
@@ -677,10 +676,12 @@ func assertAuditTrailComplete(t *testing.T, trail *audit.Trail, done remediation
 	case !executed.Change.RecordedOnTrail:
 		t.Errorf("the executed record says the execution never reached the approval trail")
 	}
-	// Change.Scope is deliberately NOT asserted here; see assertConverged for why the
-	// trail's copy of it reads `PATCH /[REDACTED]` and where the intact value is
-	// checked instead. What the record must carry is the precondition the request was
-	// conditioned on, which redaction leaves alone.
+	// The stored record must name the request it is a record OF. This is the assertion
+	// #132 was reported from: the scope reached the trail as `PATCH /[REDACTED]`, so a
+	// reader could see that a PATCH happened and not what it was addressed to.
+	if !strings.Contains(executed.Change.Scope, "/namespaces/"+e2eNamespace+"/deployments/"+wedgedDeploy) {
+		t.Errorf("the executed record's scope %q does not name the approved object", executed.Change.Scope)
+	}
 	if executed.Change.ResourceVersion == "" {
 		t.Errorf("the executed record does not say which resourceVersion the action was conditioned on")
 	}

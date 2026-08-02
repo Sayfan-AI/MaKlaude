@@ -79,7 +79,6 @@ func fullRecord() Record {
 func TestRecord_RedactsEveryClusterDerivedFreeTextField(t *testing.T) {
 	cases := map[string]func(*Record){
 		"the free-form detail":        func(r *Record) { r.Detail = "context: " + seededSecret },
-		"the write scope":             func(r *Record) { r.Change.Scope = "PATCH /api/v1/x?token=" + seededSecret },
 		"the convergence detail":      func(r *Record) { r.Outcome.Detail = "container said " + seededSecret },
 		"the terminating error":       func(r *Record) { r.Outcome.Error = "admission denied: " + seededSecret },
 		"the rollback note":           func(r *Record) { r.Rollback.Note = "run: kubectl --token=" + seededSecret },
@@ -137,6 +136,40 @@ func TestRecord_KeepsTheStructuredIdentifiers(t *testing.T) {
 	}
 	if got.Action.Target.Name != rec.Action.Target.Name {
 		t.Errorf("target name changed: %q → %q", rec.Action.Target.Name, got.Action.Target.Name)
+	}
+}
+
+// TestRecord_KeepsTheWriteScopeIntact is the same exemption as the identifiers
+// above, split out because it is the one that was wrong (#132) and the one whose
+// membership a future reader is most likely to doubt.
+//
+// A real API path is a single unbroken run of characters the high-entropy sweep
+// matches, so redacting this field does not trim it — it destroys it whole, and
+// every record ever written said "PATCH /[REDACTED]". The scope carries no secret
+// to protect: it is a mutating method plus a path built from a fixed
+// group/version/resource triple and API-server-validated DNS-1123 names, with no
+// query string. The case below is the exact scope the T6 e2e produces, which is
+// where the collapse was found.
+func TestRecord_KeepsTheWriteScopeIntact(t *testing.T) {
+	const scope = "PATCH /apis/apps/v1/namespaces/maklaude-e2e/deployments/wedged"
+
+	rec := fullRecord()
+	rec.Change.Scope = scope
+	// The executed phase is the one whose rendering carries the scope at all, so it
+	// is the only phase where the collapse was visible and the only one worth
+	// asserting the rendering of.
+	rec.Phase = PhaseExecuted
+
+	got := rec.redacted()
+
+	if got.Change.Scope != scope {
+		t.Errorf("the write scope did not survive redaction: %q → %q", scope, got.Change.Scope)
+	}
+	// The record's rendering is what a human actually reads, so the intact value has
+	// to reach it too — a field kept whole and then dropped from the rendering
+	// answers nothing.
+	if !strings.Contains(got.String(), scope) {
+		t.Errorf("the rendered record does not carry the write scope %q:\n%s", scope, got.String())
 	}
 }
 
