@@ -108,11 +108,17 @@ verify_app_installed
 echo "Seeding secrets onto $REPO ..."
 # Pipe via stdin (printf is a builtin) so values never reach the process arg list.
 #
-# The Claude credential is a subscription OAuth token (`claude setup-token`), NOT
-# an API key. It must stay in lockstep with what the workflows read: seeding a
-# secret no workflow references leaves every Claude run dying at validate-env,
-# and seeding the wrong one is the #150 outage with extra steps. That agreement
-# is pinned by TestActivateSeedsTheCredentialWorkflowsRead.
+# The Claude credential is an Anthropic API key, and it must stay in lockstep
+# with what the workflows read: seeding a secret no workflow references leaves
+# every Claude run dying at validate-env, and seeding the wrong one is the #150
+# outage with extra steps. That agreement is pinned by
+# TestActivateSeedsTheCredentialWorkflowsRead.
+#
+# Do NOT swap this to a subscription OAuth token (`claude setup-token`) to match
+# what local mode uses. The two paths authenticate differently on purpose: local
+# `genesis serve` runs an already-authenticated CLI and needs no secret at all,
+# while CI is unattended automation and must not bill a person's subscription.
+# PR #152 made that swap and was reverted in 2931732; see #150.
 printf '%s' "$ANTHROPIC_API_KEY"   | gh secret set ANTHROPIC_API_KEY
 printf '%s' "$GENESIS_GITHUB_APP_ID"     | gh secret set GENESIS_APP_ID
 printf '%s' "$GENESIS_GITHUB_APP_SECRET" | gh secret set GENESIS_APP_PRIVATE_KEY
