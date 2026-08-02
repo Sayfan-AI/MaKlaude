@@ -153,18 +153,19 @@ func (p Phase) String() string {
 // Authority says WHAT KIND of thing authorized an action, as distinct from which
 // particular one did.
 //
-// It exists because "approved by" is about to stop meaning one thing. Today every
-// authorization traces to a person who applied a label. An explicit approval bypass
-// is planned (issue #124), under which MaKlaude may act with no human in the loop
-// at all — and the one thing such a mode must never do is write a record that reads
-// like a person reviewed something no person saw. A trail that overstates human
-// involvement is worse than no trail: it launders an unreviewed action into a
-// reviewed one, permanently, in the artifact an incident review will trust.
+// It exists because "approved by" stopped meaning one thing. Almost every
+// authorization traces to a person who applied a label; under the autonomous-mode
+// bypass ([approve.AutoApproveEnv]) MaKlaude may act with no human in the loop at all —
+// and the one thing such a mode must never do is write a record that reads like a
+// person reviewed something no person saw. A trail that overstates human involvement is
+// worse than no trail: it launders an unreviewed action into a reviewed one,
+// permanently, in the artifact an incident review will trust.
 //
 // So the kind of authority is a field rather than an inference from whether
-// [Approver.Identity] happens to look like a login. When the bypass lands it sets
-// [AuthorityPolicy] and this package renders it differently; nothing about the
-// record's shape has to change, and no existing record is reinterpreted.
+// [Approver.Identity] happens to look like a login. The bypass sets [AuthorityPolicy]
+// and this package renders it differently; nothing about the record's shape had to
+// change when it landed, and no record written before it was reinterpreted. That is
+// what defining the enum ahead of its first writer bought.
 //
 // The zero value is [AuthorityUnattributed], so a record built without an approver
 // says "nobody is named" rather than silently claiming a human.
@@ -181,12 +182,14 @@ const (
 	AuthorityHuman
 
 	// AuthorityPolicy means configured policy waived the human approval and no person
-	// reviewed the action. [Approver.Identity] names the policy, never a login.
+	// reviewed the action. [Approver.Identity] names the policy, never a login, and
+	// [Approver.ApprovedAt] is the zero time because no decision was made.
 	//
-	// Nothing sets this yet; it is the shape issue #124's bypass writes into. It is
-	// defined now so that when the bypass arrives, distinguishing a waived action from
-	// a reviewed one is a rendering change rather than a migration of every record
-	// already written.
+	// It is written by the execution layer whenever the approval gate granted its
+	// permission slip under [approve.AuthorityPolicy] — the autonomous-mode bypass. Note
+	// that a process running in autonomous mode still records a genuine, attributable
+	// human approval as [AuthorityHuman]: the authority describes what happened to THIS
+	// action, not how the process was configured.
 	AuthorityPolicy
 )
 

@@ -107,10 +107,13 @@ set these before running the scan:
 | `MAKLAUDE_GITHUB_REPO`  | `owner/repo` to use as the comms trail.                   |
 | `MAKLAUDE_GITHUB_TOKEN` | Token with `issues:write` on that repo. Never logged.     |
 | `MAKLAUDE_GITHUB_API`   | Optional REST API base override (GitHub Enterprise).      |
+| `MAKLAUDE_GITHUB_SELF_LOGIN` | The login the token above belongs to. **Required** once the approval gate runs against a live trail, so a decision label MaKlaude applied to its own approval issue is recognized and refused. See [autonomous-mode.md](autonomous-mode.md). |
 
 See the [Comms trail & escalation](../README.md#comms-trail--escalation) section
 of the README for the issue lifecycle (open / recur / clear) and the
-`needs:human` gating model.
+`needs:human` gating model, and
+[Approval gate & autonomous mode](../README.md#approval-gate--autonomous-mode) for
+the separate trail mutating actions travel on.
 
 ## Next steps
 

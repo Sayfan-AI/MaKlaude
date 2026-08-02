@@ -3,6 +3,8 @@ package execute
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"sort"
 	"sync"
 	"testing"
@@ -688,6 +690,13 @@ func (h *harness) execute(p remediate.Proposal) (Report, error) {
 	return h.runner.Execute(context.Background(), authorizationFor(h.t, p), p)
 }
 
+// executeAutoApproved runs the proposal with a real permission slip that no human
+// signed, minted by the real gate with the autonomous-mode bypass on.
+func (h *harness) executeAutoApproved(p remediate.Proposal) (Report, error) {
+	h.t.Helper()
+	return h.runner.Execute(context.Background(), autoApprovedAuthorizationFor(h.t, p), p)
+}
+
 // gate drives the real approval gate over an in-memory trail. Tests use it rather
 // than a hand-built Authorization because the type cannot be forged outside the
 // approve package — which is the property that makes it worth having, and would be
@@ -702,6 +711,17 @@ type gate struct {
 
 func newGate(t *testing.T, p remediate.Proposal) *gate {
 	t.Helper()
+	return newGateWithPolicy(t, p, approve.DefaultPolicy())
+}
+
+// newGateWithPolicy is [newGate] with an explicit approval policy, for the tests whose
+// subject is the policy — chiefly the autonomous-mode bypass, which is the one way this
+// package can be handed a permission slip nobody signed.
+//
+// The gate's warnings are captured rather than left on stderr: it logs one per
+// auto-approved action, and letting those escape would bury a real failure's output.
+func newGateWithPolicy(t *testing.T, p remediate.Proposal, policy approve.Policy) *gate {
+	t.Helper()
 	g := &gate{
 		t:    t,
 		sink: approve.NewMemorySink(),
@@ -709,8 +729,9 @@ func newGate(t *testing.T, p remediate.Proposal) *gate {
 		now:  time.Date(2026, 8, 1, 11, 0, 0, 0, time.UTC),
 	}
 	g.sink.SelfLogin = "maklaude-bot"
-	g.gk = approve.NewGatekeeper(g.sink, notify.NewNopNotifier(), approve.DefaultPolicy()).
-		WithClock(func() time.Time { return g.now })
+	g.gk = approve.NewGatekeeper(g.sink, notify.NewNopNotifier(), policy).
+		WithClock(func() time.Time { return g.now }).
+		WithLogger(log.New(io.Discard, "", 0))
 	return g
 }
 
@@ -765,10 +786,50 @@ func (g *gate) artifact() approve.ArtifactView {
 	return view
 }
 
+// autoAuthorize drives the gate with the autonomous-mode bypass on and NO human
+// touching anything, returning the single policy-waived permission slip it issues.
+//
+// It goes through the real gate for the same reason [gate.tryAuthorize] does: an
+// [approve.Authorization] cannot be forged outside its own package, and a test that
+// hand-built one would be asserting against a slip the gate would never actually
+// produce — including, here, the authority field that decides how every audit record
+// downstream reads.
+func (g *gate) autoAuthorize() *approve.Authorization {
+	g.t.Helper()
+	ctx := context.Background()
+
+	// Pass one opens the artifact as a notice; pass two authorizes it.
+	if _, err := g.gk.Reconcile(ctx, []approve.Request{g.req}); err != nil {
+		g.t.Fatalf("opening the approval request: %v", err)
+	}
+	g.now = g.now.Add(time.Second)
+
+	res, err := g.gk.Reconcile(ctx, []approve.Request{g.req})
+	if err != nil {
+		g.t.Fatalf("auto-approving: %v", err)
+	}
+	if len(res.Authorized) != 1 {
+		g.t.Fatalf("the gate issued %d authorizations, want 1", len(res.Authorized))
+	}
+	if res.Authorized[0].Authority() != approve.AuthorityPolicy {
+		g.t.Fatalf("authority = %s, want %s — this helper is meant to produce a waived slip",
+			res.Authorized[0].Authority(), approve.AuthorityPolicy)
+	}
+	return res.Authorized[0]
+}
+
 // authorizationFor mints a real permission slip for a proposal.
 func authorizationFor(t *testing.T, p remediate.Proposal) *approve.Authorization {
 	t.Helper()
 	return newGate(t, p).authorize()
+}
+
+// autoApprovedAuthorizationFor mints a real permission slip that no human signed.
+func autoApprovedAuthorizationFor(t *testing.T, p remediate.Proposal) *approve.Authorization {
+	t.Helper()
+	policy := approve.DefaultPolicy()
+	policy.AutoApprove = true
+	return newGateWithPolicy(t, p, policy).autoAuthorize()
 }
 
 // cordonProposal is the canonical reversible action: cordon a NotReady node. It is

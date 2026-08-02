@@ -51,11 +51,19 @@ type GitHubSink struct {
 
 // SelfLoginEnv is the environment variable naming the account MaKlaude itself acts
 // as, used to recognize a self-applied decision label.
+//
+// It is REQUIRED whenever a live GitHub trail is configured and the autonomous-mode
+// bypass is off; [GateConfig.Check] refuses to start otherwise. It was optional until
+// the bypass existed, and the consequence was a gate that failed open in exactly the
+// deployment where the bot heuristic below cannot help — see [GitHubSink.isSelfActor].
 const SelfLoginEnv = "MAKLAUDE_GITHUB_SELF_LOGIN"
 
-// SelfLoginFromEnv reads [SelfLoginEnv]. An empty result is safe rather than
-// permissive: see [GitHubSink.isSelfActor] for the bot-account check that holds
-// regardless of whether this is configured.
+// SelfLoginFromEnv reads [SelfLoginEnv], returning empty when it is unset.
+//
+// Empty is reported rather than rejected here because this function does not know
+// whether it is allowed to be empty — that depends on the bypass, which lives in a
+// different variable. [GateConfig] reads both and [GateConfig.Check] applies the rule;
+// this is the raw read the two are assembled from.
 func SelfLoginFromEnv(getenv func(string) string) string {
 	if getenv == nil {
 		return ""
@@ -69,8 +77,15 @@ func SelfLoginFromEnv(getenv func(string) string) string {
 // crashing — the same graceful-degradation seam the escalation trail uses.
 //
 // selfLogin names the account MaKlaude runs as, so a decision label MaKlaude applied
-// to its own artifact is recognized and refused. It may be empty; the bot-account
-// check in [GitHubSink.isSelfActor] still applies.
+// to its own artifact is recognized and refused.
+//
+// The constructor accepts an empty selfLogin, and the requirement that it not be empty
+// is enforced one layer up in [SinkFromEnv]. That looks like the check being in the
+// wrong place and is deliberate: whether an unknown self-identity is acceptable depends
+// on the autonomous-mode bypass, which this constructor cannot see, so hard-requiring a
+// login here would make the sanctioned unattended deployment unrepresentable. See
+// [GateConfig.Check] for the full argument and for why the degraded [MemorySink] path
+// is exempt.
 func NewGitHubSink(cfg escalate.GitHubConfig, selfLogin string) (*GitHubSink, bool) {
 	if !cfg.Configured() {
 		return nil, false
@@ -162,6 +177,7 @@ func (g *GitHubSink) pendingFrom(ctx context.Context, issue ghIssue) (PendingAct
 	pa.ThreadTS, _ = ParseThreadMarker(issue.Body)
 	pa.PreviewedResourceVersion, pa.PreviewedAt, _ = ParsePreviewMarker(issue.Body)
 	pa.PreviewedState = ParsePreviewStateMarker(issue.Body)
+	pa.GateMode = ParseGateMarker(issue.Body)
 
 	events := map[string]labelEvent{}
 	if labels[ApprovedLabel] || labels[RejectedLabel] {
@@ -240,12 +256,23 @@ func (g *GitHubSink) labelEvents(ctx context.Context, number int) (map[string]la
 //   - The login matches the configured [SelfLoginEnv], which covers MaKlaude running
 //     under a personal access token belonging to a normal user account.
 //   - GitHub reports the actor as a Bot, or its login carries the "[bot]" suffix
-//     GitHub Apps are rendered with. This covers the deployment MaKlaude actually
-//     ships as — a GitHub App — and, crucially, it holds even when nobody configured
-//     the login. A gate whose central protection is opt-in is not a gate.
+//     GitHub Apps are rendered with. This covers the deployment MaKlaude ships as — a
+//     GitHub App — and holds without any configuration at all.
 //
-// Neither check is a substitute for the other: a bot check alone misses a PAT
-// deployment, and a login check alone silently fails open when the variable is unset.
+// Neither check is a substitute for the other, and the asymmetry is what made the
+// login mandatory. A bot check alone misses the case it most needs to catch: under
+// `genesis serve`, MaKlaude runs on the operator's own personal token, so its label
+// events carry a normal user login with type "User" and nothing here recognizes them.
+// A login check alone is fine in principle and was worthless in practice, because
+// [SelfLoginEnv] was unset in every environment and an unset login silently disables
+// the branch that reads it.
+//
+// So this used to fail OPEN in exactly one deployment — local mode — and that is the
+// one where MaKlaude and the human share an account. [GateConfig.Check] now refuses to
+// start a live gate with the login unset unless the operator has explicitly waived the
+// requirement for approval altogether. A gate whose central protection is opt-in is not
+// a gate; the fix is not to make the protection cleverer but to stop the process that
+// cannot perform it from claiming it does.
 func (g *GitHubSink) isSelfActor(login, actorType string) bool {
 	if login == "" {
 		return false

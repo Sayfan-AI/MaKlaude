@@ -78,12 +78,52 @@ const (
 	previewStateMarkerPrefix = "<!-- maklaude:preview-state="
 	previewStateMarkerSuffix = " -->"
 
+	// The approval posture the body DESCRIBES, kept as its own marker for the same
+	// reason the preview-state marker is its own: it changes independently of
+	// everything else, and a body that describes the wrong one is wrong in a way a
+	// reader cannot detect. See [PendingAction.GateMode].
+	gateMarkerPrefix = "<!-- maklaude:gate="
+	gateMarkerSuffix = " -->"
+
 	// The chat thread handle, patched in after the chat root is posted, exactly as
 	// the escalation trail does — the artifact is the durable store for thread
 	// continuity so no second datastore is introduced.
 	threadMarkerPrefix = "<!-- maklaude:proposal-thread="
 	threadMarkerSuffix = " -->"
 )
+
+// Gate-mode tokens recorded in the gate marker. They name the posture the body was
+// written under, not the posture in force now — comparing the two is what forces a
+// refresh when an operator flips the bypass.
+const (
+	gateHumanGated = "human-gated"
+	gateAutonomous = "autonomous-no-human-review"
+)
+
+// gateModeToken renders the posture a body written under this policy would describe.
+func gateModeToken(policy Policy) string {
+	if policy.AutoApprove {
+		return gateAutonomous
+	}
+	return gateHumanGated
+}
+
+// gateMarker renders the hidden marker embedding the described approval posture.
+func gateMarker(policy Policy) string {
+	return gateMarkerPrefix + gateModeToken(policy) + gateMarkerSuffix
+}
+
+// ParseGateMarker extracts the approval posture the body describes, returning an empty
+// string when no marker is present. Absence is reported as unknown rather than
+// defaulted to the human-gated token, so a body predating the marker re-renders
+// instead of being assumed to describe the posture currently in force.
+func ParseGateMarker(body string) string {
+	v, ok := betweenMarkers(body, gateMarkerPrefix, gateMarkerSuffix)
+	if !ok {
+		return ""
+	}
+	return v
+}
 
 // proposalMarker renders the hidden marker embedding a proposal identity.
 func proposalMarker(id remediate.ProposalIdentity) string {
@@ -261,11 +301,22 @@ func Title(req Request) string {
 //
 // It is content-only, like [escalate.EscalationSummary]: the notify layer adds the
 // banner, the link, and any mention.
-func ApprovalSummary(req Request) string {
+//
+// The last line changes with the policy, and that is the whole reason this takes one.
+// "Nothing runs until a human adds the `approved` label" is the single most important
+// sentence in the message and it is FALSE under the bypass — a chat notice that keeps
+// saying it while MaKlaude acts unattended is worse than no notice, because a reader
+// who has seen it a hundred times will not re-read it on the hundred-and-first.
+func ApprovalSummary(req Request, policy Policy) string {
 	p := req.Proposal
-	return fmt.Sprintf(
-		"%s\nAction: %s on `%s` (cluster `%s`)\nReversibility: %s\nNothing runs until a human adds the `%s` label to the linked issue.",
-		p.Title, p.Operation, p.Target.String(), p.Cluster, p.Reversibility, ApprovedLabel)
+	closing := fmt.Sprintf("Nothing runs until a human adds the `%s` label to the linked issue.", ApprovedLabel)
+	if policy.AutoApprove {
+		closing = fmt.Sprintf(
+			"AUTONOMOUS MODE: MaKlaude will run this itself, with NO human review, on its next pass. Add the `%s` label to the linked issue to stop it.",
+			RejectedLabel)
+	}
+	return fmt.Sprintf("%s\nAction: %s on `%s` (cluster `%s`)\nReversibility: %s\n%s",
+		p.Title, p.Operation, p.Target.String(), p.Cluster, p.Reversibility, closing)
 }
 
 // Body renders the full approval artifact: exactly what will run, on which
@@ -286,16 +337,36 @@ func ApprovalSummary(req Request) string {
 // reads as "nothing to worry about" and a missing dry-run is precisely something to
 // worry about.
 //
+// # Under the bypass the body is a notice, not a question, and says so first
+//
+// The opening line is a promise ("nothing runs until a human adds a label") that
+// [Policy.AutoApprove] breaks. A body that keeps making it while MaKlaude acts
+// unattended is not a stale detail — it is the artifact actively misinforming the one
+// person who could still stop the action, at the moment their attention is worth most.
+// So the policy is threaded in and the lead is replaced, and the posture is recorded in
+// a hidden marker so flipping the mode forces every open artifact to re-render before
+// anything is authorized under it (see [PendingAction.GateMode]).
+//
 // previewedAt is stamped into the hidden preview marker and shown in the body, so
 // the instant the approval is judged against is the same instant the human can see.
-func Body(req Request, previewedAt time.Time) string {
+func Body(req Request, previewedAt time.Time, policy Policy) string {
 	p := req.Proposal
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "MaKlaude is requesting approval to run **one mutating action** on cluster **%s**.\n\n", p.Cluster)
-	fmt.Fprintf(&b, "> Nothing runs until a human adds the `%s` label to this issue. Adding `%s` declines it. "+
-		"An approval authorizes **this action, on this object, at the cluster state shown below, once** — it is never a standing grant.\n\n",
-		ApprovedLabel, RejectedLabel)
+	if policy.AutoApprove {
+		fmt.Fprintf(&b, "MaKlaude is about to run **one mutating action** on cluster **%s**, and it is **not waiting for you**.\n\n", p.Cluster)
+		fmt.Fprintf(&b, "> **AUTONOMOUS MODE IS ENABLED** (`%s`). MaKlaude will authorize this action itself on its next reconciliation pass — "+
+			"**no human will review it**, and the audit trail will record it as waived by policy rather than approved by a person. "+
+			"This issue is a notice, not a question.\n>\n"+
+			"> Add the `%s` label to stop it: a human's refusal still overrides autonomous mode. The `%s` label is on this issue so you SEE it, "+
+			"not because MaKlaude is waiting for you.\n\n",
+			AutoApproveEnv, RejectedLabel, NeedsHumanLabel)
+	} else {
+		fmt.Fprintf(&b, "MaKlaude is requesting approval to run **one mutating action** on cluster **%s**.\n\n", p.Cluster)
+		fmt.Fprintf(&b, "> Nothing runs until a human adds the `%s` label to this issue. Adding `%s` declines it. "+
+			"An approval authorizes **this action, on this object, at the cluster state shown below, once** — it is never a standing grant.\n\n",
+			ApprovedLabel, RejectedLabel)
+	}
 
 	writeActionTable(&b, req, previewedAt)
 	writeWhatWillRun(&b, req)
@@ -303,16 +374,18 @@ func Body(req Request, previewedAt time.Time) string {
 	writeRollback(&b, req)
 	writeDiagnosis(&b, req)
 	writePreconditions(&b, req)
-	writeHowToDecide(&b, req)
+	writeHowToDecide(&b, req, policy)
 
 	fmt.Fprintf(&b, "\n---\n*Requested automatically by MaKlaude. This issue is refreshed while the proposal stands, "+
 		"and is **withdrawn without running anything** if the problem resolves on its own.*\n")
 
 	// The markers MUST be present and parseable: they are the durable record of
-	// which proposal this is and which cluster state it was previewed against.
+	// which proposal this is, which cluster state it was previewed against, and which
+	// approval posture the text above describes.
 	fmt.Fprintf(&b, "\n%s\n", proposalMarker(p.Identity))
 	fmt.Fprintf(&b, "%s\n", previewMarker(p.Target.ResourceVersion, previewedAt))
 	fmt.Fprintf(&b, "%s\n", previewStateMarker(req.Preview))
+	fmt.Fprintf(&b, "%s\n", gateMarker(policy))
 	return b.String()
 }
 
@@ -425,7 +498,16 @@ func writePreconditions(b *strings.Builder, req Request) {
 // stops applying") rather than as policy, because that is how an approver needs to
 // understand them: not as rules MaKlaude follows but as the boundaries of what
 // they are agreeing to.
-func writeHowToDecide(b *strings.Builder, req Request) {
+//
+// Under the bypass it becomes "how to stop this", which is the only decision left to a
+// reader. It still lists what remains in force, because the useful thing to tell
+// someone who has just learned that nobody reviewed an action is precisely which
+// protections did not go away with the review.
+func writeHowToDecide(b *strings.Builder, req Request, policy Policy) {
+	if policy.AutoApprove {
+		writeHowToStop(b, req)
+		return
+	}
 	b.WriteString("\n## How to decide\n\n")
 	fmt.Fprintf(b, "- **Approve:** add the `%s` label. MaKlaude records who added it and when.\n", ApprovedLabel)
 	fmt.Fprintf(b, "- **Decline:** add the `%s` label. The action is not run and is not re-proposed while this issue stays open.\n", RejectedLabel)
@@ -435,6 +517,23 @@ func writeHowToDecide(b *strings.Builder, req Request) {
 	b.WriteString("- too much time passes before the next reconciliation runs it, or\n")
 	b.WriteString("- the problem resolves on its own, in which case this is withdrawn without running anything.\n")
 	b.WriteString("\nIn any of those cases MaKlaude asks again with fresh evidence rather than acting on a stale decision.\n")
+}
+
+// writeHowToStop is the bypass's replacement for the decide section.
+func writeHowToStop(b *strings.Builder, req Request) {
+	b.WriteString("\n## How to stop this\n\n")
+	fmt.Fprintf(b, "- **Stop it:** add the `%s` label. A human's refusal overrides autonomous mode, and this action is not run "+
+		"and not re-proposed while this issue stays open.\n", RejectedLabel)
+	fmt.Fprintf(b, "- **Stop everything:** unset `%s` on the MaKlaude process. Every open request then goes back to waiting for a human.\n", AutoApproveEnv)
+	fmt.Fprintf(b, "- **Approving is not required.** Adding `%s` from your own account does not change whether this runs — it changes what the audit "+
+		"trail records, from a policy waiver to a named human approval. Worth doing only if you actually reviewed it.\n", ApprovedLabel)
+
+	b.WriteString("\nAutonomous mode waives the requirement for consent and **nothing else**. This action is still abandoned without running if:\n\n")
+	fmt.Fprintf(b, "- the target object changes (its resourceVersion moves away from `%s`),\n", req.Proposal.Target.ResourceVersion)
+	b.WriteString("- the dry-run above starts failing,\n")
+	b.WriteString("- any precondition listed above no longer holds when it is re-checked immediately before the action, or\n")
+	b.WriteString("- the problem resolves on its own, in which case this is withdrawn without running anything.\n")
+	b.WriteString("\nWhat is missing, and cannot be added afterwards, is a person having looked at it.\n")
 }
 
 // reversibilityMeaning renders, in a sentence, what a reversibility class actually
@@ -536,9 +635,51 @@ func RefusalComment(req Request, pending PendingAction, reason Reason, policy Po
 	default:
 		detail = "The approval could not be honored."
 	}
+	next := fmt.Sprintf("The issue has been refreshed with current evidence. Re-add the `%s` label if you still want this action against the state shown now.", ApprovedLabel)
+	if policy.AutoApprove {
+		// Saying "re-add the label" and stopping would imply MaKlaude is now waiting,
+		// which under the bypass it is not — it will re-decide on its own next pass. A
+		// reader who acts on the wrong one of those two beliefs loses the only window
+		// they had to intervene.
+		next = fmt.Sprintf(
+			"The issue has been refreshed with current evidence. **Autonomous mode is enabled** (`%s`), so MaKlaude will re-decide this itself on its next pass "+
+				"against the refreshed evidence — it is not waiting for you. Add the `%s` label to stop it.",
+			AutoApproveEnv, RejectedLabel)
+	}
 	return fmt.Sprintf(
-		"**Approval withdrawn — the action was NOT run.** (`%s`)\n\n%s\n\nThe issue has been refreshed with current evidence. Re-add the `%s` label if you still want this action against the state shown now.",
-		reason, detail, ApprovedLabel)
+		"**Approval withdrawn — the action was NOT run.** (`%s`)\n\n%s\n\n%s",
+		reason, detail, next)
+}
+
+// AuthorizationComment renders the note the gate posts on an artifact at the moment it
+// honors a decision, before the permission slip leaves the package.
+//
+// The two authorities get genuinely different text rather than one sentence with a
+// substituted name. A human-approved action's note is a receipt — here is who allowed
+// it and when — and a policy-waived one's is a warning, because it is the record that
+// an action ran against a live cluster with nobody having looked at it. Rendering the
+// second as the first with `@policy:MAKLAUDE_DANGEROUSLY_AUTO_APPROVE` in the name slot
+// would be technically accurate and would read, to anyone skimming, exactly like an
+// approval.
+func AuthorizationComment(auth *Authorization) string {
+	if !auth.Valid() {
+		return "An authorization was recorded that the gate did not issue. This should never happen; treat it as a bug."
+	}
+	tail := "\n\nThe action has **not** run yet; its outcome will be recorded here."
+
+	if !auth.Authority().HumanReviewed() {
+		return fmt.Sprintf(
+			"**Auto-approved — NO HUMAN REVIEWED THIS.** MaKlaude is authorized to run `%s` on `%s` (cluster `%s`) at resourceVersion `%s` because "+
+				"`%s` is enabled on the process that made this decision. Nobody approved it: the requirement for approval was waived by configuration, "+
+				"and the audit trail records it as `%s` rather than naming a person.%s",
+			auth.Operation(), auth.Target().String(), auth.Cluster(), auth.Target().ResourceVersion,
+			AutoApproveEnv, AutoApprovePolicy, tail)
+	}
+	return fmt.Sprintf(
+		"**Approval honored.** MaKlaude is authorized to run `%s` on `%s` (cluster `%s`) at resourceVersion `%s`, "+
+			"on the approval recorded by @%s at %s.%s",
+		auth.Operation(), auth.Target().String(), auth.Cluster(), auth.Target().ResourceVersion,
+		auth.Approver(), auth.ApprovedAt().UTC().Format(time.RFC3339), tail)
 }
 
 // WithdrawalComment renders the note left when an artifact is closed. Closing with
@@ -564,17 +705,32 @@ func WithdrawalComment(id remediate.ProposalIdentity, reason Reason) string {
 }
 
 // ExecutionComment renders the note recording that an authorized action ran. It
-// restates who approved it and against which resourceVersion, so the audit trail
-// answers "who allowed this, and what exactly did it act on" from the artifact
+// restates on whose authority it ran and against which resourceVersion, so the audit
+// trail answers "who allowed this, and what exactly did it act on" from the artifact
 // alone.
+//
+// It is the LAST place in this package where an authority could be misrendered, and
+// the highest-stakes one: everything before it describes something that might happen,
+// and this describes a cluster that has already changed. So it asks the authority for
+// the same reason [AuthorizationComment] does — a note reading "approved by
+// @policy:MAKLAUDE_DANGEROUSLY_AUTO_APPROVE" would be the trail's permanent record of
+// an unreviewed mutation, phrased as a review.
 func ExecutionComment(auth *Authorization, detail string) string {
 	if !auth.Valid() {
 		return "An execution was recorded against an invalid authorization. This should never happen; treat it as a bug."
 	}
-	body := fmt.Sprintf(
-		"**Executed.** `%s` on `%s` (cluster `%s`, resourceVersion `%s`), approved by @%s at %s.",
-		auth.Operation(), auth.Target().String(), auth.Cluster(), auth.Target().ResourceVersion,
-		auth.Approver(), auth.ApprovedAt().UTC().Format(time.RFC3339))
+	var body string
+	if auth.Authority().HumanReviewed() {
+		body = fmt.Sprintf(
+			"**Executed.** `%s` on `%s` (cluster `%s`, resourceVersion `%s`), approved by @%s at %s.",
+			auth.Operation(), auth.Target().String(), auth.Cluster(), auth.Target().ResourceVersion,
+			auth.Approver(), auth.ApprovedAt().UTC().Format(time.RFC3339))
+	} else {
+		body = fmt.Sprintf(
+			"**Executed — NO HUMAN REVIEWED THIS.** `%s` on `%s` (cluster `%s`, resourceVersion `%s`), run under `%s` with the approval requirement waived by policy (`%s`).",
+			auth.Operation(), auth.Target().String(), auth.Cluster(), auth.Target().ResourceVersion,
+			AutoApproveEnv, AutoApprovePolicy)
+	}
 	if d := strings.TrimSpace(detail); d != "" {
 		body += "\n\n" + d
 	}

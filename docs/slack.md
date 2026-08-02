@@ -29,7 +29,10 @@ the same graceful-degradation seam the GitHub trail uses (see the
 > **Safety (locked):** inbound is strictly read / notify / converse. A captured
 > reply only ever becomes a GitHub comment — there is **no code path** from an
 > inbound event to a cluster mutation or any actionable behavior. Anything
-> actionable still routes through MaKlaude's existing human gates.
+> actionable still routes through MaKlaude's approval gate (see
+> [autonomous-mode.md](autonomous-mode.md) for the one, explicit way that gate can be
+> waived — which is a property of the operator's configuration, never of an inbound
+> message).
 
 ## How notifications work
 
@@ -97,7 +100,9 @@ inbound listener:
 
 This is strictly **read / notify / converse**: a captured reply only ever becomes
 a GitHub comment. There is **no path** from an inbound event to a cluster
-mutation; anything actionable still routes through MaKlaude's existing human gates.
+mutation; anything actionable still routes through MaKlaude's approval gate, whose
+posture is set by the operator's configuration and never by an inbound message (see
+[autonomous-mode.md](autonomous-mode.md)).
 
 ### HTTP Events API: request signatures are verified
 

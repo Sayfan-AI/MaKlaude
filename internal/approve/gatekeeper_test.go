@@ -1,7 +1,9 @@
 package approve
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"strings"
 	"testing"
 	"time"
@@ -20,21 +22,36 @@ import (
 // its timestamp — arrives through [MemorySink.Decide], which is the whole test
 // seam. A pass that could manufacture its own approval would prove nothing.
 
-// harness bundles a gatekeeper with the sink behind it and a clock a test can move,
-// so a multi-pass scenario reads as a sequence of events rather than as plumbing.
+// harness bundles a gatekeeper with the sink behind it, a clock a test can move, and
+// the gate's own log output, so a multi-pass scenario reads as a sequence of events
+// rather than as plumbing.
 type harness struct {
 	t    *testing.T
 	sink *MemorySink
 	gk   *Gatekeeper
 	at   time.Time
+	logs *bytes.Buffer
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{t: t, sink: NewMemorySink(), at: passAt}
+	return newPolicyHarness(t, DefaultPolicy())
+}
+
+// newPolicyHarness is [newHarness] with an explicit policy, for the scenarios whose
+// subject IS the policy — chiefly the autonomous-mode bypass.
+//
+// The logger is always captured rather than only when a test asserts on it. The gate
+// warns on stderr for every auto-approved action, and a test suite that let those
+// escape would bury a real failure's output under the warnings of the tests that are
+// working correctly.
+func newPolicyHarness(t *testing.T, policy Policy) *harness {
+	t.Helper()
+	h := &harness{t: t, sink: NewMemorySink(), at: passAt, logs: &bytes.Buffer{}}
 	h.sink.SelfLogin = "maklaude-bot"
-	h.gk = NewGatekeeper(h.sink, notify.NewNopNotifier(), DefaultPolicy()).
-		WithClock(func() time.Time { return h.at })
+	h.gk = NewGatekeeper(h.sink, notify.NewNopNotifier(), policy).
+		WithClock(func() time.Time { return h.at }).
+		WithLogger(log.New(h.logs, "", 0))
 	return h
 }
 
