@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sayfan-AI/MaKlaude/internal/budget"
 	"github.com/Sayfan-AI/MaKlaude/internal/execute"
 	"github.com/Sayfan-AI/MaKlaude/internal/remediate"
 )
@@ -36,8 +37,78 @@ type Report struct {
 	// order, so multi-cluster output is stable.
 	Clusters []ClusterReport `json:"clusters"`
 
+	// Autonomy is the blast-radius posture: the circuit breakers and the auto-applies
+	// this pass held back. It is ALWAYS populated and always rendered, empty or not.
+	Autonomy AutonomyReport `json:"autonomy"`
+
 	// Totals aggregates across clusters. Derived by finalize.
 	Totals Totals `json:"totals"`
+}
+
+// AutonomyReport is the blast-radius layer's slice of a [Report]: what
+// [budget.Budget] is bounding, what it has closed off, and what it held back.
+//
+// Both lists are rendered unconditionally, and empty is stated in words rather than
+// left as an absent section. That is a requirement rather than a rendering taste. A
+// tripped breaker means MaKlaude has stopped acting on a cluster and is waiting for a
+// person who does not know they are needed; a suppressed auto-apply means an action a
+// rule permitted and the shape had earned did not happen. Both look, from the outside,
+// exactly like a system with nothing to do — the same invisible-nothing-happened shape
+// the dev system has had to drain out of its own loop repeatedly (stale gates, dropped
+// triage, ready-to-merge PRs). Printing them always, and saying "none", is what makes
+// the difference legible.
+type AutonomyReport struct {
+	// Configured reports whether a blast-radius budget is wired at all. When false
+	// nothing can be auto-applied, because the ceiling that would bound it does not
+	// exist — so this is a posture statement, not the absence of one.
+	Configured bool `json:"configured"`
+
+	// Sealed reports that the budget's persisted state could not be read or written,
+	// so every auto-apply is denied. See [budget.Status.Sealed]: the seal is
+	// deliberately a visible state rather than a returned error, and this is where it
+	// becomes visible.
+	Sealed     bool   `json:"sealed"`
+	SealDetail string `json:"sealDetail,omitempty"`
+
+	// StatePath names the file the breakers and cooldowns live in, so an escalation
+	// can point an operator at it instead of making them infer it from configuration.
+	StatePath string `json:"statePath,omitempty"`
+
+	// Breakers is one entry per cluster with recorded state, sorted by cluster. Closed
+	// breakers are included so a reader sees a failure run building before it trips.
+	Breakers []budget.Breaker `json:"breakers"`
+
+	// Suppressed is every auto-apply a bound held back during this pass.
+	Suppressed []budget.Suppression `json:"suppressed"`
+}
+
+// autonomyReport projects a budget's status, or the not-configured posture when there
+// is no budget. The slices are always non-nil so the JSON form has the same shape
+// whether or not anything happened.
+func autonomyReport(b *budget.Budget) AutonomyReport {
+	if b == nil {
+		return AutonomyReport{Breakers: []budget.Breaker{}, Suppressed: []budget.Suppression{}}
+	}
+	s := b.Status()
+	return AutonomyReport{
+		Configured: true,
+		Sealed:     s.Sealed,
+		SealDetail: s.SealDetail,
+		StatePath:  s.Path,
+		Breakers:   s.Breakers,
+		Suppressed: s.Suppressions,
+	}
+}
+
+// Tripped returns the open breakers.
+func (a AutonomyReport) Tripped() []budget.Breaker {
+	out := make([]budget.Breaker, 0, len(a.Breakers))
+	for _, b := range a.Breakers {
+		if b.Tripped {
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 // ClusterReport is one cluster's slice of a [Report].
@@ -220,6 +291,7 @@ func (r *Report) WriteText(w io.Writer) error {
 
 	if len(r.Clusters) == 0 {
 		b.WriteString("\nNo clusters registered.\n")
+		r.Autonomy.writeText(&b)
 		_, err := io.WriteString(w, b.String())
 		return err
 	}
@@ -266,6 +338,8 @@ func (r *Report) WriteText(w io.Writer) error {
 		}
 	}
 
+	r.Autonomy.writeText(&b)
+
 	b.WriteString("\nTotals: ")
 	fmt.Fprintf(&b, "%d cluster(s), %d proposal(s)", r.Totals.Clusters, r.Totals.Proposals)
 	if len(r.Totals.ByOperation) > 0 {
@@ -285,6 +359,55 @@ func (r *Report) WriteText(w io.Writer) error {
 
 	_, err := io.WriteString(w, b.String())
 	return err
+}
+
+// writeText renders the blast-radius posture as two always-present sections.
+//
+// The sections are written even when both are empty, and the empty case says "none"
+// rather than being skipped — see [AutonomyReport] for why the absence of a section
+// is the one rendering this must not have.
+func (a AutonomyReport) writeText(b *strings.Builder) {
+	b.WriteString("\nAutonomy (blast radius): ")
+	if !a.Configured {
+		b.WriteString("not configured — no action can be auto-applied, so nothing is bounded and nothing is suppressed.\n")
+		return
+	}
+	if a.StatePath != "" {
+		fmt.Fprintf(b, "state %s\n", a.StatePath)
+	} else {
+		b.WriteString("in-memory state (nothing survives a restart)\n")
+	}
+	if a.Sealed {
+		fmt.Fprintf(b, "  ! STATE UNREADABLE — every auto-apply is denied: %s\n", a.SealDetail)
+	}
+
+	tripped := a.Tripped()
+	if len(tripped) == 0 {
+		b.WriteString("  circuit breakers: none tripped\n")
+	} else {
+		fmt.Fprintf(b, "  circuit breakers TRIPPED (%d) — autonomy is off on these clusters until a human clears them:\n", len(tripped))
+		for _, br := range tripped {
+			fmt.Fprintf(b, "    - %s: %s (since %s)\n", br.Cluster, orUnknown(br.Detail),
+				br.TrippedAt.UTC().Format("2006-01-02 15:04:05 MST"))
+		}
+	}
+	// A failure run that has not yet tripped is the warning before the outage, so it
+	// is reported separately rather than folded into "none tripped".
+	for _, br := range a.Breakers {
+		if !br.Tripped && br.ConsecutiveFailures > 0 {
+			fmt.Fprintf(b, "    ~ %s: %d consecutive auto-apply failure(s), breaker still closed\n",
+				br.Cluster, br.ConsecutiveFailures)
+		}
+	}
+
+	if len(a.Suppressed) == 0 {
+		b.WriteString("  suppressed auto-applies: none\n")
+		return
+	}
+	fmt.Fprintf(b, "  suppressed auto-applies (%d) — eligible actions a bound held back:\n", len(a.Suppressed))
+	for _, s := range a.Suppressed {
+		fmt.Fprintf(b, "    - %s %s: %s (%s)\n", s.Cluster, s.Target, s.Reason, orUnknown(s.Detail))
+	}
 }
 
 // describeMode renders the kill switch as a sentence rather than a token, because the
