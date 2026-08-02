@@ -206,3 +206,71 @@ func TestCheckpointRejectsEmptyIntent(t *testing.T) {
 		t.Error("checkpoint.sh created a file for a whitespace-only intent")
 	}
 }
+
+// TestCheckpointRejectsUnknownFlags — the same principle as the empty-intent
+// rejection above, in the form that actually bit (#136). Intent came from "$*"
+// with only `--path` special-cased, so `checkpoint.sh --help` recorded "--help"
+// as the run's reasoning and printed "intent recorded"; 12 such entries piled up
+// locally in eight hours. It is worse than recording nothing precisely because
+// it CREATES the file: escalate.sh branches on existence, so the "No intent
+// checkpoint was recorded" diagnosis — the thing that tells a human they are
+// looking at a run that died before its first deliverable — never fires, and the
+// section reads as a confident answer instead.
+//
+// Executed rather than read, because what matters is the exit status and whether
+// a file appeared, not whether the script contains a `case` arm.
+func TestCheckpointRejectsUnknownFlags(t *testing.T) {
+	script := checkpointPathFor(t)
+
+	// -h and --help are handled separately (usage, exit 0); everything else that
+	// looks like a flag must be refused rather than guessed at.
+	for _, flag := range []string{"--verbose", "--intent", "--file", "-x", "--paths"} {
+		t.Run(flag, func(t *testing.T) {
+			tmp := t.TempDir()
+			cmd := exec.Command("bash", script, flag)
+			cmd.Env = append(os.Environ(), "RUNNER_TEMP="+tmp, "GENESIS_CHECKPOINT_FILE=")
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
+
+			if err := cmd.Run(); err == nil {
+				t.Errorf("checkpoint.sh accepted %q — a mistyped flag becomes the recorded intent, and the escalation then reports it as what the run meant to do", flag)
+			}
+			if _, err := os.Stat(filepath.Join(tmp, "genesis-intent.md")); err == nil {
+				t.Errorf("checkpoint.sh created a checkpoint file for %q; the file existing is what suppresses the no-intent diagnosis in escalate.sh", flag)
+			}
+			// The caller is an agent that will otherwise retry the same guess.
+			if !strings.Contains(stderr.String(), "stdin") {
+				t.Errorf("refusing %q does not point at stdin as the escape hatch for intent that legitimately starts with a dash; stderr:\n%s", flag, stderr.String())
+			}
+		})
+	}
+}
+
+// TestCheckpointHelpWritesNothing — `--help` is the flag agents actually reach
+// for, so it is the one that must both work and stay out of the record.
+// Supporting it removes the incentive that produced #136 in the first place;
+// exiting 0 keeps it from looking like a failure worth investigating turns over.
+func TestCheckpointHelpWritesNothing(t *testing.T) {
+	script := checkpointPathFor(t)
+
+	for _, flag := range []string{"--help", "-h"} {
+		t.Run(flag, func(t *testing.T) {
+			tmp := t.TempDir()
+			cmd := exec.Command("bash", script, flag)
+			cmd.Env = append(os.Environ(), "RUNNER_TEMP="+tmp, "GENESIS_CHECKPOINT_FILE=")
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("checkpoint.sh %s exited non-zero (%v) — asking a script what it takes must not read as a failure", flag, err)
+			}
+			if _, err := os.Stat(filepath.Join(tmp, "genesis-intent.md")); err == nil {
+				t.Errorf("checkpoint.sh %s wrote a checkpoint file — this is the exact #136 defect", flag)
+			}
+			// Usage is only useful if it names the other two ways in.
+			for _, want := range []string{"--path", "stdin"} {
+				if !strings.Contains(string(out), want) {
+					t.Errorf("usage for %s does not mention %q; got:\n%s", flag, want, out)
+				}
+			}
+		})
+	}
+}

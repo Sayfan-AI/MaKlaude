@@ -36,6 +36,18 @@
 #   checkpoint.sh "one paragraph: what I intend to do this run, and why"
 #   echo "..." | checkpoint.sh          # intent on stdin
 #   checkpoint.sh --path                # print the resolved file path, write nothing
+#   checkpoint.sh --help                # print usage, write nothing
+#
+# Unknown flags are REFUSED rather than recorded (#136). Taking intent from "$*"
+# with only `--path` special-cased meant `checkpoint.sh --help` wrote "--help"
+# into the file and reported success — 12 such entries accumulated locally. That
+# is the empty-intent bug in a costlier form: it makes the file EXIST, so
+# escalate.sh renders a flag string as the run's reasoning instead of reporting
+# "No intent checkpoint was recorded", and that absence report is what tells a
+# human they are looking at the #85 signature. So the best-effort/never-fail rule
+# below stays scoped to filesystem failures, which the caller cannot fix; a
+# mistyped flag is a caller error and fails loudly, exactly as an empty intent
+# already does.
 #
 # `--path` is the single source of truth for WHERE the checkpoint lives:
 # escalate.sh asks this script rather than recomputing the default, so the two
@@ -57,10 +69,47 @@ resolve_path() {
   printf '%s/genesis-intent.md\n' "${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
 }
 
-if [ "${1:-}" = "--path" ]; then
-  resolve_path
-  exit 0
-fi
+usage() {
+  cat <<'EOF'
+Usage:
+  checkpoint.sh "one paragraph: what I intend to do this run, and why"
+  echo "..." | checkpoint.sh     intent on stdin
+  checkpoint.sh --path           print the resolved checkpoint path, write nothing
+  checkpoint.sh --help           print this message, write nothing
+
+Env:
+  GENESIS_CHECKPOINT_FILE        override the checkpoint path (tests use this)
+  GENESIS_CHECKPOINT_MAX_LINES   bound on the retained file (default 200)
+  RUNNER_TEMP                    Actions per-job temp dir; the normal location
+EOF
+}
+
+# Flags are matched before intent so a mistyped one can never become the record.
+case "${1:-}" in
+  --path)
+    resolve_path
+    exit 0
+    ;;
+  --help | -h)
+    usage
+    exit 0
+    ;;
+  -*)
+    {
+      echo "checkpoint.sh: unknown option '$1' — refusing to record it as intent."
+      echo
+      echo "A flag written into the checkpoint is worse than no checkpoint: it makes the"
+      echo "file exist, so escalate.sh reports the flag as what the run meant to do instead"
+      echo "of reporting that no intent was recorded — and that absence is the signal a"
+      echo "human reads to identify a run that died before its first deliverable."
+      echo
+      echo "If the intent genuinely begins with a dash, pipe it on stdin."
+      echo
+      usage
+    } >&2
+    exit 2
+    ;;
+esac
 
 # Intent from argv, else stdin.
 if [ "$#" -gt 0 ]; then
