@@ -113,7 +113,7 @@ func (rs Ruleset) Validate() error {
 	seen := make(map[string]bool, len(rs))
 	for i, r := range rs {
 		if err := r.validate(); err != nil {
-			return fmt.Errorf("%w: rule %d: %s", ErrInvalidRuleset, i, err)
+			return fmt.Errorf("%w: rule %d: %w", ErrInvalidRuleset, i, err)
 		}
 		if seen[r.Name] {
 			return fmt.Errorf("%w: rule %d: duplicate rule name %q; names identify a rule in the audit trail and in a revocation, so they must be unique", ErrInvalidRuleset, i, r.Name)

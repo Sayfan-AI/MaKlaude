@@ -136,10 +136,14 @@ func (d Decision) AutoApplies() bool { return d == DecisionAutoApply }
 type Reason int
 
 const (
-	// ReasonNoRuleMatched — rules are configured, are valid, and none of them covers
-	// this proposal, with no single dimension standing out as the near miss. It is
-	// the zero value, pairing with the zero [Decision], so a zero [Verdict] is a safe
-	// one.
+	// ReasonNoRuleMatched — rules are configured and valid, none of them covers this
+	// proposal, and no dimension was identified as the near miss.
+	//
+	// It is the zero value so that a zero [Verdict] pairs with the zero [Decision]
+	// and reads as a safe one. In the current selector ladder it is not reachable
+	// from [Decide]: every configured rule fails on some dimension, and each of those
+	// has its own reason. It is kept as the unclassified fallback so that adding a
+	// selector dimension cannot produce a verdict with an unset reason.
 	ReasonNoRuleMatched Reason = iota
 
 	// ReasonAutonomyNotConfigured — the ruleset is empty or absent. This is the
@@ -346,6 +350,31 @@ type Verdict struct {
 
 // AutoApplies reports whether this verdict permits acting without a human.
 func (v Verdict) AutoApplies() bool { return v.Decision.AutoApplies() }
+
+// PolicyPrefix namespaces a rule name where it is recorded as an authorizing
+// policy, alongside a human's login in the same field. It matches the prefix the
+// blanket bypass already records under, so a reader (or a script) sees one shape
+// for "not a person" rather than two.
+const PolicyPrefix = "policy:"
+
+// PolicyIdentity renders the authorizing policy for an audit record: the rule name
+// under [PolicyPrefix], or empty when this verdict authorized nothing.
+//
+// It is what makes an earned rule distinguishable from the blanket bypass, which
+// records the same prefix over an environment variable name. The distinction is the
+// whole point of this milestone — the bypass means a human waived review, an earned
+// rule means a human approved this shape repeatedly and it worked — so a renderer
+// that collapsed the two would be a bug, and naming the specific rule is what makes
+// collapsing them impossible.
+//
+// The two can never collide: [Rule.Name] is validated lowercase, and the bypass's
+// marker is an upper-case environment variable name.
+func (v Verdict) PolicyIdentity() string {
+	if !v.AutoApplies() || v.Rule == "" {
+		return ""
+	}
+	return PolicyPrefix + v.Rule
+}
 
 // String renders the verdict as one stable line for a trail, a log, or an issue
 // comment. The three decisions read differently on purpose: an auto-apply names the

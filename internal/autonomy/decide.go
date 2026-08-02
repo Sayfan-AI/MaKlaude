@@ -49,6 +49,12 @@ func Decide(cluster string, p remediate.Proposal, rs Ruleset, trust TrustOracle)
 	if v, refused := refuse(cluster, p); refused {
 		return v
 	}
+	// The validation error's text is deliberately dropped rather than carried on the
+	// verdict. [Ruleset.Validate] is exported so the loader that reads an operator's
+	// configuration can refuse to start and say exactly what is wrong, which is where
+	// a person is actually looking; re-checking here is the runtime backstop against
+	// a ruleset that reached this function unvalidated, and its whole job is to make
+	// that case gate rather than to explain it on every proposal.
 	if err := rs.Validate(); err != nil {
 		return verdict(ReasonRulesetInvalid, "")
 	}
