@@ -9,9 +9,16 @@
 //     comms trail, then prints a structured report (text or JSON). scan never
 //     mutates a cluster; its only writes are to the escalation trail, and those
 //     degrade to an in-memory dry-run unless GitHub is configured.
+//   - remediate     — one pass of the GATED remediation cycle: observe, diagnose,
+//     propose, preview, ask a human, and execute only what they have already
+//     approved. It is off by default in the strongest sense available — without
+//     MAKLAUDE_EXECUTE_MODE it proposes and stops, constructing no write-capable
+//     client at all — and it relaxes none of the five gates the remediation
+//     design rests on.
 //
-// Continuous monitoring, remediation, and approval flows are added in later
-// milestones; scan is the deterministic, auditable core they build on.
+// The two commands are separate rather than one command with a flag because they
+// make different promises. scan's is that nothing it does can change a cluster,
+// and that promise is worth being unable to weaken by passing an argument.
 package main
 
 import (
@@ -23,6 +30,7 @@ import (
 	"os"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/cluster"
+	"github.com/Sayfan-AI/MaKlaude/internal/operate"
 	"github.com/Sayfan-AI/MaKlaude/internal/scan"
 	"github.com/Sayfan-AI/MaKlaude/internal/version"
 )
@@ -34,6 +42,7 @@ Usage:
 
 Commands:
   scan       Run a one-shot, read-only scan of every registered cluster
+  remediate  Run one pass of the gated remediation cycle (propose-only by default)
   version    Print version information and exit
   help       Show this help message and exit
 
@@ -41,7 +50,7 @@ Flags:
   -v, --version    Print version information and exit
   -h, --help       Show this help message and exit
 
-Run "maklaude scan --help" for scan-specific flags.
+Run "maklaude scan --help" or "maklaude remediate --help" for per-command flags.
 `
 
 const scanUsage = `maklaude scan — one-shot, read-only scan of every registered cluster
@@ -52,6 +61,39 @@ prints a report. It performs NO mutating action against any cluster.
 
 Usage:
   maklaude scan --config <path> [--json]
+
+Flags:
+  --config <path>   Path to the cluster registry config (see config.example.yaml). Required.
+  --json            Emit the report as JSON instead of human-readable text.
+  -h, --help        Show this help message and exit
+`
+
+const remediateUsage = `maklaude remediate — one pass of the gated remediation cycle
+
+For each cluster in the config it observes, diagnoses, and proposes remediations,
+then — only if execution has been explicitly enabled — previews each proposal as a
+server-side dry run, puts it to a human on the approval trail, and executes exactly
+what a human has already approved.
+
+EXECUTION IS OFF BY DEFAULT. With MAKLAUDE_EXECUTE_MODE unset this command proposes
+and stops: it builds no write-capable client, opens no approval request, and sends
+nothing to any cluster.
+
+  export MAKLAUDE_EXECUTE_MODE=disabled   # default. Propose only.
+  export MAKLAUDE_EXECUTE_MODE=dry-run    # full cycle, every request dryRun=All.
+  export MAKLAUDE_EXECUTE_MODE=enabled    # an approved action changes the cluster.
+
+Enabling it is necessary but not sufficient. An action must still pass every gate
+it always had: the separate write RBAC bundle (deploy/rbac/write), an approval label
+from an identity MaKlaude cannot forge, preconditions re-checked against a fresh
+read, and the resourceVersion the proposal was computed from. See docs/remediation.md.
+
+Approvals travel over the same MAKLAUDE_GITHUB_* configuration the escalation trail
+uses. Without it the gate degrades to an in-memory trail nobody can approve on, so
+the cycle asks and nothing is ever authorized.
+
+Usage:
+  maklaude remediate --config <path> [--json]
 
 Flags:
   --config <path>   Path to the cluster registry config (see config.example.yaml). Required.
@@ -85,6 +127,8 @@ func run(args []string, out io.Writer) int {
 		return 0
 	case "scan":
 		return runScan(fs.Args()[1:], out)
+	case "remediate":
+		return runRemediate(fs.Args()[1:], out)
 	case "", "help":
 		fmt.Fprint(out, usage)
 		return 0
@@ -141,6 +185,71 @@ func runScan(args []string, out io.Writer) int {
 	}
 	if writeErr != nil {
 		fmt.Fprintf(out, "maklaude scan: %v\n", writeErr)
+		return 1
+	}
+	return 0
+}
+
+// runRemediate parses the remediate subcommand's flags, builds the cluster registry,
+// runs ONE pass of the gated remediation cycle, and writes the report.
+//
+// Exit codes: 0 on success, 2 on a usage/config error, 1 on a run failure. Note what
+// is deliberately NOT an error code: a pass that proposed actions and executed none
+// exits 0, because that is the gate working. Only a run that could not be performed
+// at all fails.
+//
+// The [operate.New] error path is the one worth reading twice. It fires on an
+// unrecognized MAKLAUDE_EXECUTE_MODE, and on the two approval-gate misconfigurations
+// that would otherwise produce a gate that looks functional while authorizing things
+// nobody decided. Refusing to start is the only place those can be made visible: by
+// the time they matter, the artifact already reads like a human decision.
+func runRemediate(args []string, out io.Writer) int {
+	fs := flag.NewFlagSet("remediate", flag.ContinueOnError)
+	fs.SetOutput(out)
+	var configPath string
+	var asJSON bool
+	fs.StringVar(&configPath, "config", "", "path to the cluster registry config file (required)")
+	fs.BoolVar(&asJSON, "json", false, "emit the report as JSON instead of text")
+	fs.Usage = func() { fmt.Fprint(out, remediateUsage) }
+
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if configPath == "" {
+		fmt.Fprintln(out, "maklaude remediate: --config is required")
+		fmt.Fprint(out, remediateUsage)
+		return 2
+	}
+
+	reg, err := cluster.NewRegistryFromFile(configPath)
+	if err != nil {
+		fmt.Fprintf(out, "maklaude remediate: %v\n", err)
+		return 2
+	}
+
+	cycle, _, err := operate.New()
+	if err != nil {
+		fmt.Fprintf(out, "maklaude remediate: %v\n", err)
+		return 2
+	}
+
+	report, err := cycle.Run(context.Background(), reg)
+	if err != nil {
+		fmt.Fprintf(out, "maklaude remediate: %v\n", err)
+		return 1
+	}
+
+	var writeErr error
+	if asJSON {
+		writeErr = report.WriteJSON(out)
+	} else {
+		writeErr = report.WriteText(out)
+	}
+	if writeErr != nil {
+		fmt.Fprintf(out, "maklaude remediate: %v\n", writeErr)
 		return 1
 	}
 	return 0
