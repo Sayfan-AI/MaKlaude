@@ -210,6 +210,10 @@ jobs:
           # TestE2E_BinaryTwoPassGatedRemediation. See stuck-deploy.yaml.
           kubectl apply -f test/e2e/manifests/wedged-deploy.yaml
           kubectl apply -f test/e2e/manifests/stuck-deploy.yaml
+          # Milestone 5's unattended scenarios: three more fixable faults, one per
+          # namespace, because a namespace is the only bound an autonomy rule has. See
+          # the manifest header for the layout and why `neverready` cannot converge.
+          kubectl apply -f test/e2e/manifests/autonomy-scenarios.yaml
 
       - name: Wait for crashloop pod to enter CrashLoopBackOff
         run: |
@@ -298,17 +302,58 @@ jobs:
       # this one, so it is known-good", and the whole justification for the rollback
       # MaKlaude proposes rests on it having been true.
       #
-      # Both scenarios go through the same three phases, so they share one loop rather
-      # than three duplicated step bodies. `wedged` is remediated in-process by
-      # TestE2E_GatedRemediation and `stuck` by the shipped binary in
-      # TestE2E_BinaryTwoPassGatedRemediation; each test needs a fault of its own
-      # because the first thing a successful remediation does is remove it.
+      # The scenarios go through the same three phases, so they share one loop rather
+      # than duplicated step bodies. Each test needs a fault of its own because the
+      # first thing a successful remediation does is remove it: `wedged` is remediated
+      # in-process by TestE2E_GatedRemediation, `stuck` by the shipped binary in
+      # TestE2E_BinaryTwoPassGatedRemediation, and `earned` unattended by
+      # TestE2E_UnattendedAutonomy. `offlimits` is remediated by nobody — that is what
+      # it proves — and `neverready`'s remediation is designed to fail.
+      #
+      # The pairs are namespace/deployment because Milestone 5's scenarios each live in
+      # their own namespace; see test/e2e/manifests/autonomy-scenarios.yaml.
       - name: Wait for each fixable fault's first revision to be healthy
         run: |
           set -euo pipefail
-          for d in wedged stuck; do
-            kubectl rollout status "deployment/${d}" --timeout=180s -n maklaude-e2e
-            kubectl get deployment "$d" -o wide -n maklaude-e2e
+          for pair in maklaude-e2e/wedged maklaude-e2e/stuck maklaude-e2e-auto/earned maklaude-e2e-offlimits/offlimits; do
+            ns="${pair%%/*}"; d="${pair##*/}"
+            kubectl rollout status "deployment/${d}" --timeout=180s -n "$ns"
+            kubectl get deployment "$d" -o wide -n "$ns"
+          done
+
+      # `neverready` is excluded from the loop above on purpose: its revision 1 carries
+      # a readiness probe that always fails, so `kubectl rollout status` would block
+      # until it timed out. What has to be true before the bad rollout lands is only
+      # that revision 1 EXISTS as a running pod — there has to be something for the
+      # rollback to restore — so that is what is waited for, and the never-Ready part
+      # is asserted rather than merely tolerated: if this pod ever went Ready, the
+      # circuit-breaker phase would silently become a test of a converging action.
+      - name: Wait for the unfixable fault's first revision to be running and not ready
+        run: |
+          set -euo pipefail
+          ns=maklaude-e2e-fail
+          deadline=$(( $(date +%s) + 180 ))
+          while :; do
+            phase=$(kubectl get pod -l scenario=neverready \
+              -o jsonpath='{.items[0].status.phase}' -n "$ns" 2>/dev/null || true)
+            ready=$(kubectl get pod -l scenario=neverready \
+              -o jsonpath='{.items[0].status.containerStatuses[0].ready}' -n "$ns" 2>/dev/null || true)
+            echo "neverready: phase='${phase}' ready='${ready}'"
+            if [ "$phase" = "Running" ] && [ "$ready" = "false" ]; then
+              echo "neverready is running and unready, as designed."
+              break
+            fi
+            if [ "$ready" = "true" ]; then
+              echo "::error::the neverready pod became Ready; its readiness probe is supposed to fail forever"
+              kubectl describe pod -l scenario=neverready -n "$ns" || true
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::the neverready pod did not reach Running/not-Ready in time"
+              kubectl describe pod -l scenario=neverready -n "$ns" || true
+              exit 1
+            fi
+            sleep 5
           done
 
       # The bad rollout itself. The tag does not exist on Docker Hub, so the pull fails
@@ -317,22 +362,26 @@ jobs:
       # is used because it produces a genuine second revision through the same API path
       # an operator's own bad rollout would.
       #
-      # Both get the SAME unpullable tag on purpose: the Go assertion that the rollback
-      # restored a good image keys on the substring "maklaude-e2e-wedged-rollout"
-      # (test/e2e/remediation_test.go, wedgeImageMarker), so one marker covers both.
+      # They all get the SAME unpullable tag on purpose: the Go assertion that the
+      # rollback restored a good image keys on the substring
+      # "maklaude-e2e-wedged-rollout" (test/e2e/remediation_test.go, wedgeImageMarker),
+      # so one marker covers every scenario.
       - name: Wedge each fixable fault with a bad rollout
         run: |
           set -euo pipefail
-          for d in wedged stuck; do
+          for pair in maklaude-e2e/wedged maklaude-e2e/stuck maklaude-e2e-auto/earned \
+                      maklaude-e2e-offlimits/offlimits maklaude-e2e-fail/neverready; do
+            ns="${pair%%/*}"; d="${pair##*/}"
             kubectl set image "deployment/${d}" \
-              app=busybox:maklaude-e2e-wedged-rollout-v0 -n maklaude-e2e
+              app=busybox:maklaude-e2e-wedged-rollout-v0 -n "$ns"
           done
 
       - name: Wait for each fixable fault to be stuck on the bad revision
         run: |
           set -euo pipefail
-          ns=maklaude-e2e
-          for d in wedged stuck; do
+          for pair in maklaude-e2e/wedged maklaude-e2e/stuck maklaude-e2e-auto/earned \
+                      maklaude-e2e-offlimits/offlimits maklaude-e2e-fail/neverready; do
+            ns="${pair%%/*}"; d="${pair##*/}"
             deadline=$(( $(date +%s) + 180 ))
             while :; do
               reason=$(kubectl get pod -l "scenario=${d}" \
@@ -449,11 +498,13 @@ jobs:
           kubectl get pods -A || true
           echo "=== e2e namespace ==="
           kubectl -n maklaude-e2e describe pods || true
-          echo "=== deployments + revisions (the gated-remediation targets) ==="
-          kubectl get deployments,replicasets -o wide -n maklaude-e2e || true
-          for d in wedged stuck; do
-            kubectl rollout history "deployment/${d}" -n maklaude-e2e || true
-            kubectl describe deployment "$d" -n maklaude-e2e || true
+          echo "=== deployments + revisions (the remediation targets) ==="
+          for pair in maklaude-e2e/wedged maklaude-e2e/stuck maklaude-e2e-auto/earned \
+                      maklaude-e2e-offlimits/offlimits maklaude-e2e-fail/neverready; do
+            ns="${pair%%/*}"; d="${pair##*/}"
+            kubectl get deployments,replicasets,pods -o wide -n "$ns" || true
+            kubectl rollout history "deployment/${d}" -n "$ns" || true
+            kubectl describe deployment "$d" -n "$ns" || true
           done
           echo "=== audit tail (MaKlaude SA) ==="
           if [ -n "${AUDIT_LOG_DIR:-}" ] && [ -f "${AUDIT_LOG_DIR}/audit.log" ]; then
