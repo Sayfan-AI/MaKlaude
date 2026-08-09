@@ -60,6 +60,8 @@ func entryAt(t *testing.T, s autonomy.Shape, kind rune, i int) Entry {
 		e.Authority, e.Outcome, e.Ref = audit.AuthorityHuman, OutcomeConverged, refFor(i)
 	case 'p':
 		e.Authority, e.Outcome = audit.AuthorityPolicy, OutcomeConverged
+	case 'F':
+		e.Authority, e.Outcome = audit.AuthorityPolicy, OutcomeFailed
 	case 'i':
 		e.Authority, e.Outcome, e.Ref = audit.AuthorityHuman, OutcomeInconclusive, refFor(i)
 	case 'f':
@@ -108,15 +110,17 @@ func TestPromotionNeedsThresholdHumanApprovedConvergedExecutions(t *testing.T) {
 }
 
 // The asymmetry the package doc argues for: autonomy must not manufacture its own
-// evidence. A full window of flawless auto-applied executions earns nothing.
+// evidence. A full window's worth of flawless auto-applied executions earns nothing —
+// they are not stored at all (see [Entry.Counts]), so the shape's history reads as
+// empty rather than as full of non-approvals.
 func TestAutoAppliedSuccessesDoNotBuildTrust(t *testing.T) {
 	l := history(t, repeat('p', EvaluationWindow))
 
 	if ev := l.Trust(shape); ev.Trusted {
 		t.Fatalf("%d auto-applied converged executions promoted the shape: %+v", EvaluationWindow, ev)
 	}
-	if st := l.Standing(shape); st.Approved != 0 {
-		t.Errorf("Approved = %d, want 0: an auto-applied success is not an approval", st.Approved)
+	if st := l.Standing(shape); st.Approved != 0 || st.Recorded != 0 {
+		t.Errorf("Approved = %d, Recorded = %d, want 0 and 0: an auto-applied success is not evidence", st.Approved, st.Recorded)
 	}
 }
 
@@ -397,20 +401,115 @@ func TestHumanApprovedEntryWithoutAnArtifactIsRejected(t *testing.T) {
 	}
 }
 
-// A policy-waived entry legitimately has no artifact — nobody approved it — and must
-// still be recordable, because it occupies a slot in the window.
-func TestPolicyWaivedEntryNeedsNoArtifact(t *testing.T) {
-	l := NewMemory()
-	e := entryAt(t, shape, 'p', 0)
+// A policy-waived entry legitimately has no artifact — nobody approved it — and the
+// ones that count must still be recordable: the unattended failure is exactly the
+// evidence that re-gates a shape.
+func TestPolicyWaivedFailureNeedsNoArtifactAndDemotes(t *testing.T) {
+	l := history(t, repeat('h', PromotionThreshold))
+	if !l.Trust(shape).Trusted {
+		t.Fatalf("fixture error: %d approvals did not promote the shape", PromotionThreshold)
+	}
+
+	e := entryAt(t, shape, 'F', PromotionThreshold)
 	if e.Ref != "" {
 		t.Fatalf("fixture error: a policy entry should carry no ref, got %q", e.Ref)
 	}
-
 	if err := l.Record(e); err != nil {
-		t.Fatalf("a policy-waived entry was rejected: %v", err)
+		t.Fatalf("a policy-waived failure was rejected: %v", err)
 	}
-	if l.Len() != 1 {
-		t.Errorf("Len = %d, want 1", l.Len())
+	if st := l.Standing(shape); !st.Blocked || st.Trusted {
+		t.Fatalf("an unattended failure did not re-gate the shape: %+v", st)
+	}
+}
+
+// Counts is the window-membership rule, and its whole truth table is pinned here
+// because both [Ledger.Record] and [Ledger.Rebuild] act on it. Exactly one case is
+// excluded — the auto-applied success — and every unknown falls on the counting
+// (fail-closed) side.
+func TestCountsExcludesExactlyTheAutoAppliedSuccess(t *testing.T) {
+	cases := []struct {
+		name      string
+		authority audit.Authority
+		outcome   Outcome
+		counts    bool
+	}{
+		{"policy converged is the one exclusion", audit.AuthorityPolicy, OutcomeConverged, false},
+		{"policy inconclusive occupies a slot", audit.AuthorityPolicy, OutcomeInconclusive, true},
+		{"policy failure demotes", audit.AuthorityPolicy, OutcomeFailed, true},
+		{"policy drift-abort demotes", audit.AuthorityPolicy, OutcomeDriftAborted, true},
+		{"policy rollback demotes", audit.AuthorityPolicy, OutcomeRolledBack, true},
+		{"human converged promotes", audit.AuthorityHuman, OutcomeConverged, true},
+		{"human inconclusive occupies a slot", audit.AuthorityHuman, OutcomeInconclusive, true},
+		{"unattributed converged counts", audit.AuthorityUnattributed, OutcomeConverged, true},
+		{"an unknown outcome counts and demotes", audit.AuthorityPolicy, Outcome(97), true},
+		{"an unknown authority counts", audit.Authority(97), OutcomeConverged, true},
+	}
+	for _, tc := range cases {
+		e := Entry{Authority: tc.authority, Outcome: tc.outcome}
+		if got := e.Counts(); got != tc.counts {
+			t.Errorf("%s: Counts() = %v, want %v", tc.name, got, tc.counts)
+		}
+	}
+}
+
+// The decision recorded on issue #166: an auto-applied success is not evidence in
+// either direction. It is dropped at the ledger's door — no error, no entry, no
+// window slot — rather than stored and filtered later.
+func TestAnAutoAppliedSuccessIsDroppedNotStored(t *testing.T) {
+	l := NewMemory()
+	if err := l.Record(entryAt(t, shape, 'p', 0)); err != nil {
+		t.Fatalf("recording an auto-applied success errored: %v", err)
+	}
+	if l.Len() != 0 {
+		t.Fatalf("Len = %d, want 0: an auto-applied success must not hold a window slot", l.Len())
+	}
+	if st := l.Standing(shape); st.Recorded != 0 {
+		t.Errorf("Recorded = %d, want 0", st.Recorded)
+	}
+}
+
+// The failure mode the decision on issue #166 exists to prevent, asserted against the
+// ledger itself: a trusted shape that keeps converging unattended keeps its trust, no
+// matter how many successes are reported. Under the old occupies-a-slot reading the
+// tenth success here would have flushed the third approval out of the window and the
+// shape would have revoked its own autonomy for working.
+func TestAPerfectlyWorkingShapeKeepsItsTrust(t *testing.T) {
+	l := history(t, repeat('h', PromotionThreshold))
+	if !l.Trust(shape).Trusted {
+		t.Fatalf("fixture error: %d approvals did not promote the shape", PromotionThreshold)
+	}
+
+	for i := 0; i < 2*EvaluationWindow; i++ {
+		if err := l.Record(entryAt(t, shape, 'p', PromotionThreshold+i)); err != nil {
+			t.Fatalf("recording auto-applied success %d: %v", i, err)
+		}
+	}
+	if !l.Trust(shape).Trusted {
+		t.Fatalf("%d flawless unattended executions revoked the shape's own trust: %s",
+			2*EvaluationWindow, l.Explain(shape))
+	}
+}
+
+// Rebuild applies the same membership rule as the live path — one predicate, two
+// callers — so a rebuild from artifacts that include auto-applied successes produces
+// the same ledger the live appends did.
+func TestRebuildDropsAutoAppliedSuccesses(t *testing.T) {
+	l := NewMemory()
+	entries := []Entry{
+		entryAt(t, shape, 'h', 0),
+		entryAt(t, shape, 'p', 1),
+		entryAt(t, shape, 'h', 2),
+	}
+	if err := l.Rebuild(entries); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	if l.Len() != 2 {
+		t.Fatalf("Len = %d, want 2: the auto-applied success must not survive a rebuild", l.Len())
+	}
+	for _, e := range l.Entries() {
+		if !e.Counts() {
+			t.Errorf("a rebuilt ledger holds a non-counting entry: %+v", e)
+		}
 	}
 }
 

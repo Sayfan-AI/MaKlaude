@@ -153,9 +153,12 @@ type Cycle struct {
 	// milestone forbids, so "nowhere to disclose" means "nothing to disclose".
 	disclosure *disclose.Trail
 
-	// ledger is the trust ledger's write side, used ONLY to demote a shape after an
-	// unattended failure. See [Cycle.demoteIfAsked] for why a success is never recorded.
-	ledger Demoter
+	// ledger is the trust ledger's write side. Both halves of the cycle write to it:
+	// the gated path records the human-approved executions that promote a shape
+	// ([Cycle.recordGatedTrust]), and the unattended path records the outcomes that
+	// demote one ([Cycle.recordTrust]). What belongs in the evaluation window is the
+	// ledger's rule, not either caller's — see [TrustRecorder].
+	ledger TrustRecorder
 
 	// live reports whether the approval gate is backed by a real comms system rather
 	// than the in-memory dry-run sink. Surfaced in the report because "nobody can
@@ -403,7 +406,9 @@ func (c *Cycle) executeAuthorized(ctx context.Context, h *cluster.Handle,
 		// "a policy waived the requirement" is the distinction an operator reading
 		// this is most likely to care about.
 		er.Authority = auth.Authority().String()
-		c.markLifecycle(ctx, auth, p, &er)
+		recs := c.lifecycleFor(p.Identity)
+		c.markLifecycle(ctx, auth, recs, &er)
+		c.recordGatedTrust(recs, &er)
 		out = append(out, er)
 	}
 	return out
@@ -426,12 +431,11 @@ func (c *Cycle) executeAuthorized(ctx context.Context, h *cluster.Handle,
 // rebuild will not know it lost, which is the one failure mode this whole format exists
 // to prevent.
 func (c *Cycle) markLifecycle(ctx context.Context, auth *approve.Authorization,
-	p remediate.Proposal, er *ExecutionReport) {
+	recs []audit.Record, er *ExecutionReport) {
 
 	if c.gate == nil {
 		return
 	}
-	recs := c.lifecycleFor(p.Identity)
 	if len(recs) == 0 {
 		// No records to mark. The audit sink could not be read back, which the
 		// execution report already reflects; writing an empty marker would put an
@@ -441,6 +445,28 @@ func (c *Cycle) markLifecycle(ctx context.Context, auth *approve.Authorization,
 	if err := c.gate.RecordLifecycle(ctx, auth, recs); err != nil {
 		er.Error = appendError(er.Error,
 			fmt.Sprintf("the action ran and its approval artifact carries no rebuildable lifecycle: %v", err))
+	}
+}
+
+// recordGatedTrust projects a finished gated execution onto the trust ledger, on the
+// live path — a human-approved converged execution is the only entry that can promote
+// a shape, and until this call existed none ever arrived (#166). The marker written by
+// [Cycle.markLifecycle] made that evidence recoverable by a rebuild; this makes the
+// ledger what its doc says it is, a cache of the artifacts rather than a file that
+// happens to be reconstructible.
+//
+// A nil ledger is the shipped posture, not an error: the artifact carries the
+// lifecycle marker, so the evidence is durable and a ledger wired later recovers it
+// through [internal/rebuild]. A recording failure is reported on the execution report
+// and does not fail the action, for the same reason a marking failure does not — the
+// action has already run.
+func (c *Cycle) recordGatedTrust(recs []audit.Record, er *ExecutionReport) {
+	if c.ledger == nil || len(recs) == 0 {
+		return
+	}
+	if err := c.ledger.RecordLifecycle(recs); err != nil {
+		er.Error = appendError(er.Error,
+			fmt.Sprintf("the action ran and its outcome could not be recorded in the trust ledger: %v", err))
 	}
 }
 

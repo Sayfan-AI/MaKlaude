@@ -184,7 +184,9 @@ func (c *Cycle) UseBudget(b *budget.Budget) { c.budget = b }
 
 // UseAutonomy attaches the four things a cycle needs to act without asking: the
 // operator's rules, the trust oracle that says whether a shape earned them, the trail
-// every unattended action is disclosed on, and the ledger a failure demotes the shape in.
+// every unattended action is disclosed on, and the ledger both halves of the cycle
+// record finished executions in — the gated path's approvals are what promote a shape,
+// the unattended path's failures are what demote one.
 //
 // It is one setter rather than four for a reason [Cycle.autonomyWired] then enforces:
 // these are not independent knobs. Rules with no oracle grant nothing, an oracle with no
@@ -194,14 +196,15 @@ func (c *Cycle) UseBudget(b *budget.Budget) { c.budget = b }
 //
 // ledger may be nil, and that is the one genuine option here: a deployment can run
 // autonomy against a trust oracle it does not write back to (a static allowlist under
-// test, a ledger owned by another process). A failure then cannot demote the shape, and
+// test, a ledger owned by another process). A failure then cannot demote the shape —
 // the disclosure says so in those words rather than reporting a demotion that did not
-// happen.
+// happen — and a gated approval earns nothing in this process, though the lifecycle
+// marker on its artifact keeps the evidence recoverable by [internal/rebuild].
 //
 // It is a setter rather than a [NewForTest] parameter for the reason [Cycle.UseBudget]
 // is: four more arguments would touch every existing call site to pass nil, and a wall
 // of nils is how a genuinely-forgotten argument stops being noticeable.
-func (c *Cycle) UseAutonomy(rules autonomy.Ruleset, oracle autonomy.TrustOracle, trail *disclose.Trail, ledger Demoter) {
+func (c *Cycle) UseAutonomy(rules autonomy.Ruleset, oracle autonomy.TrustOracle, trail *disclose.Trail, ledger TrustRecorder) {
 	c.rules = rules
 	c.oracle = oracle
 	c.disclosure = trail

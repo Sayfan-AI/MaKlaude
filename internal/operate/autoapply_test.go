@@ -436,35 +436,31 @@ func TestRun_AFailedUnattendedActionRecordsTheOutcomeAndCarriesTheConsequence(t 
 	}
 }
 
-// TestRun_TheTrustLedgerIsNeverToldAboutAnUnattendedSuccess.
+// TestRun_EveryUnattendedOutcomeReachesTheTrustRecorder.
 //
-// [trust.Entry.Promotes] needs human authority, so an auto-applied success is a
-// non-promoting entry — and the ledger's standing is computed over a fixed window of the
-// most recent entries. Writing successes into it would push the human-approved executions
-// that earned the trust out of the window and silently un-earn it: a shape that works
-// perfectly would revoke its own autonomy after a handful of successes.
-func TestRun_TheTrustLedgerIsNeverToldAboutAnUnattendedSuccess(t *testing.T) {
+// The unattended path hands the recorder EVERY finished lifecycle, success or failure —
+// it does not filter, because [internal/rebuild] derives entries from every completed
+// disclosure, and a live path that held some outcomes back would build a different
+// history than a rebuild of the same artifacts. What belongs in the evaluation window
+// is the ledger's own rule ([trust.Entry.Counts], which drops the auto-applied
+// success), decided behind the recorder rather than in front of it. Issue #166 settled
+// this: an earlier version of this test asserted the opposite — that a success must
+// never reach the ledger — which was one half of the two-package contradiction that
+// issue records.
+func TestRun_EveryUnattendedOutcomeReachesTheTrustRecorder(t *testing.T) {
 	c, _, _, ledger := autonomousCycle(t)
 
-	// Force the success path: a converged run records no failure, so nothing may reach
-	// the ledger. The fake cluster cannot converge, so the equivalent assertion is that
-	// nothing is recorded when no demotion was asked for.
 	report := run(t, c)
 	applied := onlyAutoApplied(t, report)
 
-	if applied.Execution.Failure == "" && applied.Execution.Convergence == "converged" {
-		if len(ledger.lifecycles) != 0 {
-			t.Fatalf("a converged unattended action wrote %d entries to the trust ledger", len(ledger.lifecycles))
-		}
-		return
+	if !applied.Execution.Executed {
+		t.Fatalf("the action did not run, so there is no lifecycle to record: %+v", applied)
 	}
-	// The fixture fails, so assert the rule from the other direction: the ledger is
-	// written exactly when a demotion was asked for, and never otherwise.
-	if applied.Demoted && len(ledger.lifecycles) == 0 {
-		t.Fatal("a demotion was reported and the ledger was never written")
+	if len(ledger.lifecycles) != 1 {
+		t.Fatalf("the trust recorder was handed %d lifecycles for one finished action, want 1", len(ledger.lifecycles))
 	}
-	if !applied.Demoted && len(ledger.lifecycles) != 0 {
-		t.Fatalf("the ledger was written %d times without a demotion being asked for", len(ledger.lifecycles))
+	if len(ledger.lifecycles[0]) == 0 {
+		t.Fatal("the recorder was handed an empty lifecycle, which a rebuild of the artifacts would never produce")
 	}
 }
 

@@ -55,14 +55,20 @@ import (
 // does NOT fall through is [autonomy.DecisionRefuse], which means the proposal must not
 // be acted on by any authority — including a human's — and is reported instead.
 
-// Demoter is the trust ledger's write side, narrowed to the one method this package is
-// allowed to call.
+// TrustRecorder is the trust ledger's write side, narrowed to the one method this
+// package is allowed to call.
 //
 // It is an interface rather than a *[trust.Ledger] so that a cycle can be wired with a
 // ledger, without one, or with a recorder that fails on demand — and so that this
 // package cannot reach [trust.Ledger.Rebuild], which replaces the whole file and is not
 // a thing a remediation pass should be able to do by accident.
-type Demoter interface {
+//
+// Both halves of the cycle write through it: the gated path hands it the
+// human-approved executions that promote a shape, and the unattended path hands it
+// the failures that demote one. Neither caller filters what it reports — what belongs
+// in the evaluation window is the ledger's own rule ([trust.Entry.Counts]), decided
+// behind this interface rather than in front of it.
+type TrustRecorder interface {
 	// RecordLifecycle projects one action's audit lifecycle onto a ledger entry and
 	// records it, treating a lifecycle with no execution behind it as a no-op.
 	RecordLifecycle(recs []audit.Record) error
@@ -272,7 +278,7 @@ func (c *Cycle) applyOne(ctx context.Context, runner *execute.Runner,
 	// Read once, here, after everything that could add to the lifecycle: the execution,
 	// and the rollback the consequence may have triggered.
 	out.Records = c.lifecycleFor(p.Identity)
-	c.demoteIfAsked(&out)
+	c.recordTrust(&out)
 
 	rep.Tripped = out.Consequence.Tripped
 	rep.Escalated = out.Consequence.Escalate
@@ -336,21 +342,24 @@ func (c *Cycle) rollBackIfAsked(ctx context.Context, runner *execute.Runner,
 	out.RolledBack, out.Rollback = true, rb
 }
 
-// demoteIfAsked records the failure against the shape's trust, re-gating it.
+// recordTrust hands the finished action's lifecycle to the trust ledger — the write
+// that re-gates a shape when the outcome demotes it.
 //
-// It records ONLY on demotion, never on success, and that is a correctness requirement
-// rather than an optimization. [trust.Entry.Promotes] needs human authority, so an
-// auto-applied success is a non-promoting entry — and the ledger's standing is computed
-// over a fixed window of the most recent entries, so writing successes into it would
-// push the human-approved executions that earned the trust out of the window and
-// silently un-earn it. A shape that works perfectly would revoke its own autonomy after
-// a handful of successes, which is a failure mode nobody would look for.
-func (c *Cycle) demoteIfAsked(out *disclose.Outcome) {
-	if !out.Consequence.Demote {
-		return
-	}
+// It hands over EVERY lifecycle rather than only the demoting ones, and the reason is
+// agreement rather than generosity: [internal/rebuild] derives entries from every
+// completed disclosure, so a live path that filtered here would build a different
+// history than a rebuild of the same artifacts. What belongs in the evaluation window
+// is decided in exactly one place — [trust.Entry.Counts], behind the recorder — and an
+// auto-applied success is dropped there, not here. The conclusion the old
+// record-only-on-demotion rule protected still holds (a success never flushes the
+// approvals that earned the trust out of the window), but its premise does not:
+// expiry is handled by condition-based invalidation (issue #167), not by counting
+// successes into a window, so nothing here needs to hold outcomes back to preserve it.
+func (c *Cycle) recordTrust(out *disclose.Outcome) {
 	if c.ledger == nil {
-		out.DemotionErr = "no trust ledger is wired, so this failure did not re-gate the shape"
+		if out.Consequence.Demote {
+			out.DemotionErr = "no trust ledger is wired, so this failure did not re-gate the shape"
+		}
 		return
 	}
 	if err := c.ledger.RecordLifecycle(out.Records); err != nil {
