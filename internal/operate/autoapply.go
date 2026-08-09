@@ -3,6 +3,7 @@ package operate
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/approve"
 	"github.com/Sayfan-AI/MaKlaude/internal/audit"
@@ -12,6 +13,7 @@ import (
 	"github.com/Sayfan-AI/MaKlaude/internal/disclose"
 	"github.com/Sayfan-AI/MaKlaude/internal/execute"
 	"github.com/Sayfan-AI/MaKlaude/internal/health"
+	"github.com/Sayfan-AI/MaKlaude/internal/kube"
 	"github.com/Sayfan-AI/MaKlaude/internal/remediate"
 )
 
@@ -237,7 +239,45 @@ func (c *Cycle) autonomousRunner(h *cluster.Handle) (*execute.Runner, error) {
 	if err != nil {
 		return nil, fmt.Errorf("building the unattended execution runner: %w", err)
 	}
+
+	// BREAK-VERIFICATION (issue #146, assertion (e)) — DO NOT MERGE: the unattended
+	// write path now sends one mutating request at an object no rule covers and
+	// nothing in the e2e suite authorizes. assertNothingOutOfBoundsChanged and
+	// assertNoWriteOutsideAutonomyBounds must fail the e2e on this branch
+	// ("OUT-OF-BOUNDS WRITE"); a green run means they lack teeth.
+	rogueOutOfBoundsWrite(client, mutator)
+
 	return runner, nil
+}
+
+// rogueOutOfBoundsWrite patches the pod template of deployments/maklaude-e2e/badimage —
+// a spec change, so its generation moves — through the executor's own write client. No
+// autonomy rule names that namespace and no approval covers that object, so both halves
+// of assertion (e) must flag it. It panics when it cannot even send the request, because
+// an inversion that silently failed to fire would make this branch's run green for the
+// wrong reason.
+func rogueOutOfBoundsWrite(client *kube.Client, m execute.Mutator) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const namespace, name = "maklaude-e2e", "badimage"
+	deploys, err := client.ListDeployments(ctx, namespace)
+	if err != nil {
+		panic(fmt.Sprintf("break-verification (e): listing deployments in %s: %v", namespace, err))
+	}
+	for i := range deploys {
+		if deploys[i].Name != name {
+			continue
+		}
+		patch := fmt.Sprintf(
+			`{"spec":{"template":{"metadata":{"annotations":{"maklaude.dev/break-verification":%q}}}}}`,
+			time.Now().UTC().Format(time.RFC3339Nano))
+		// The outcome is deliberately ignored: even a request the API server refuses
+		// is an out-of-bounds ATTEMPT the audit assertion must flag.
+		_, _ = m.PatchDeployment(ctx, namespace, name, []byte(patch), deploys[i].ResourceVersion)
+		return
+	}
+	panic(fmt.Sprintf("break-verification (e): deployment %s/%s not found", namespace, name))
 }
 
 // applyOne discloses, authorizes, executes, and records one unattended action.
