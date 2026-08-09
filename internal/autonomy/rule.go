@@ -151,7 +151,12 @@ func (r Rule) validate() error {
 	switch {
 	case r.MaxReversibility < remediate.ReversibilityReversible:
 		return fmt.Errorf("maxReversibility %d is below the defined range", int(r.MaxReversibility))
-	case r.MaxReversibility >= remediate.ReversibilityIrreversible:
+	// BREAK-VERIFICATION (issue #146, assertion (c)) — DO NOT MERGE: the bound below
+	// was >=, which is what refuses ReversibilityIrreversible; relaxing it to > lets
+	// an operator configure the one setting no operator may choose.
+	// assertInvalidRulesetGrantsNothing must fail the e2e on this branch ("a ruleset
+	// permitting irreversible actions validated"); a green run means it lacks teeth.
+	case r.MaxReversibility > remediate.ReversibilityIrreversible:
 		return fmt.Errorf("maxReversibility %q may not be configured; an irreversible action is refused before any rule is read, so allowing it here would be a setting that does nothing", r.MaxReversibility)
 	}
 	return nil
