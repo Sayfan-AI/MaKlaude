@@ -216,11 +216,11 @@ func TestRunOutcomeReportsTheScalarsThatSettleIt(t *testing.T) {
 // can take, since no agent here can rotate a secret — and fall back to the
 // three-way guess only when the evidence genuinely is not in the file.
 func TestRunOutcomeNamesTheAPICause(t *testing.T) {
-	apiRetry := func(status int, errTok string, attempt, max int) map[string]any {
+	apiRetry := func(status int, errTok string, attempt, maxRetries int) map[string]any {
 		return map[string]any{
 			"type": "system", "subtype": "api_retry",
 			"error": errTok, "error_status": status,
-			"attempt": attempt, "max_retries": max,
+			"attempt": attempt, "max_retries": maxRetries,
 		}
 	}
 	errResult := func(fields map[string]any) map[string]any {

@@ -47,10 +47,10 @@ type stubFailureComment struct {
 }
 
 type stubFailureIssue struct {
-	Number    int           `json:"number"`
-	Title     string        `json:"title"`
-	Body      string        `json:"body"`
-	CreatedAt string        `json:"createdAt"`
+	Number    int                  `json:"number"`
+	Title     string               `json:"title"`
+	Body      string               `json:"body"`
+	CreatedAt string               `json:"createdAt"`
 	Comments  []stubFailureComment `json:"comments"`
 }
 
