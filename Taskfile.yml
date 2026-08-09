@@ -48,7 +48,14 @@ tasks:
       This target only runs the Go test; the kind cluster + seeding is driven by
       the CI e2e job (see .github/workflows/e2e.yml).
     cmds:
-      - go test -tags e2e -count=1 -v ./test/e2e/...
+      # The timeout is raised from Go's 10-minute default deliberately. This suite
+      # WAITS on real clusters — a 150s convergence window per gated remediation, a
+      # bounded window that must expire in full for the circuit-breaker scenario, and a
+      # health re-scan after each — so 10 minutes is now inside the range of a passing
+      # run. A test binary killed by the default timeout panics with no failing
+      # assertion, which reads as a broken harness rather than as "the suite got
+      # longer".
+      - go test -tags e2e -count=1 -timeout 30m -v ./test/e2e/...
 
   vet:
     desc: Run go vet

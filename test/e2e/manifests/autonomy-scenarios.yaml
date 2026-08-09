@@ -1,0 +1,194 @@
+# Seed scenarios for the UNATTENDED half of the cycle — Milestone 5's e2e (T6, #146).
+#
+# Every fault here is the same fault wedged-deploy.yaml seeds: a Deployment rolled
+# forward onto an image that cannot be pulled, so `remediate.rollbackRevisionRule`
+# proposes a rollback to the revision that was demonstrably running before. Read that
+# manifest's header for why the two-step shape (a good revision 1, then a bad rollout
+# applied by CI) is load-bearing and why `strategy: Recreate` is what makes the fault
+# present unambiguously with one replica.
+#
+# What is new here is the NAMESPACE LAYOUT, and it is the whole design of the test.
+#
+# An autonomy rule's blast-radius bound is its namespace list, and nothing else in the
+# rule can distinguish two Deployments that carry the same fault: the trust ledger's
+# unit is a (cluster, operation) SHAPE, so a shape trusted for `rollbackrevision` on
+# this cluster is trusted for every rollback on it. That is deliberate — trust is
+# evidence about a kind of action, not about one object — and it means the only way to
+# prove "a rule permitted this one and held that one back" is to put the two objects in
+# different namespaces and have the rule name one of them.
+#
+# So one namespace per role, one Deployment in each:
+#
+#   maklaude-e2e-auto/earned          the rule covers it. It gates while the ledger is
+#                                     empty and auto-applies once trust is seeded.
+#   maklaude-e2e-offlimits/offlimits  the rule does NOT cover it, and the SAME trust
+#                                     applies to its shape. It must never be touched —
+#                                     which also makes it the object the tripped-breaker
+#                                     phase suppresses, since suppression leaves it
+#                                     equally untouched.
+#   maklaude-e2e-fail/neverready      the rule covers it and its remediation CANNOT
+#                                     succeed, so the auto-apply fails and trips the
+#                                     cluster's circuit breaker.
+#
+# A separate namespace per role also keeps each phase's expected auto-apply count at
+# exactly one. A rule scoped to a namespace holding two wedged Deployments would admit
+# both (the per-pass cap is 2), and "exactly one action ran and it was this one" is the
+# assertion that distinguishes a bounded autonomy from a permissive one.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: maklaude-e2e-auto
+  labels:
+    app.kubernetes.io/part-of: maklaude-e2e
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: maklaude-e2e-offlimits
+  labels:
+    app.kubernetes.io/part-of: maklaude-e2e
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: maklaude-e2e-fail
+  labels:
+    app.kubernetes.io/part-of: maklaude-e2e
+---
+# The shape that EARNS it: wedged exactly like `wedged`, and inside the one namespace
+# the autonomy rule names. Its rollback is the action MaKlaude takes with nobody
+# watching, and the cluster must converge afterwards.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: earned
+  namespace: maklaude-e2e-auto
+  labels:
+    app.kubernetes.io/part-of: maklaude-e2e
+    scenario: earned
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: maklaude-e2e
+      scenario: earned
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: maklaude-e2e
+        scenario: earned
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "sleep 3600"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+---
+# The shape that has earned it and is still OUT OF SCOPE. Identical fault, identical
+# operation, identical trust — and a namespace no rule in the test names. Nothing may
+# ever write to it, and the e2e asserts that from the object's own generation as well
+# as from the apiserver audit log.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: offlimits
+  namespace: maklaude-e2e-offlimits
+  labels:
+    app.kubernetes.io/part-of: maklaude-e2e
+    scenario: offlimits
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: maklaude-e2e
+      scenario: offlimits
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: maklaude-e2e
+        scenario: offlimits
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "sleep 3600"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+---
+# The auto-apply that MUST FAIL, and the reason it fails is structural rather than
+# timed.
+#
+# A circuit breaker only means something if a real failure can trip it, so the e2e
+# needs an action that lands and then does not work. The tempting way to produce one is
+# a very short observation window, and it is the wrong way: it makes the assertion a
+# race between the runner's clock and the kubelet's, which is a flake in whichever
+# direction it lands.
+#
+# Instead the fault is unfixable BY CONSTRUCTION. Revision 1 carries a readiness probe
+# that runs `/bin/false`, so its pod starts, stays Running, and is never Ready — the
+# Deployment can therefore never report `ready == available == desired`, which is
+# exactly what `execute`'s convergence predicate requires. CI then wedges it onto the
+# same unpullable image as the others, so the pipeline diagnoses a bad image and
+# proposes the rollback; the rollback lands, the API server accepts it, the revision
+# advances, and the workload still never becomes ready. That is a genuine "MaKlaude
+# changed a cluster and its model of the change was wrong" — the condition the breaker
+# exists for — and no window length can make it come out the other way.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neverready
+  namespace: maklaude-e2e-fail
+  labels:
+    app.kubernetes.io/part-of: maklaude-e2e
+    scenario: neverready
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: maklaude-e2e
+      scenario: neverready
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: maklaude-e2e
+        scenario: neverready
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "sleep 3600"]
+          # The pod runs and is never Ready. `/bin/false` exits non-zero every time,
+          # so no amount of waiting makes this Deployment available.
+          readinessProbe:
+            exec:
+              command: ["/bin/false"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 1
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
