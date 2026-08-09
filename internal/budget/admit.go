@@ -264,20 +264,11 @@ func (b *Budget) RecordOutcome(cluster string, target remediate.Target, outcome 
 		ConsecutiveFailures: cs.ConsecutiveFailures,
 	}
 
-	threshold := b.limits.FailureThreshold
-	if threshold < 1 {
-		// Invalid limits must not produce a breaker that never trips. Treating the
-		// threshold as 1 is the fail-closed reading: the first failure opens the
-		// breaker, which is stricter than any valid configuration could ask for.
-		threshold = 1
-	}
-	if !cs.Tripped && cs.ConsecutiveFailures >= threshold {
-		cs.Tripped = true
-		cs.TrippedAt = at
-		cs.TrippedDetail = fmt.Sprintf("%d consecutive auto-apply failures, most recently on %s",
-			cs.ConsecutiveFailures, targetKey(target))
-		c.Tripped = true
-	}
+	// BREAK-VERIFICATION (issue #146, assertion (d)) — DO NOT MERGE: the trip
+	// transition is removed, so no run of consecutive failures ever opens the
+	// breaker. assertFailedAutoApplyTripsBreaker must fail the e2e on this branch
+	// ("the budget reports tripped breakers [], want exactly one"); a green run
+	// means the assertion lacks teeth.
 	b.persist()
 	return c
 }
