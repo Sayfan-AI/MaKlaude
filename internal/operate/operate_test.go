@@ -159,7 +159,14 @@ func newCycle(t *testing.T, mode kube.ExecuteMode, objects ...runtime.Object) (*
 	if mode != kube.ExecuteDisabled {
 		sink = approve.NewMemorySink()
 		sink.SelfLogin = testSelfLogin
-		gate = approve.NewGatekeeper(sink, notify.NewNopNotifier(), approve.DefaultPolicy())
+		// The gate's clock must be the cycle's pinned clock, not the wall clock. With
+		// the default time.Now here, the simulated approval below is stamped at
+		// fixedTime while the gate reconciles at the real instant — so the moment the
+		// wall clock passes fixedTime plus ApprovalTTL, every approval in this file is
+		// refused as expired. That is exactly how these tests went green in CI on
+		// 2026-08-02 and red on every machine a week later.
+		gate = approve.NewGatekeeper(sink, notify.NewNopNotifier(), approve.DefaultPolicy()).
+			WithClock(func() time.Time { return fixedTime })
 	}
 
 	c, err := NewForTest(mode, newClient, factory.build, gate, audit.NewTrail(), fastPolicy, false,
