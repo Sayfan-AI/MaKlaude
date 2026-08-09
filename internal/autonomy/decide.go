@@ -158,7 +158,11 @@ func decideTrust(cluster string, op remediate.Operation, rule string, trust Trus
 		return verdict(ReasonNoTrustLedger, rule)
 	}
 	evidence := trust.Trust(Shape{Cluster: cluster, Operation: op})
-	if !evidence.Trusted {
+	// BREAK-VERIFICATION (issue #146, assertion (b)) — DO NOT MERGE: the trust check
+	// is inverted, so the exact shape the ledger promoted now gates (and an untrusted
+	// shape falls through to the empty-citation gate below). assertEarnedTrustAutoApplies
+	// must fail the e2e on this branch; a green run means the assertion lacks teeth.
+	if evidence.Trusted {
 		return verdict(ReasonUntrustedShape, rule)
 	}
 	citation := strings.TrimSpace(evidence.Citation)
