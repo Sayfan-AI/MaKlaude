@@ -56,6 +56,14 @@ const leakMarker = "SUPERSECRET-TRANSCRIPT-CONTENT"
 
 func execFixture(t *testing.T, dir string, result map[string]any) string {
 	t.Helper()
+	return execFixtureEvents(t, dir, nil, result)
+}
+
+// execFixtureEvents is execFixture with extra events (e.g. `api_retry` system
+// messages) inserted between the boilerplate and the terminal result, matching
+// where the SDK emits them.
+func execFixtureEvents(t *testing.T, dir string, extra []any, result map[string]any) string {
+	t.Helper()
 	events := []any{
 		map[string]any{"type": "system", "subtype": "init", "model": "claude-opus-5[1m]"},
 		map[string]any{
@@ -65,6 +73,7 @@ func execFixture(t *testing.T, dir string, result map[string]any) string {
 			},
 		},
 	}
+	events = append(events, extra...)
 	if result != nil {
 		events = append(events, result)
 	}
@@ -198,6 +207,82 @@ func TestRunOutcomeReportsTheScalarsThatSettleIt(t *testing.T) {
 	}
 }
 
+// TestRunOutcomeNamesTheAPICause pins #151: four escalations (#108, #109, #149,
+// #150) told a reader "auth, quota, or an upstream API failure — read the
+// retained transcript" about a failure whose cause was `api_error_status: 401`,
+// a bounded integer sitting in the same terminal result the classifier had
+// already parsed. It stopped one field short. The classifier must read the
+// cause fields when they exist, name the cause — for 401, the action a human
+// can take, since no agent here can rotate a secret — and fall back to the
+// three-way guess only when the evidence genuinely is not in the file.
+func TestRunOutcomeNamesTheAPICause(t *testing.T) {
+	apiRetry := func(status int, errTok string, attempt, max int) map[string]any {
+		return map[string]any{
+			"type": "system", "subtype": "api_retry",
+			"error": errTok, "error_status": status,
+			"attempt": attempt, "max_retries": max,
+		}
+	}
+	errResult := func(fields map[string]any) map[string]any {
+		r := map[string]any{
+			"type": "result", "subtype": "success", "is_error": true,
+			"num_turns": 1, "duration_ms": 177026, "total_cost_usd": 0,
+		}
+		for k, v := range fields {
+			r[k] = v
+		}
+		return r
+	}
+	guess := "auth, quota, or an upstream"
+
+	t.Run("401 names the credential and the human action", func(t *testing.T) {
+		f := execFixtureEvents(t, t.TempDir(),
+			[]any{apiRetry(401, "authentication_failed", 9, 10), apiRetry(401, "authentication_failed", 10, 10)},
+			errResult(map[string]any{"terminal_reason": "api_error", "api_error_status": 401}))
+		class, prose, _ := runOutcome(t, f)
+		if class != "agent-error" {
+			t.Fatalf("classified as %q, want agent-error — the cause fields must not change the class, only the prose", class)
+		}
+		for _, want := range []string{"401", "ANTHROPIC_API_KEY", "rotate", "authentication_failed", "10/10"} {
+			if !strings.Contains(prose, want) {
+				t.Errorf("the 401 verdict omits %q — this is the line that replaces a three-way guess with the action a human can take (#151):\n%s", want, prose)
+			}
+		}
+		if strings.Contains(prose, guess) {
+			t.Errorf("the three-way guess still renders when the artifact names the cause — enumerating candidates next to the answer re-creates the ambiguity #151 removed:\n%s", prose)
+		}
+	})
+
+	t.Run("unrecognized status still reports the number", func(t *testing.T) {
+		f := execFixture(t, t.TempDir(), errResult(map[string]any{"terminal_reason": "api_error", "api_error_status": 418}))
+		_, prose, _ := runOutcome(t, f)
+		if !strings.Contains(prose, "418") {
+			t.Errorf("an unmapped status is dropped instead of reported — the integer is the evidence even when no canned action exists:\n%s", prose)
+		}
+		if strings.Contains(prose, guess) {
+			t.Errorf("a known status fell through to the guess:\n%s", prose)
+		}
+	})
+
+	t.Run("retry evidence alone is enough for the status", func(t *testing.T) {
+		f := execFixtureEvents(t, t.TempDir(),
+			[]any{apiRetry(401, "authentication_failed", 10, 10)},
+			errResult(nil))
+		_, prose, _ := runOutcome(t, f)
+		if !strings.Contains(prose, "ANTHROPIC_API_KEY") {
+			t.Errorf("a 401 visible only in the api_retry messages was not surfaced — the retry stream carries the same bounded status the result does:\n%s", prose)
+		}
+	})
+
+	t.Run("no cause fields falls back to the guess", func(t *testing.T) {
+		f := execFixture(t, t.TempDir(), errResult(nil))
+		_, prose, _ := runOutcome(t, f)
+		if !strings.Contains(prose, guess) {
+			t.Errorf("with no cause evidence in the file the prose must say the cause is unknown and where to look, not stay silent:\n%s", prose)
+		}
+	})
+}
+
 // TestRunOutcomeLeaksNoTranscriptContent is the public-repo constraint, and the
 // reason this suite executes the script instead of reading it. The escalation
 // body lands in a world-readable issue; the SDK's free-form error and result
@@ -233,6 +318,25 @@ func TestRunOutcomeLeaksNoTranscriptContent(t *testing.T) {
 	_, prose2, _ := runOutcome(t, f2)
 	if strings.Contains(prose2, leakMarker) {
 		t.Errorf("a free-form subtype reached the escalation body verbatim — sanitize it to an identifier or degrade it to a fixed token:\n%s", prose2)
+	}
+
+	// The #151 cause fields are string-typed too, and they cross the same
+	// boundary: a hostile terminal_reason or retry error token must degrade the
+	// same way the subtype does, or the cause line becomes the new back door.
+	f3 := execFixtureEvents(t, t.TempDir(),
+		[]any{map[string]any{
+			"type": "system", "subtype": "api_retry",
+			"error": leakMarker + " <img src=x>", "error_status": 401,
+			"attempt": 10, "max_retries": 10,
+		}},
+		map[string]any{
+			"type": "result", "subtype": "success", "is_error": true,
+			"num_turns": 1, "duration_ms": 100, "total_cost_usd": 0,
+			"terminal_reason": "api " + leakMarker, "api_error_status": 401,
+		})
+	_, prose3, _ := runOutcome(t, f3)
+	if strings.Contains(prose3, leakMarker) {
+		t.Errorf("a free-form cause field reached the escalation body verbatim — terminal_reason and the retry error must be sanitized like the subtype (#151):\n%s", prose3)
 	}
 }
 

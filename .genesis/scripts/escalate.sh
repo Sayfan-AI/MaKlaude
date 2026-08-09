@@ -187,6 +187,24 @@ existing=$(gh issue list --state open --label "automation:failure" --json number
 body=$(printf 'A workflow run failed and the loop could not self-advance.\n\n- Workflow: **%s**\n- Failed run: %s\n\n### How this run died\n\n%s\n\n### What this run was trying to do\n\n%s\n\n### What this run may already have landed\n\n%s\n\n### Where the transcript is\n\n%s\n\n%s' "$WF_NAME" "$RUN_URL" "$outcome" "$intent" "$landed" "$transcript" "$marker")
 
 if [ -n "$existing" ]; then
+  # A repeat failure is not an isolated incident, and the escalation must say so
+  # in its own body rather than leaving the count buried in a comment thread
+  # nobody re-reads. The 3.5-day outage of 2026-07-30 (#150) presented, to anyone
+  # scanning the issue list, as two issues titled "a run failed" — 14 consecutive
+  # failures were visible only by opening #108 and counting (#151). The streak is
+  # derived from the issue itself: the body plus every prior comment carrying
+  # this workflow's dedup marker is one failure each, and this comment makes N.
+  # Best-effort on purpose — a failed read degrades to the plain body, because an
+  # escalation path that can itself fail is the false-escalation bug #91 removed.
+  streak_info="$(gh issue view "$existing" --json createdAt,comments 2>/dev/null || true)"
+  if [ -n "$streak_info" ]; then
+    first_seen="$(printf '%s' "$streak_info" | jq -r '.createdAt // empty' 2>/dev/null || true)"
+    prior="$(printf '%s' "$streak_info" | jq -r --arg m "$marker" '[.comments[]? | select(.body | contains($m))] | length' 2>/dev/null || true)"
+    if [ -n "$first_seen" ] && [ -n "$prior" ]; then
+      streak_n=$((prior + 2))
+      body=$(printf '**This is failure %s of this workflow in an unbroken sequence since %s.** One failure is an incident; a streak is an outage — the cause is almost certainly the one already diagnosed above, so read the newest prior comment before treating this one as new information.\n\n%s' "$streak_n" "$first_seen" "$body")
+    fi
+  fi
   gh issue comment "$existing" --body "$body"
 else
   gh issue create \
