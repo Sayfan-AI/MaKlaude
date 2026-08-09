@@ -393,6 +393,76 @@ for age, num, c, thread, note in rows:
 PY
 }
 
+# Open automation:failure escalations with their REPEAT COUNTS.
+#
+# Why this exists: escalate.sh dedups per workflow, so repeat failures of one
+# workflow become comments on one issue rather than new issues. That is correct
+# — 14 issues for one cause would be worse — but it means a total loop outage
+# presents, to anyone scanning the issue list, as a single issue titled "a run
+# failed", and the recurrence count lives only in a comment thread nobody
+# re-reads. The 3.5-day outage of 2026-07-30 (#150) looked exactly like a
+# one-off from `summary` (#151). A single failure is noise; fourteen in a row is
+# an outage, and only the streak makes the difference visible.
+#
+# Same family as gates/red-prs/ready-prs/unanswered-comments: derived from repo
+# state, printed unconditionally by `summary`, empty means all-clear. One
+# failure = the issue body + one per comment carrying the escalation's
+# per-workflow dedup marker; human triage comments carry no marker and are not
+# counted.
+#
+# Reads `gh issue list --json` output (automation:failure issues, with comments)
+# on stdin. Prints nothing when no failure escalation is open.
+format_failure_streaks() {
+    python3 -c "
+import json
+import re
+import sys
+from datetime import datetime
+
+issues = json.load(sys.stdin)
+
+MARKER = re.compile(r'<!-- genesis-failure-wf: (.+?) -->')
+
+
+def ts(value):
+    return datetime.fromisoformat(value.replace('Z', '+00:00'))
+
+
+rows = []
+for i in issues:
+    body = i.get('body') or ''
+    m = MARKER.search(body)
+    wf = m.group(1) if m else i.get('title', '?')
+    marker = m.group(0) if m else '<!-- genesis-failure-wf:'
+    count = 1
+    last = ts(i['createdAt'])
+    for c in i.get('comments') or []:
+        if marker in (c.get('body') or ''):
+            count += 1
+            created = c.get('createdAt')
+            if created and ts(created) > last:
+                last = ts(created)
+    rows.append((count, i, wf, last))
+
+# Longest streak first: the workflow that has failed the most times running is
+# the outage, not the one that failed most recently.
+rows.sort(key=lambda r: -r[0])
+
+for count, i, wf, last in rows:
+    streak = '%d consecutive failures' % count if count > 1 else '1 failure'
+    print('#%d  %s since %s (newest %s) — %s' % (
+        i['number'], streak,
+        ts(i['createdAt']).strftime('%Y-%m-%d %H:%MZ'),
+        last.strftime('%Y-%m-%d %H:%MZ'), wf))
+"
+}
+
+# Open failure escalations, with comments so the streak needs no extra calls.
+fetch_failures() {
+    gh issue list --state open --label "automation:failure" \
+        --json number,title,body,createdAt,comments --limit 100
+}
+
 # Open PRs plus everything format_red_prs and format_ready_prs filter on. One
 # query serves both so `summary` pays for a single PR round-trip.
 fetch_prs() {
@@ -520,6 +590,13 @@ json.dump(filtered, sys.stdout)
         format_unanswered_comments "$WINDOW_DAYS"
         ;;
 
+    failure-streaks)
+        # Open automation:failure escalations with repeat counts, longest streak
+        # first (empty = no failure escalation open). A dedup'd escalation makes
+        # an outage look like one issue; the count is what tells them apart.
+        fetch_failures | format_failure_streaks
+        ;;
+
     blocked)
         # Shortcut: list all blocked issues
         gh issue list --state open --label "blocked" --json "$FIELDS" --limit 100 | format_issues
@@ -571,6 +648,15 @@ json.dump(filtered, sys.stdout)
         # to be that run's trigger. Empty here means nobody is waiting on a reply.
         echo "=== Unanswered Human Comments (a person spoke; answer before acting) ==="
         format_unanswered_comments "$DEFAULT_COMMENT_WINDOW_DAYS"
+        echo ""
+        # Unconditional for the fifth time: escalate.sh dedups repeat failures
+        # into one issue per workflow, so an outage and a one-off look identical
+        # from the sections above — one open issue either way. The streak count
+        # is the only visible difference, and it must not live solely in a
+        # comment thread nobody re-reads (#151). Empty here means no failure
+        # escalation is open at all.
+        echo "=== Automation Failure Streaks (repeat failures on one escalation = outage) ==="
+        fetch_failures | format_failure_streaks
         echo ""
         echo "=== Blocked ==="
         gh issue list --state open --label "blocked" --json "$FIELDS" --limit 100 | format_issues
@@ -634,8 +720,12 @@ json.dump(filtered, sys.stdout)
             echo "Usage: issues.sh label --id ID --add LABEL | --remove LABEL" >&2
             exit 1
         fi
-        [ -n "$ADD" ] && gh issue edit "$ID" --add-label "$ADD"
-        [ -n "$REMOVE" ] && gh issue edit "$ID" --remove-label "$REMOVE"
+        # Plain `[ -n ... ] && cmd` here would make a successful add-only call
+        # exit 1: the trailing `[ -n "$REMOVE" ]` fails when --remove is unset,
+        # and the case arm's status is the script's. Callers treat non-zero as
+        # "the label was not applied", which is exactly wrong.
+        if [ -n "$ADD" ]; then gh issue edit "$ID" --add-label "$ADD"; fi
+        if [ -n "$REMOVE" ]; then gh issue edit "$ID" --remove-label "$REMOVE"; fi
         ;;
 
     comment)
@@ -681,6 +771,9 @@ Commands:
               loop has not answered, stalest first. Closed threads are reported
               only when the loop closed them AFTER the comment (empty = nothing
               waiting on a reply)
+  failure-streaks
+              List open automation:failure escalations with repeat counts,
+              longest streak first (empty = no failure escalation open)
   blocked   List all blocked issues
   recent    List recently updated issues (default: last 24h)
   summary   Overview of project state
