@@ -159,7 +159,12 @@ func decideTrust(cluster string, op remediate.Operation, rule string, trust Trus
 	}
 	evidence := trust.Trust(Shape{Cluster: cluster, Operation: op})
 	if !evidence.Trusted {
-		return verdict(ReasonUntrustedShape, rule)
+		// BREAK-VERIFICATION (issue #146, assertion (a)) — DO NOT MERGE: a shape with
+		// NO trust history is granted autonomy anyway. assertUntrustedShapeGates must
+		// fail the e2e on this branch; a green run means the assertion lacks teeth.
+		v := verdict(ReasonEarnedTrust, rule)
+		v.Evidence = "break-verification: fabricated trust for an untrusted shape"
+		return v
 	}
 	citation := strings.TrimSpace(evidence.Citation)
 	if citation == "" {
