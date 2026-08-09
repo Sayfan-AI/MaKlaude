@@ -51,6 +51,12 @@ func (e execution) gated() bool { return e.authority == audit.AuthorityHuman }
 // executions covers both trails and every outcome. The three converged human-approved
 // entries on prod/rollout-restart are the promotion evidence — the case the T3 carry-over
 // singles out as the one a disclosure-only marker would make unrebuildable.
+//
+// e8 is the auto-applied success, the exact case the decision on issue #166 settles: it
+// is on the disclosure trail like any finished action, and [trust.Entry.Counts] keeps it
+// out of BOTH ledgers — the live one at [trust.Ledger.Record], the rebuilt one at
+// [trust.Ledger.Rebuild] — so the parity these tests assert covers the one execution the
+// two packages used to disagree about.
 var executions = []execution{
 	{"e1", "prod", remediate.OpRolloutRestart, audit.AuthorityHuman, "converged", "", false, false, base},
 	{"e2", "prod", remediate.OpRolloutRestart, audit.AuthorityHuman, "converged", "", false, false, base.Add(time.Minute)},
@@ -59,6 +65,7 @@ var executions = []execution{
 	{"e5", "prod", remediate.OpDeletePod, audit.AuthorityHuman, "", "drifted", true, false, base.Add(4 * time.Minute)},
 	{"e6", "staging", remediate.OpCordonNode, audit.AuthorityHuman, "converged", "", false, true, base.Add(5 * time.Minute)},
 	{"e7", "staging", remediate.OpCordonNode, audit.AuthorityPolicy, "", "execute-failed", false, false, base.Add(6 * time.Minute)},
+	{"e8", "prod", remediate.OpRolloutRestart, audit.AuthorityPolicy, "converged", "", false, false, base.Add(7 * time.Minute)},
 }
 
 // shapes are the three (cluster, operation) pairs the table exercises.
@@ -341,6 +348,44 @@ func TestLedger_ReadsTheGatedTrailsEvidenceForAutonomy(t *testing.T) {
 	}
 }
 
+// TestLedger_AnAutoAppliedSuccessIsOnTheTrailAndInNeitherLedger pins the resolution of
+// issue #166's second finding — the two packages used to state opposite rules about
+// whether an auto-applied success belongs in the window. The rule now lives in
+// [trust.Entry.Counts] and both paths consult it, so the success is fully disclosed on
+// its trail and holds a window slot in neither history.
+func TestLedger_AnAutoAppliedSuccessIsOnTheTrailAndInNeitherLedger(t *testing.T) {
+	asink, dsink := writeAll(t)
+	live := liveLedger(t, asink, dsink)
+
+	rebuilt := trust.NewMemory()
+	if _, err := Ledger(context.Background(), rebuilt, archives(asink, dsink)...); err != nil {
+		t.Fatalf("Ledger: %v", err)
+	}
+
+	// The artifact exists — dropping the entry must not mean dropping the disclosure.
+	all, err := dsink.ListAll(context.Background())
+	if err != nil {
+		t.Fatalf("ListAll (disclosure): %v", err)
+	}
+	onTrail := false
+	for _, a := range all {
+		if id, ok := disclose.ParseProposalMarker(a.Body); ok && string(id) == "e8" {
+			onTrail = true
+		}
+	}
+	if !onTrail {
+		t.Fatal("the auto-applied success is missing from the disclosure trail, so this test proves nothing")
+	}
+
+	for name, l := range map[string]*trust.Ledger{"live": live, "rebuilt": rebuilt} {
+		for _, e := range l.Entries() {
+			if e.Key == "e8" {
+				t.Errorf("the %s ledger holds the auto-applied success: %+v", name, e)
+			}
+		}
+	}
+}
+
 // TestLedger_RefusesAnUnreadableMarkerAndLeavesTheLedgerAlone is the asymmetry the whole
 // package turns on: a lost failure re-grants autonomy, a lost approval merely delays it.
 // So an artifact whose marker exists and cannot be parsed aborts the rebuild, and the
@@ -438,8 +483,10 @@ func TestLedger_TreatsAnInFlightArtifactAsNothingToContribute(t *testing.T) {
 		t.Errorf("the rebuild derived %d entries, want %d — an unfinished action must contribute none",
 			report.Finished, len(executions))
 	}
-	if got := rebuilt.Len(); got != len(executions) {
-		t.Errorf("the rebuilt ledger holds %d entries, want %d", got, len(executions))
+	// One fewer than derived: e8, the auto-applied success, is a finished action the
+	// ledger declines to count — see [trust.Entry.Counts].
+	if got, want := rebuilt.Len(), len(executions)-1; got != want {
+		t.Errorf("the rebuilt ledger holds %d entries, want %d", got, want)
 	}
 }
 

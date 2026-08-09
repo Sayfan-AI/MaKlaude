@@ -707,7 +707,7 @@ type unattendedPass struct {
 // decisions. That is what makes "the proposal went to a human" a checkable outcome
 // rather than an accident of nothing being wired.
 func runUnattendedPass(t *testing.T, reg *cluster.Registry, blast *budget.Budget, rules autonomy.Ruleset,
-	oracle autonomy.TrustOracle, ledger operate.Demoter, policy execute.Policy) unattendedPass {
+	oracle autonomy.TrustOracle, ledger operate.TrustRecorder, policy execute.Policy) unattendedPass {
 	t.Helper()
 
 	approvals := approve.NewMemorySink()
@@ -796,11 +796,14 @@ func rollbackRule(name string, namespaces ...string) autonomy.Ruleset {
 // the approval artifact behind it, which is the check that stops a hand-edited ledger
 // from being a blank cheque.
 //
-// What this does NOT establish is that the live gated path ever writes such an entry.
-// It does not, today: nothing on the human-approved path calls into the ledger at all,
-// which is #166. When that is fixed, the honest version of this helper drives three real
-// approvals through the gate instead — and the test above would then prove promotion end
-// to end rather than promotion arithmetic.
+// The live gated path writes exactly this kind of entry since issue #166's fix —
+// operate.Cycle.recordGatedTrust projects every finished gated execution onto the
+// ledger — and driving a shape from untrusted to trusted through real approvals, end
+// to end in the live wiring, is proven by
+// internal/operate's TestRun_ApprovalsAloneDriveAShapeFromUntrustedToTrusted. Seeding
+// here is therefore a fixture convenience, not a workaround: this scenario is about
+// what a trusted shape may DO unattended, and three real approval round-trips through
+// the kind cluster would buy it nothing but wall-clock time.
 func seededLedger(t *testing.T) *trust.Ledger {
 	t.Helper()
 

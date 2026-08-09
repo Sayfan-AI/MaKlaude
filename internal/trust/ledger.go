@@ -67,9 +67,20 @@ func NewMemory() *Ledger {
 // alternative — storing it with whatever fields were populated — would put an entry
 // in the window whose meaning nobody can state, and the window is the input to a
 // decision about mutating a cluster with no human watching.
+//
+// An entry that does not [Entry.Counts] — an auto-applied success — is dropped
+// silently rather than rejected: it is a legitimate execution that simply is not
+// evidence, and a caller reporting it did nothing wrong. Dropping it HERE rather
+// than asking callers to filter is what makes the window-membership rule a property
+// of the ledger: the live path and [Ledger.Rebuild] funnel through the same
+// predicate, so no caller can put an entry in one history that the other would not
+// hold.
 func (l *Ledger) Record(e Entry) error {
 	if err := validate(e); err != nil {
 		return err
+	}
+	if !e.Counts() {
+		return nil
 	}
 
 	l.mu.Lock()
@@ -104,12 +115,19 @@ func (l *Ledger) Record(e Entry) error {
 // Duplicate keys among the supplied entries collapse to the first occurrence, so a
 // caller that reads overlapping pages of artifacts does not have to deduplicate
 // first.
+//
+// An entry that does not [Entry.Counts] is dropped, exactly as [Ledger.Record] drops
+// it on the live path — one predicate, two callers, no way for the two histories to
+// disagree about an auto-applied success.
 func (l *Ledger) Rebuild(entries []Entry) error {
 	kept := make([]Entry, 0, len(entries))
 	seen := make(map[string]struct{}, len(entries))
 	for _, e := range entries {
 		if err := validate(e); err != nil {
 			return err
+		}
+		if !e.Counts() {
+			continue
 		}
 		if _, dup := seen[e.Key]; dup {
 			continue

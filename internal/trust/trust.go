@@ -43,13 +43,31 @@
 //
 // # Autonomy does not compound
 //
-// Only an execution a HUMAN approved counts toward the 3. An auto-applied execution
-// that converged perfectly occupies a slot in the window and contributes nothing to
-// promotion. Without that asymmetry trust would be self-reinforcing: three approvals
-// would buy autonomy, autonomy would manufacture its own evidence, and the shape
-// would never again need a person. The window would then measure how much MaKlaude
-// has done rather than how much a human has sanctioned, which is the opposite of
-// what "earned" is supposed to mean.
+// Only an execution a HUMAN approved can promote. An auto-applied execution that
+// converged perfectly is not evidence for further autonomy: it neither promotes nor
+// erodes, and it does not occupy a window slot at all. [Entry.Counts] is that rule,
+// and it is consulted inside [Ledger.Record] and [Ledger.Rebuild] so the live append
+// path and a rebuild from the artifacts cannot disagree about what the window holds.
+// The decision is recorded on issue #166: flushing the human approvals that earned
+// trust out of the window, so that a shape working perfectly revokes its own autonomy,
+// would make a person re-approve a fix that has never once failed — the kind of
+// nagging that gets a safety feature switched off.
+//
+// The asymmetry is not needed to stop trust being self-reinforcing, because an
+// auto-approval IS a human approval. It is taken earlier and at a higher level of
+// abstraction — over a policy rather than over one action — but the chain of authority
+// still terminates at a person. What the asymmetry preserves is what the window
+// measures: how much a human has sanctioned, not how much MaKlaude has done.
+//
+// The exposure that buys is written down rather than left implicit: with successes
+// excluded from the window, no amount of clean unattended operation expires trust on
+// its own. Once earned, it lapses only when an execution demotes the shape — a
+// failure, rollback, or drift-abort — or when inconclusive outcomes crowd the
+// approvals out of the window. A shape passing permanently out of human oversight is a
+// real danger; a counting window was the wrong remedy for it, and condition-based
+// invalidation — trust as a cached judgment that stays valid until something
+// invalidates it — is the right one. That model is issue #167, and it is where the
+// expiry question gets settled.
 //
 // # The ledger is a cache; the approval artifacts are the authority
 //
@@ -251,6 +269,24 @@ func (e Entry) Promotes() bool {
 // Demotes reports whether this entry blocks trust for its shape while it remains in
 // the window.
 func (e Entry) Demotes() bool { return e.Outcome.Demotes() }
+
+// Counts reports whether this entry belongs in the evaluation window at all. It is
+// the window-membership rule, in exactly one place: [Ledger.Record] and
+// [Ledger.Rebuild] both consult it, so the live append path and a rebuild from the
+// artifacts cannot disagree about what the window holds.
+//
+// Exactly one thing is excluded: a policy-authorized execution that converged — the
+// auto-applied success. It cannot promote ([Entry.Promotes] requires a person) and,
+// per the decision on issue #166, it must not erode either; see the package doc.
+//
+// Everything else counts, and the shape of the condition is what makes the unknowns
+// fall on the fail-closed side: an outcome this build has never heard of is not
+// [OutcomeConverged], so it counts (and demotes); an entry whose authority was never
+// attributed counts; a policy-authorized failure, rollback, drift-abort, or
+// inconclusive counts. The excluded case is named exactly, and nothing else is.
+func (e Entry) Counts() bool {
+	return !(e.Authority == audit.AuthorityPolicy && e.Outcome == OutcomeConverged)
+}
 
 // before reports whether e sorts earlier than other in the ledger's total order:
 // event time first, then key.
