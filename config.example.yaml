@@ -19,6 +19,51 @@ clusters:
     context: staging
 
 # ---------------------------------------------------------------------------
+# OPTIONAL: CHAOS ELIGIBILITY (Milestone 6) — OFF BY DEFAULT, PER CLUSTER.
+#
+# This is the ONE thing in this file that lets MaKlaude break a cluster on
+# purpose, and it is off for every cluster above because the key is absent. A
+# config written before this milestone stays ineligible, unchanged.
+#
+# Eligibility is per cluster, never global, and it is not a boolean. The marker
+# is a two-part acknowledgement that NAMES THE CLUSTER IT APPLIES TO, because
+# the realistic accident is not a typo — it is copying a config block from a
+# scratch cluster onto a production one. `chaos: true` survives that copy
+# silently. A sentence naming `kind-maklaude` does not: pasted under `prod` it
+# names the wrong cluster, and MaKlaude refuses the whole config saying so.
+#
+# To mark a cluster eligible, add this UNDER that cluster's entry, with BOTH the
+# `cluster` field and the name inside the sentence matching that cluster's name
+# exactly:
+#
+#   - name: kind-maklaude
+#     kubeconfig: ~/.kube/config
+#     context: kind-maklaude
+#     chaos:
+#       cluster: kind-maklaude
+#       acknowledgement: >-
+#         I accept that MaKlaude may deliberately break the cluster named
+#         kind-maklaude
+#
+# The sentence is compared exactly, word for word and case for case; only line
+# wrapping is forgiven (the `>-` above folds it onto one line). "yes", "true", a
+# reworded variant, or a name that doesn't match are each rejected with an error
+# naming what to fix. A partially-written block is an error too, not a silent
+# downgrade — you should never be left believing you marked a cluster when you
+# did not.
+#
+# There is no commented-out live example to un-comment, on purpose. Marking a
+# cluster eligible means typing that cluster's name twice yourself.
+#
+# What eligibility does NOT do: it grants nothing on its own. Chaos Mesh must be
+# installed, a SEPARATE ServiceAccount and RBAC bundle must be applied, and every
+# experiment still passes the same gates a remediation does — the blast-radius
+# budget, the cooldown, and the circuit breaker. Injecting a fault ALWAYS asks a
+# human; unlike a remediation, it can never be promoted to run unattended, because
+# a run of clean injections says the injector works, not that the next one is safe.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # OPTIONAL: LLM-assisted diagnosis (Milestone 3 / T5) — OFF BY DEFAULT.
 #
 # MaKlaude's root-cause diagnosis is deterministic and fully functional on its
