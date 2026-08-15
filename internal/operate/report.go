@@ -253,6 +253,17 @@ type ClusterReport struct {
 	// itself cannot say.
 	RevokedByHuman []string `json:"revokedByHuman,omitempty"`
 
+	// Regressions lists fixes this pass found had not held: MaKlaude reported the fault
+	// converged, and the same fault is back within [trust.RecurrenceHorizon]. Each one
+	// has demoted its shape back to the human gate.
+	//
+	// It is reported rather than left to the ledger for the same reason
+	// [ClusterReport.RefusedByPolicy] is. A demotion's only other trace is a shape that
+	// silently stopped auto-applying, which reads exactly like a shape that had never
+	// earned trust — and "the fix you approved does not work" is a strictly more
+	// important thing to tell an operator than any of the actions that did succeed.
+	Regressions []string `json:"regressions,omitempty"`
+
 	// Error, when non-empty, explains a per-cluster failure. It never aborts the
 	// cycle over the other clusters.
 	Error string `json:"error,omitempty"`
@@ -325,7 +336,14 @@ func (r AutoApplyReport) withError(msg string) AutoApplyReport {
 // for an operator to see what was suggested and why, without the full precondition
 // set the artifact itself carries.
 type ProposalReport struct {
-	Identity      string `json:"identity"`
+	Identity string `json:"identity"`
+
+	// Fingerprint is the fix's validity token — what trust is keyed on since issue
+	// #167. It is reported because "this proposal gated" and "this proposal was
+	// auto-applied" are both answers about a fingerprint, and without it an operator
+	// comparing two passes cannot tell a fix that changed from one that did not.
+	Fingerprint string `json:"fingerprint"`
+
 	Cluster       string `json:"cluster"`
 	Operation     string `json:"operation"`
 	Target        string `json:"target"`
@@ -600,6 +618,13 @@ func writeAutoApplied(b *strings.Builder, c *ClusterReport) {
 	for _, r := range c.RevokedByHuman {
 		fmt.Fprintf(b, "    o revoked by a human: %s\n", r)
 	}
+	// Rendered last and marked distinctly, because it is the only line in this section
+	// that is about a PAST action being wrong rather than about a present one being
+	// held back. An operator skimming for what needs their attention should not have to
+	// distinguish it from the ordinary gating traffic above.
+	for _, r := range c.Regressions {
+		fmt.Fprintf(b, "    ! regression: %s\n", r)
+	}
 }
 
 // describeConsequences renders what followed a failed unattended action, or empty when
@@ -782,6 +807,7 @@ func toProposalReports(proposals []remediate.Proposal) []ProposalReport {
 		p := &proposals[i]
 		out = append(out, ProposalReport{
 			Identity:      string(p.Identity),
+			Fingerprint:   string(p.Fingerprint()),
 			Cluster:       p.Cluster,
 			Operation:     string(p.Operation),
 			Target:        p.Target.String(),

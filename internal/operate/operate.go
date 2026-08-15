@@ -255,6 +255,13 @@ func (c *Cycle) runCluster(ctx context.Context, h *cluster.Handle, revoked revoc
 		return cr
 	}
 
+	// Recurrences are noted BEFORE anything is decided, so a fix that has just been
+	// shown not to hold cannot authorize itself on the same pass that proves it. This
+	// is the check that lets the counting window go — see the [trust] package doc — and
+	// its placement is the whole of its value: a demotion recorded after the decision
+	// would be perfectly correct and one pass too late.
+	cr.Regressions = c.noteRecurrences(proposals)
+
 	// The unattended half runs BEFORE the gate, and what it hands back is everything a
 	// person still has to decide. Running it first is what stops an action being both
 	// auto-applied and put to a human on the same pass; handing the remainder to the

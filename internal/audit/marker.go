@@ -103,12 +103,19 @@ type wireRecord struct {
 // identity, cluster and operation are hoisted out of the records because this package
 // duplicates them onto every record and repeating them here would let a malformed payload
 // disagree with itself about which action it describes.
+//
+// The fingerprint is hoisted for the same reason and carried with `omitempty`, because
+// a marker written before it existed simply has no such key. Absent decodes to the
+// empty fingerprint, which is exactly the right reading — see
+// [trust.Entry.Fingerprint] — so an older artifact rebuilds into a history that still
+// counts its failures and can promote nothing.
 type wireLifecycle struct {
-	Version   int          `json:"v"`
-	Identity  string       `json:"identity"`
-	Cluster   string       `json:"cluster"`
-	Operation string       `json:"operation"`
-	Records   []wireRecord `json:"records"`
+	Version     int          `json:"v"`
+	Identity    string       `json:"identity"`
+	Cluster     string       `json:"cluster"`
+	Operation   string       `json:"operation"`
+	Fingerprint string       `json:"fingerprint,omitempty"`
+	Records     []wireRecord `json:"records"`
 }
 
 // LifecycleMarker renders the hidden marker carrying the lifecycle a rebuild reads.
@@ -127,17 +134,27 @@ func LifecycleMarker(recs []Record) (string, error) {
 	}
 
 	wire := wireLifecycle{
-		Version:   lifecycleVersion,
-		Identity:  string(head.Identity),
-		Cluster:   head.Cluster,
-		Operation: string(head.Operation),
-		Records:   make([]wireRecord, 0, len(recs)),
+		Version:     lifecycleVersion,
+		Identity:    string(head.Identity),
+		Cluster:     head.Cluster,
+		Operation:   string(head.Operation),
+		Fingerprint: string(head.Fingerprint),
+		Records:     make([]wireRecord, 0, len(recs)),
 	}
 	for i, rec := range recs {
 		if rec.Action.Identity != head.Identity || rec.Action.Cluster != head.Cluster || rec.Action.Operation != head.Operation {
 			return "", fmt.Errorf("audit: record %d describes %s/%s on %q, the lifecycle describes %s/%s on %q",
 				i, rec.Action.Cluster, rec.Action.Operation, rec.Action.Identity,
 				head.Cluster, head.Operation, head.Identity)
+		}
+		// Checked separately from the three above so the message can say what actually
+		// went wrong. Two records of one lifecycle disagreeing about the fingerprint means
+		// the action was re-derived mid-flight from a proposal that had changed, and
+		// hoisting either answer would file the whole lifecycle under a fix that only half
+		// of it was.
+		if rec.Action.Fingerprint != head.Fingerprint {
+			return "", fmt.Errorf("audit: record %d carries fingerprint %q, the lifecycle carries %q",
+				i, rec.Action.Fingerprint, head.Fingerprint)
 		}
 		wire.Records = append(wire.Records, wireRecord{
 			Phase:             rec.Phase.String(),
@@ -189,9 +206,10 @@ func ParseLifecycleMarker(body string) ([]Record, error) {
 	}
 
 	action := Action{
-		Identity:  remediate.ProposalIdentity(wire.Identity),
-		Cluster:   wire.Cluster,
-		Operation: remediate.Operation(wire.Operation),
+		Identity:    remediate.ProposalIdentity(wire.Identity),
+		Cluster:     wire.Cluster,
+		Operation:   remediate.Operation(wire.Operation),
+		Fingerprint: remediate.Fingerprint(wire.Fingerprint),
 	}
 	recs := make([]Record, 0, len(wire.Records))
 	for i, w := range wire.Records {

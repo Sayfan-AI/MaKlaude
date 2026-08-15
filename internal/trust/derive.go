@@ -49,6 +49,13 @@ const (
 // rollback as a duplicate of the thing it undid.
 const rollbackKeySuffix = "#rollback"
 
+// recurrenceKeySuffix distinguishes the entry recording that a converged execution did
+// not hold from the entry recording the execution itself. Same reasoning as
+// [rollbackKeySuffix]: both concern one proposal identity, the history needs both, and
+// sharing a key would make the idempotent [Ledger.Record] drop the regression as a
+// duplicate of the very convergence it contradicts. See [Ledger.NoteRecurrence].
+const recurrenceKeySuffix = "#recurrence"
+
 // EntryFrom projects one action's audit lifecycle onto a single ledger entry.
 //
 // The input is every record for one proposal identity, in trail order — exactly what
@@ -75,29 +82,54 @@ func EntryFrom(recs []audit.Record) (Entry, error) {
 		return Entry{}, ErrNotAnExecution
 	}
 
-	key := string(head.Action.Identity)
-	if key == "" {
+	identity := head.Action.Identity
+	if identity == "" {
 		return Entry{}, fmt.Errorf("trust: the lifecycle carries no proposal identity")
+	}
+
+	at := finishedAt(recs)
+	if at.IsZero() {
+		return Entry{}, fmt.Errorf("trust: lifecycle %s carries no usable instant", identity)
+	}
+
+	// The key discriminates one EXECUTION of a fix from the next. See [Entry.Key] for
+	// what the identity-only key was quietly doing.
+	//
+	// Two discriminators, because neither is sufficient alone. The finish instant
+	// separates repeated runs, but only as finely as the clock behind it — an injected
+	// or coarse clock can stamp two genuine executions identically, and the failure mode
+	// is the collapse this is fixing, silently back again. The approval artifact is
+	// unique per approval and so separates them regardless of the clock, but a
+	// policy-authorized execution has none. Together they cover both, and both are
+	// recoverable from the artifact, so the same lifecycle read twice still produces the
+	// same key: [Ledger.Record] stays idempotent and a rebuild still reproduces the live
+	// history exactly.
+	key := string(identity) + "@" + at.UTC().Format(time.RFC3339Nano)
+	if ref := last.Approver.Ref; ref != "" {
+		key += "@" + ref
 	}
 	if rollback {
 		key += rollbackKeySuffix
 	}
 
-	at := finishedAt(recs)
-	if at.IsZero() {
-		return Entry{}, fmt.Errorf("trust: lifecycle %s carries no usable instant", key)
-	}
-
 	e := Entry{
-		Key: key,
+		Key:      key,
+		Identity: identity,
 		Shape: autonomy.Shape{
 			Cluster:   head.Action.Cluster,
 			Operation: head.Action.Operation,
 		},
-		Authority: last.Approver.Authority,
-		Outcome:   outcome,
-		At:        at,
-		Ref:       last.Approver.Ref,
+		// Read off the record rather than recomputed from it. The fingerprint has to be
+		// the one that was current when the action ran, and recomputing would produce
+		// this build's answer under this build's [remediate.PlannerVersion] — which is
+		// the one thing the version exists to distinguish. An older record carries no
+		// fingerprint and gets the empty one, which promotes nothing; see
+		// [Entry.Fingerprint].
+		Fingerprint: head.Action.Fingerprint,
+		Authority:   last.Approver.Authority,
+		Outcome:     outcome,
+		At:          at,
+		Ref:         last.Approver.Ref,
 	}
 	if err := validate(e); err != nil {
 		return Entry{}, err
@@ -118,6 +150,11 @@ func classify(recs []audit.Record) (outcome Outcome, rollback bool) {
 
 	// worseThan ranks outcomes so the loop can keep the worst it has seen without
 	// depending on the order records appear in.
+	// [OutcomeRegressed] is ranked but never produced here: a regression is not
+	// visible in one action's lifecycle, only in the recurrence of the fault a LATER
+	// cycle diagnoses, so it arrives through [Ledger.NoteRecurrence] instead. It is in
+	// the table anyway so that adding a lifecycle path that can detect one does not
+	// silently rank it at zero and lose it to any other outcome.
 	rank := map[Outcome]int{
 		OutcomeUnrecorded:   0,
 		OutcomeConverged:    1,
@@ -125,6 +162,7 @@ func classify(recs []audit.Record) (outcome Outcome, rollback bool) {
 		OutcomeDriftAborted: 3,
 		OutcomeFailed:       4,
 		OutcomeRolledBack:   5,
+		OutcomeRegressed:    6,
 	}
 	keep := func(candidate Outcome) {
 		if rank[candidate] > rank[outcome] {

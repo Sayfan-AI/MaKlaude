@@ -235,6 +235,7 @@ func (r *Runner) execute(ctx context.Context, auth *approve.Authorization, p rem
 		Operation:     p.Operation,
 		Target:        p.Target,
 		Reversibility: p.Reversibility,
+		Fingerprint:   p.Fingerprint(),
 		Mode:          mode,
 		ProposedAt:    p.ProposedAt,
 		StartedAt:     time.Now().UTC(),

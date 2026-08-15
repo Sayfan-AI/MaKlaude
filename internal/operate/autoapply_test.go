@@ -32,9 +32,28 @@ const autoRule = "test-rollout-restart"
 // earnedTrust is the trust posture in which the test cluster's rollout restarts have been
 // earned. [autonomy.StaticTrust] is a real [autonomy.TrustOracle], so this pins the trust
 // input exactly without standing up a ledger the test would then be testing.
-func earnedTrust() autonomy.StaticTrust {
-	return autonomy.StaticTrust{
-		{Cluster: testCluster, Operation: remediate.OpRolloutRestart}: "3 of the last 3 human-approved rolloutrestarts converged",
+func earnedTrust() shapeTrust {
+	return shapeTrust{autonomy.Shape{Cluster: testCluster, Operation: remediate.OpRolloutRestart}: true}
+}
+
+// shapeTrust trusts every fingerprint of the shapes it names.
+//
+// [autonomy.StaticTrust] would need the exact [remediate.Fingerprint] the cycle
+// computes, which these tests would have to recompute from a hand-built proposal — and
+// a hand-built proposal that drifted in any fingerprinted field would silently make
+// every case below assert that an UNTRUSTED shape gates, which is what they all do
+// anyway. Trusting the shape keeps the fingerprint out of tests that are about the
+// unattended path; the fingerprint's own effect on trust is asserted where it belongs,
+// in promotion_test.go and the trust package.
+type shapeTrust map[autonomy.Shape]bool
+
+func (s shapeTrust) Trust(subject autonomy.Subject) autonomy.TrustEvidence {
+	if !s[subject.Shape] {
+		return autonomy.TrustEvidence{}
+	}
+	return autonomy.TrustEvidence{
+		Trusted:  true,
+		Citation: "3 human-approved rolloutrestarts of this fix converged",
 	}
 }
 
@@ -52,12 +71,22 @@ func permissiveRuleset() autonomy.Ruleset {
 // told to fail — the case that must not be silent, since a failed demotion leaves a shape
 // trusted after an unattended failure.
 type recordingLedger struct {
-	lifecycles [][]audit.Record
-	err        error
+	lifecycles  [][]audit.Record
+	recurrences []remediate.ProposalIdentity
+	err         error
 }
 
 func (l *recordingLedger) RecordLifecycle(recs []audit.Record) error {
 	l.lifecycles = append(l.lifecycles, recs)
+	return l.err
+}
+
+// NoteRecurrence records what the cycle offered as a possible regression. A fake ledger
+// holds no history, so nothing here can contradict a claim of convergence and every
+// offer is a no-op — which is the point: these tests are about the unattended path, and
+// a fake that invented demotions would change their subject.
+func (l *recordingLedger) NoteRecurrence(id remediate.ProposalIdentity, _ autonomy.Shape, _ time.Time) error {
+	l.recurrences = append(l.recurrences, id)
 	return l.err
 }
 

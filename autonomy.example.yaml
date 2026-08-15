@@ -28,9 +28,10 @@
 # all of:
 #
 #   1. a rule below that names the cluster, the namespace, and the operation;
-#   2. EARNED TRUST for that (cluster, operation) shape — 3 human-approved
-#      executions that converged, with zero failures, rollbacks or drift-aborts
-#      among the last 10 recorded executions of the shape;
+#   2. EARNED TRUST for that FIX — 3 human-approved executions that converged
+#      carrying the same fingerprint (they need not be recent), with nothing
+#      demoting among the last 10 recorded executions of the (cluster, operation)
+#      shape. A change to the fix mints a new fingerprint and re-gates it;
 #   3. room under the blast-radius ceiling — 2 auto-applies per cluster per pass,
 #      a 30-minute cooldown per target, and a per-cluster circuit breaker that
 #      trips after 2 consecutive auto-apply failures;

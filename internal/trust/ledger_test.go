@@ -18,6 +18,22 @@ var (
 	other = autonomy.Shape{Cluster: "staging", Operation: remediate.OpRolloutRestart}
 )
 
+// The fingerprint every synthetic history is recorded under, and the subjects that
+// ask about it. A second fingerprint stands for the same shape after the fix changed.
+//
+// They are literals rather than [remediate.Proposal.Fingerprint] output because these
+// tests are about the ledger's arithmetic over fingerprints, not about what a
+// fingerprint covers — that is fingerprint_test.go's job, and coupling the two would
+// make a change to either one fail in both places.
+var (
+	fixtureFP = remediate.Fingerprint("fp1:fixture")
+	changedFP = remediate.Fingerprint("fp1:changed")
+
+	subject      = autonomy.Subject{Shape: shape, Fingerprint: fixtureFP}
+	changed      = autonomy.Subject{Shape: shape, Fingerprint: changedFP}
+	otherSubject = autonomy.Subject{Shape: other, Fingerprint: fixtureFP}
+)
+
 // base is the instant the synthetic histories start at. Fixed rather than derived
 // from time.Now so a failing citation assertion prints the same string on every run.
 var base = time.Date(2026, 7, 1, 9, 0, 0, 0, time.UTC)
@@ -51,9 +67,10 @@ func entryAt(t *testing.T, s autonomy.Shape, kind rune, i int) Entry {
 	t.Helper()
 
 	e := Entry{
-		Key:   fmt.Sprintf("%s-%d", s, i),
-		Shape: s,
-		At:    base.Add(time.Duration(i) * time.Minute),
+		Key:         fmt.Sprintf("%s-%d", s, i),
+		Shape:       s,
+		Fingerprint: fixtureFP,
+		At:          base.Add(time.Duration(i) * time.Minute),
 	}
 	switch kind {
 	case 'h':
@@ -86,10 +103,10 @@ func repeat(kind rune, n int) string { return strings.Repeat(string(kind), n) }
 func TestShapeWithNoHistoryIsUntrusted(t *testing.T) {
 	l := NewMemory()
 
-	if ev := l.Trust(shape); ev.Trusted {
+	if ev := l.Trust(subject); ev.Trusted {
 		t.Fatalf("a shape with no recorded history was trusted: %+v", ev)
 	}
-	if got := l.Explain(shape); !strings.Contains(got, "no recorded executions") {
+	if got := l.Explain(subject); !strings.Contains(got, "no recorded executions") {
 		t.Errorf("explanation does not say the history is empty: %q", got)
 	}
 }
@@ -102,7 +119,7 @@ func TestPromotionNeedsThresholdHumanApprovedConvergedExecutions(t *testing.T) {
 		want := n >= PromotionThreshold
 
 		l := history(t, spelling)
-		if got := l.Trust(shape).Trusted; got != want {
+		if got := l.Trust(subject).Trusted; got != want {
 			t.Errorf("history %q: trusted = %v, want %v (%d approvals, threshold %d)",
 				spelling, got, want, n, PromotionThreshold)
 		}
@@ -114,12 +131,12 @@ func TestPromotionNeedsThresholdHumanApprovedConvergedExecutions(t *testing.T) {
 // they are not stored at all (see [Entry.Counts]), so the shape's history reads as
 // empty rather than as full of non-approvals.
 func TestAutoAppliedSuccessesDoNotBuildTrust(t *testing.T) {
-	l := history(t, repeat('p', EvaluationWindow))
+	l := history(t, repeat('p', DemotionScope))
 
-	if ev := l.Trust(shape); ev.Trusted {
-		t.Fatalf("%d auto-applied converged executions promoted the shape: %+v", EvaluationWindow, ev)
+	if ev := l.Trust(subject); ev.Trusted {
+		t.Fatalf("%d auto-applied converged executions promoted the shape: %+v", DemotionScope, ev)
 	}
-	if st := l.Standing(shape); st.Approved != 0 || st.Recorded != 0 {
+	if st := l.Standing(subject); st.Approved != 0 || st.Recorded != 0 {
 		t.Errorf("Approved = %d, Recorded = %d, want 0 and 0: an auto-applied success is not evidence", st.Approved, st.Recorded)
 	}
 }
@@ -129,7 +146,7 @@ func TestAutoAppliedSuccessesDoNotBuildTrust(t *testing.T) {
 // partially-built record carries, and it must not be the one that promotes.
 func TestUnattributedExecutionsDoNotBuildTrust(t *testing.T) {
 	l := NewMemory()
-	for i := 0; i < EvaluationWindow; i++ {
+	for i := 0; i < DemotionScope; i++ {
 		e := Entry{
 			Key:     fmt.Sprintf("unattributed-%d", i),
 			Shape:   shape,
@@ -143,7 +160,7 @@ func TestUnattributedExecutionsDoNotBuildTrust(t *testing.T) {
 		}
 	}
 
-	if ev := l.Trust(shape); ev.Trusted {
+	if ev := l.Trust(subject); ev.Trusted {
 		t.Fatalf("unattributed executions promoted the shape: %+v", ev)
 	}
 }
@@ -166,23 +183,23 @@ func TestEveryDemotionCaseDemotes(t *testing.T) {
 			// Three approvals, then the demoting execution. Without the last rune this
 			// history is trusted; the sibling assertion below proves that.
 			trusted := history(t, repeat('h', PromotionThreshold))
-			if !trusted.Trust(shape).Trusted {
+			if !trusted.Trust(subject).Trusted {
 				t.Fatalf("precondition failed: %d approvals alone should be trusted", PromotionThreshold)
 			}
 
 			l := history(t, repeat('h', PromotionThreshold)+string(tc.kind))
-			if ev := l.Trust(shape); ev.Trusted {
+			if ev := l.Trust(subject); ev.Trusted {
 				t.Fatalf("a %s did not demote: %+v", tc.name, ev)
 			}
 
-			st := l.Standing(shape)
+			st := l.Standing(subject)
 			if !st.Blocked {
 				t.Fatalf("Standing.Blocked = false after a %s", tc.name)
 			}
 			if st.Blocker.Outcome != tc.outcome {
 				t.Errorf("Blocker.Outcome = %s, want %s", st.Blocker.Outcome, tc.outcome)
 			}
-			if got := l.Explain(shape); !strings.Contains(got, tc.outcome.String()) {
+			if got := l.Explain(subject); !strings.Contains(got, tc.outcome.String()) {
 				t.Errorf("explanation does not name the blocking outcome %s: %q", tc.outcome, got)
 			}
 		})
@@ -192,17 +209,17 @@ func TestEveryDemotionCaseDemotes(t *testing.T) {
 // Demotion is immediate: the very next Trust call after a failure says no, with no
 // decay period and no averaging.
 func TestDemotionIsImmediate(t *testing.T) {
-	l := history(t, repeat('h', EvaluationWindow-1))
-	if !l.Trust(shape).Trusted {
+	l := history(t, repeat('h', DemotionScope-1))
+	if !l.Trust(subject).Trusted {
 		t.Fatalf("precondition failed: a window of approvals should be trusted")
 	}
 
-	failure := entryAt(t, shape, 'f', EvaluationWindow)
+	failure := entryAt(t, shape, 'f', DemotionScope)
 	if err := l.Record(failure); err != nil {
 		t.Fatalf("recording the failure: %v", err)
 	}
 
-	if ev := l.Trust(shape); ev.Trusted {
+	if ev := l.Trust(subject); ev.Trusted {
 		t.Fatalf("trust survived a single failure: %+v", ev)
 	}
 }
@@ -211,15 +228,15 @@ func TestDemotionIsImmediate(t *testing.T) {
 // permanent brand: the failure has to age out AND fresh approvals have to accumulate.
 func TestDemotionLastsUntilTheFailureLeavesTheWindow(t *testing.T) {
 	// One failure followed by a full window of approvals. The failure is entry 0 and
-	// the window holds the last EvaluationWindow entries, so it has just fallen out.
-	l := history(t, "f"+repeat('h', EvaluationWindow))
-	if !l.Trust(shape).Trusted {
-		t.Fatalf("trust did not return after the failure aged out: %s", l.Explain(shape))
+	// the window holds the last DemotionScope entries, so it has just fallen out.
+	l := history(t, "f"+repeat('h', DemotionScope))
+	if !l.Trust(subject).Trusted {
+		t.Fatalf("trust did not return after the failure aged out: %s", l.Explain(subject))
 	}
 
 	// One approval short, and the failure is still inside the window.
-	still := history(t, "f"+repeat('h', EvaluationWindow-1))
-	if ev := still.Trust(shape); ev.Trusted {
+	still := history(t, "f"+repeat('h', DemotionScope-1))
+	if ev := still.Trust(subject); ev.Trusted {
 		t.Fatalf("trust returned while the failure was still in the window: %+v", ev)
 	}
 }
@@ -229,45 +246,117 @@ func TestDemotionLastsUntilTheFailureLeavesTheWindow(t *testing.T) {
 func TestInconclusiveNeitherPromotesNorDemotes(t *testing.T) {
 	l := history(t, repeat('h', PromotionThreshold)+"ii")
 
-	if !l.Trust(shape).Trusted {
-		t.Fatalf("inconclusive executions demoted a trusted shape: %s", l.Explain(shape))
+	if !l.Trust(subject).Trusted {
+		t.Fatalf("inconclusive executions demoted a trusted shape: %s", l.Explain(subject))
 	}
-	if st := l.Standing(shape); st.Approved != PromotionThreshold {
+	if st := l.Standing(subject); st.Approved != PromotionThreshold {
 		t.Errorf("Approved = %d, want %d: an inconclusive execution is not an approval",
 			st.Approved, PromotionThreshold)
 	}
 }
 
-// The reason the window bounds BOTH halves of the rule rather than only the
-// failures — see the package doc. Under the looser reading this history stays
-// trusted forever on three year-old approvals.
-func TestInconclusiveExecutionsEventuallyPushApprovalsOutOfTheWindow(t *testing.T) {
-	l := history(t, repeat('h', PromotionThreshold)+repeat('i', EvaluationWindow))
+// The property that replaced the counting window's accidental version of it.
+//
+// Under the window, a shape that timed out on every attempt lost trust because the
+// timeouts crowded its approvals out of the last ten. Issue #167 removed the window,
+// and this asserts the loss was not silent: a run of unobserved outcomes as long as
+// the run of confirmed ones that earns trust blocks the shape outright. See
+// [unobservedStreak].
+func TestAnUnobservedStreakBlocksTrust(t *testing.T) {
+	l := history(t, repeat('h', PromotionThreshold)+repeat('i', PromotionThreshold))
 
-	if ev := l.Trust(shape); ev.Trusted {
-		t.Fatalf("approvals that aged out of the window still granted trust: %+v", ev)
+	if ev := l.Trust(subject); ev.Trusted {
+		t.Fatalf("a shape MaKlaude can no longer observe stayed trusted: %+v", ev)
 	}
-	st := l.Standing(shape)
-	if st.Blocked {
-		t.Errorf("Blocked = true: an inconclusive execution must not read as a demotion")
+	st := l.Standing(subject)
+	if !st.Blocked || !st.Blind {
+		t.Errorf("Blocked = %v, Blind = %v, want both true", st.Blocked, st.Blind)
 	}
-	if st.Approved != 0 {
-		t.Errorf("Approved = %d, want 0: every approval should have left the window", st.Approved)
+	// The approvals are still there. That is the difference from the window: the
+	// evidence has not been thrown away, it has been overruled by newer evidence about
+	// whether the fix can still be seen to work, and it counts again the moment one
+	// execution converges.
+	if st.Approved != PromotionThreshold {
+		t.Errorf("Approved = %d, want %d: a streak must not erase the approvals it overrules",
+			st.Approved, PromotionThreshold)
 	}
-	if st.Recorded != PromotionThreshold+EvaluationWindow {
-		t.Errorf("Recorded = %d, want %d: total history must not be truncated",
-			st.Recorded, PromotionThreshold+EvaluationWindow)
+	if got := l.Explain(subject); !strings.Contains(got, "no longer confirm") {
+		t.Errorf("Explain() = %q, want it to say the outcomes could not be observed rather than that a fix failed", got)
+	}
+
+	// One short of the streak, and trust holds. A single flake must not re-gate.
+	shorter := history(t, repeat('h', PromotionThreshold)+repeat('i', PromotionThreshold-1))
+	if !shorter.Trust(subject).Trusted {
+		t.Errorf("%d inconclusive executions re-gated the shape: %s", PromotionThreshold-1, shorter.Explain(subject))
+	}
+}
+
+// The two halves of issue #167's model, as one history.
+//
+// Promotion is scoped to the fix: a shape with a spotless record of one fingerprint
+// grants nothing to a proposal carrying another. Demotion is scoped to the shape: a
+// failure on any fingerprint blocks them all, so a changed fix cannot be used to
+// launder one.
+func TestTrustIsScopedToTheFingerprint(t *testing.T) {
+	l := history(t, repeat('h', PromotionThreshold))
+
+	if !l.Trust(subject).Trusted {
+		t.Fatalf("precondition failed: %s should be trusted", subject)
+	}
+	if ev := l.Trust(changed); ev.Trusted {
+		t.Fatalf("a changed fix inherited the old fix's approvals: %+v", ev)
+	}
+	if got := l.Explain(changed); !strings.Contains(got, "given for a different action") {
+		t.Errorf("Explain() = %q, want it to say the approvals on record were for another fix", got)
+	}
+	if st := l.Standing(changed); st.Recorded != PromotionThreshold || st.Matching != 0 {
+		t.Errorf("Recorded = %d, Matching = %d, want %d and 0: the shape's history is visible, none of it matches",
+			st.Recorded, st.Matching, PromotionThreshold)
+	}
+
+	// A failure recorded against the CHANGED fingerprint must block the original,
+	// which the fingerprint-scoped half deliberately does not do in reverse.
+	failure := entryAt(t, shape, 'f', PromotionThreshold)
+	failure.Fingerprint = changedFP
+	if err := l.Record(failure); err != nil {
+		t.Fatalf("recording the other fingerprint's failure: %v", err)
+	}
+	if ev := l.Trust(subject); ev.Trusted {
+		t.Fatalf("a failure on a sibling fingerprint left the shape trusted: %+v", ev)
+	}
+}
+
+// An approval does not expire. This is the counting window's removal stated as the
+// property it was blocking: a fix that has never failed stays trusted no matter how
+// much unrelated history piles up behind it.
+func TestApprovalsDoNotAgeOut(t *testing.T) {
+	// The approvals, then far more than a window's worth of auto-applied successes and
+	// a couple of confirmed runs on a different fingerprint. Nothing here is a failure.
+	l := history(t, repeat('h', PromotionThreshold)+repeat('p', DemotionScope*3))
+	for i := 0; i < DemotionScope; i++ {
+		e := entryAt(t, shape, 'h', PromotionThreshold+DemotionScope*3+i)
+		e.Fingerprint = changedFP
+		if err := l.Record(e); err != nil {
+			t.Fatalf("recording a run of the changed fix: %v", err)
+		}
+	}
+
+	if !l.Trust(subject).Trusted {
+		t.Fatalf("trust expired on a fix that has never failed: %s", l.Explain(subject))
+	}
+	if st := l.Standing(subject); st.Approved != PromotionThreshold {
+		t.Errorf("Approved = %d, want %d", st.Approved, PromotionThreshold)
 	}
 }
 
 // Trust is per shape. A cluster earning autonomy must not lend it to another.
 func TestTrustDoesNotLeakBetweenShapes(t *testing.T) {
-	l := history(t, repeat('h', EvaluationWindow))
+	l := history(t, repeat('h', DemotionScope))
 
-	if !l.Trust(shape).Trusted {
+	if !l.Trust(subject).Trusted {
 		t.Fatalf("precondition failed: %s should be trusted", shape)
 	}
-	if ev := l.Trust(other); ev.Trusted {
+	if ev := l.Trust(otherSubject); ev.Trusted {
 		t.Fatalf("%s inherited trust from %s: %+v", other, shape, ev)
 	}
 }
@@ -280,8 +369,8 @@ func TestDemotionDoesNotLeakBetweenShapes(t *testing.T) {
 		t.Fatalf("recording the other shape's failure: %v", err)
 	}
 
-	if !l.Trust(shape).Trusted {
-		t.Fatalf("a failure on %s demoted %s: %s", other, shape, l.Explain(shape))
+	if !l.Trust(subject).Trusted {
+		t.Fatalf("a failure on %s demoted %s: %s", other, shape, l.Explain(subject))
 	}
 }
 
@@ -290,16 +379,19 @@ func TestDemotionDoesNotLeakBetweenShapes(t *testing.T) {
 func TestCitationStatesTheEvidence(t *testing.T) {
 	l := history(t, repeat('h', PromotionThreshold))
 
-	ev := l.Trust(shape)
+	ev := l.Trust(subject)
 	if !ev.Trusted {
-		t.Fatalf("precondition failed: %s", l.Explain(shape))
+		t.Fatalf("precondition failed: %s", l.Explain(subject))
 	}
 
 	for _, want := range []string{
 		shape.String(),
-		fmt.Sprintf("%d of the last %d", PromotionThreshold, PromotionThreshold),
-		"human-approved and converged",
+		fmt.Sprintf("%d human-approved executions of this exact fix", PromotionThreshold),
 		"no failure, rollback or drift-abort",
+		// The fingerprint is in the citation because the citation is the entire
+		// oversight artifact for an action nobody approved, and "which fix did the
+		// approvals cover?" is the first question issue #167 makes askable.
+		string(fixtureFP),
 		refFor(PromotionThreshold - 1),
 	} {
 		if !strings.Contains(ev.Citation, want) {
@@ -313,9 +405,9 @@ func TestCitationStatesTheEvidence(t *testing.T) {
 func TestCitationIsStableAcrossCalls(t *testing.T) {
 	l := history(t, repeat('h', PromotionThreshold+1))
 
-	first := l.Trust(shape).Citation
+	first := l.Trust(subject).Citation
 	for i := 0; i < 5; i++ {
-		if got := l.Trust(shape).Citation; got != first {
+		if got := l.Trust(subject).Citation; got != first {
 			t.Fatalf("citation varied between calls on identical history:\n%s\n%s", first, got)
 		}
 	}
@@ -327,11 +419,11 @@ func TestCitationIsStableAcrossCalls(t *testing.T) {
 func TestUntrustedVerdictCarriesNoCitation(t *testing.T) {
 	l := history(t, repeat('h', PromotionThreshold)+"f")
 
-	ev := l.Trust(shape)
+	ev := l.Trust(subject)
 	if ev.Trusted || ev.Citation != "" {
 		t.Fatalf("an untrusted verdict carried evidence: %+v", ev)
 	}
-	if l.Explain(shape) == "" {
+	if l.Explain(subject) == "" {
 		t.Error("Explain returned nothing for an untrusted shape")
 	}
 }
@@ -341,7 +433,7 @@ func TestUntrustedVerdictCarriesNoCitation(t *testing.T) {
 func TestWindowIsIndependentOfInsertionOrder(t *testing.T) {
 	// A history whose oldest entry is a failure: in event order it has aged out, and
 	// in reverse insertion order a naive implementation would put it last and demote.
-	spelling := "f" + repeat('h', EvaluationWindow)
+	spelling := "f" + repeat('h', DemotionScope)
 
 	forward := history(t, spelling)
 
@@ -352,11 +444,11 @@ func TestWindowIsIndependentOfInsertionOrder(t *testing.T) {
 		}
 	}
 
-	if got, want := backward.Trust(shape), forward.Trust(shape); got != want {
+	if got, want := backward.Trust(subject), forward.Trust(subject); got != want {
 		t.Fatalf("insertion order changed the verdict:\nforward:  %+v\nbackward: %+v", want, got)
 	}
-	if !forward.Trust(shape).Trusted {
-		t.Fatalf("precondition failed: the failure should have aged out: %s", forward.Explain(shape))
+	if !forward.Trust(subject).Trusted {
+		t.Fatalf("precondition failed: the failure should have aged out: %s", forward.Explain(subject))
 	}
 }
 
@@ -375,7 +467,7 @@ func TestRecordIsIdempotentOnKey(t *testing.T) {
 	if got := l.Len(); got != 1 {
 		t.Errorf("Len = %d, want 1: the same key was stored more than once", got)
 	}
-	if ev := l.Trust(shape); ev.Trusted {
+	if ev := l.Trust(subject); ev.Trusted {
 		t.Fatalf("one execution recorded %d times bought trust: %+v", PromotionThreshold+2, ev)
 	}
 }
@@ -406,7 +498,7 @@ func TestHumanApprovedEntryWithoutAnArtifactIsRejected(t *testing.T) {
 // evidence that re-gates a shape.
 func TestPolicyWaivedFailureNeedsNoArtifactAndDemotes(t *testing.T) {
 	l := history(t, repeat('h', PromotionThreshold))
-	if !l.Trust(shape).Trusted {
+	if !l.Trust(subject).Trusted {
 		t.Fatalf("fixture error: %d approvals did not promote the shape", PromotionThreshold)
 	}
 
@@ -417,7 +509,7 @@ func TestPolicyWaivedFailureNeedsNoArtifactAndDemotes(t *testing.T) {
 	if err := l.Record(e); err != nil {
 		t.Fatalf("a policy-waived failure was rejected: %v", err)
 	}
-	if st := l.Standing(shape); !st.Blocked || st.Trusted {
+	if st := l.Standing(subject); !st.Blocked || st.Trusted {
 		t.Fatalf("an unattended failure did not re-gate the shape: %+v", st)
 	}
 }
@@ -463,7 +555,7 @@ func TestAnAutoAppliedSuccessIsDroppedNotStored(t *testing.T) {
 	if l.Len() != 0 {
 		t.Fatalf("Len = %d, want 0: an auto-applied success must not hold a window slot", l.Len())
 	}
-	if st := l.Standing(shape); st.Recorded != 0 {
+	if st := l.Standing(subject); st.Recorded != 0 {
 		t.Errorf("Recorded = %d, want 0", st.Recorded)
 	}
 }
@@ -475,18 +567,18 @@ func TestAnAutoAppliedSuccessIsDroppedNotStored(t *testing.T) {
 // shape would have revoked its own autonomy for working.
 func TestAPerfectlyWorkingShapeKeepsItsTrust(t *testing.T) {
 	l := history(t, repeat('h', PromotionThreshold))
-	if !l.Trust(shape).Trusted {
+	if !l.Trust(subject).Trusted {
 		t.Fatalf("fixture error: %d approvals did not promote the shape", PromotionThreshold)
 	}
 
-	for i := 0; i < 2*EvaluationWindow; i++ {
+	for i := 0; i < 2*DemotionScope; i++ {
 		if err := l.Record(entryAt(t, shape, 'p', PromotionThreshold+i)); err != nil {
 			t.Fatalf("recording auto-applied success %d: %v", i, err)
 		}
 	}
-	if !l.Trust(shape).Trusted {
+	if !l.Trust(subject).Trusted {
 		t.Fatalf("%d flawless unattended executions revoked the shape's own trust: %s",
-			2*EvaluationWindow, l.Explain(shape))
+			2*DemotionScope, l.Explain(subject))
 	}
 }
 
@@ -632,23 +724,38 @@ func TestLedgerDrivesTheAutonomyDecision(t *testing.T) {
 		},
 	}
 
-	untrusted := history(t, repeat('h', PromotionThreshold-1))
+	// Re-key the synthetic histories onto the fingerprint this proposal actually
+	// computes. Spelling the token would pin an implementation detail of another
+	// package; asking the proposal keeps the two in step by construction.
+	refingerprint := func(l *Ledger) *Ledger {
+		out := NewMemory()
+		for _, e := range l.Entries() {
+			e.Fingerprint = proposal.Fingerprint()
+			if err := out.Record(e); err != nil {
+				t.Fatalf("re-keying %s: %v", e.Key, err)
+			}
+		}
+		return out
+	}
+	live := autonomy.Subject{Shape: shape, Fingerprint: proposal.Fingerprint()}
+
+	untrusted := refingerprint(history(t, repeat('h', PromotionThreshold-1)))
 	v := autonomy.Decide(shape.Cluster, proposal, ruleset, untrusted)
 	if v.Decision != autonomy.DecisionGate || v.Reason != autonomy.ReasonUntrustedShape {
 		t.Fatalf("an under-threshold history did not gate: %s", v)
 	}
 
-	trusted := history(t, repeat('h', PromotionThreshold))
+	trusted := refingerprint(history(t, repeat('h', PromotionThreshold)))
 	v = autonomy.Decide(shape.Cluster, proposal, ruleset, trusted)
 	if v.Decision != autonomy.DecisionAutoApply || v.Reason != autonomy.ReasonEarnedTrust {
 		t.Fatalf("an earned history did not auto-apply: %s", v)
 	}
-	if v.Evidence != trusted.Trust(shape).Citation {
+	if v.Evidence != trusted.Trust(live).Citation {
 		t.Errorf("the verdict's evidence is not the ledger's citation:\n%s\n%s",
-			v.Evidence, trusted.Trust(shape).Citation)
+			v.Evidence, trusted.Trust(live).Citation)
 	}
 
-	demoted := history(t, repeat('h', PromotionThreshold)+"r")
+	demoted := refingerprint(history(t, repeat('h', PromotionThreshold)+"r"))
 	v = autonomy.Decide(shape.Cluster, proposal, ruleset, demoted)
 	if v.Decision != autonomy.DecisionGate || v.Reason != autonomy.ReasonUntrustedShape {
 		t.Fatalf("a rollback did not return the shape to the human gate: %s", v)

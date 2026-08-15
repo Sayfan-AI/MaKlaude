@@ -393,14 +393,20 @@ naming the variable to fix — rules with no ledger can never promote a shape, a
 rules with no ceiling have nothing bounding them, so either one is autonomy that is
 configured, valid, and silently unable to fire.
 
-Four things worth knowing before you enable it:
+Five things worth knowing before you enable it:
 
 - **Nothing is trusted on day one.** There is no seed and no "start trusted" flag —
-  trust is *derived*, never declared. Promotion needs 3 human-approved executions of
-  the shape that converged, with zero failures, rollbacks or drift-aborts among the
-  last 10 recorded executions of it. Demotion is immediate on any one of those three.
-  So the first pass after enabling autonomy behaves exactly like the last pass before
-  it; what changed is that each approval is now evidence.
+  trust is *derived*, never declared. Promotion needs 3 human-approved executions that
+  converged carrying the same **fingerprint** — the identity of one fix, covering which
+  object it touches and why — and they need not be recent. Demotion is broader and
+  immediate: one failure, rollback, drift-abort, regression, or a run of 3 unobservable
+  outcomes blocks every fix of that `(cluster, operation)` shape for its next 10
+  recorded executions. So the first pass after enabling autonomy behaves exactly like
+  the last pass before it; what changed is that each approval is now evidence.
+- **Trust ends on invalidation, not on a schedule.** A cached approval stays good until
+  the fix changes or the fix stops working. Change what a proposal would actually do —
+  a different object, a different cause, a dropped guard — and it gets a new fingerprint
+  that no past approval covers, so it returns to the gate.
 - **An unattended success earns nothing.** Only an execution a *human* approved can
   promote, so autonomy does not compound.
 - **The bounds are fixed, not configurable.** 2 auto-applies per cluster per pass, a

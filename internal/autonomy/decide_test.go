@@ -46,10 +46,30 @@ func shippedRuleset() Ruleset {
 	}}
 }
 
-// earned is a trust oracle that has promoted the fixture shape.
+// subjectOf is what [Decide] will ask the oracle about for this proposal: its shape
+// and its fingerprint. Tests seed trust through it rather than spelling a fingerprint,
+// so a change to what [remediate.Proposal.Fingerprint] covers cannot quietly turn these
+// cases into assertions about an untrusted subject that gate for the wrong reason.
+func subjectOf(p remediate.Proposal) Subject {
+	return Subject{
+		Shape:       Shape{Cluster: p.Cluster, Operation: p.Operation},
+		Fingerprint: p.Fingerprint(),
+	}
+}
+
+// trusting is a trust oracle that has promoted exactly the fixes proposed here.
+func trusting(ps ...remediate.Proposal) StaticTrust {
+	out := StaticTrust{}
+	for _, p := range ps {
+		out[subjectOf(p)] = "seeded"
+	}
+	return out
+}
+
+// earned is a trust oracle that has promoted the fixture proposal's fix.
 func earned() StaticTrust {
 	return StaticTrust{
-		{Cluster: testCluster, Operation: remediate.OpRolloutRestart}: "3 human-approved executions converged; 0 failures in the last 10",
+		subjectOf(proposal()): "3 human-approved executions of this fix converged; no failures in the last 10 for the shape",
 	}
 }
 
@@ -170,7 +190,7 @@ func TestDecide_RefusedRegardlessOfConfiguration(t *testing.T) {
 			tc.mutate(&p)
 			// Trust every shape, including the mutated one, so trust cannot be what
 			// stops it.
-			trust := StaticTrust{{Cluster: testCluster, Operation: p.Operation}: "seeded"}
+			trust := trusting(p)
 
 			got := Decide(testCluster, p, permissive, trust)
 
@@ -277,7 +297,7 @@ func TestDecide_ScopeNearMisses(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			p := proposal()
 			tc.mutate(&p)
-			trust := StaticTrust{{Cluster: p.Cluster, Operation: p.Operation}: "seeded"}
+			trust := trusting(p)
 
 			got := Decide(p.Cluster, p, shippedRuleset(), trust)
 
@@ -308,7 +328,7 @@ func TestDecide_ClusterScopedTargetNeverAutoApplies(t *testing.T) {
 	// ...so try it the only way validation permits: a real namespace listed, and a
 	// target that simply has none.
 	rules[0].Namespaces = []string{testNamespace}
-	trust := StaticTrust{{Cluster: testCluster, Operation: remediate.OpCordonNode}: "seeded"}
+	trust := trusting(p)
 
 	got := Decide(testCluster, p, rules, trust)
 
@@ -319,11 +339,17 @@ func TestDecide_ClusterScopedTargetNeverAutoApplies(t *testing.T) {
 // They are separate reasons because they need three different responses: wire up
 // the ledger, wait for history, or fix a ledger claiming what it cannot evidence.
 func TestDecide_TrustGates(t *testing.T) {
-	otherShape := StaticTrust{
-		{Cluster: "staging", Operation: remediate.OpRolloutRestart}:     "seeded",
-		{Cluster: testCluster, Operation: remediate.OpCordonNode}:       "seeded",
-		{Cluster: testCluster, Operation: remediate.OpRollbackRevision}: "seeded",
-	}
+	// Trust for three neighbours of the fixture: same operation on another cluster, and
+	// two other operations on this one. None of them is the proposal under test, so all
+	// three must leave it gating.
+	otherCluster := proposal()
+	otherCluster.Cluster = "staging"
+	otherCluster.Target.Cluster = "staging"
+	cordon := proposal()
+	cordon.Operation = remediate.OpCordonNode
+	rollback := proposal()
+	rollback.Operation = remediate.OpRollbackRevision
+	otherShape := trusting(otherCluster, cordon, rollback)
 
 	for _, tc := range []struct {
 		name  string
@@ -336,12 +362,12 @@ func TestDecide_TrustGates(t *testing.T) {
 		{"history for a neighbouring shape only", otherShape, ReasonUntrustedShape},
 		{
 			name:  "trusted with no citation",
-			trust: StaticTrust{{Cluster: testCluster, Operation: remediate.OpRolloutRestart}: ""},
+			trust: StaticTrust{subjectOf(proposal()): ""},
 			want:  ReasonTrustEvidenceMissing,
 		},
 		{
 			name:  "trusted with a blank citation",
-			trust: StaticTrust{{Cluster: testCluster, Operation: remediate.OpRolloutRestart}: "   \n\t"},
+			trust: StaticTrust{subjectOf(proposal()): "   \n\t"},
 			want:  ReasonTrustEvidenceMissing,
 		},
 	} {
@@ -361,7 +387,7 @@ func TestDecide_TrustGates(t *testing.T) {
 func TestDecide_TrustIsScopedToTheCluster(t *testing.T) {
 	rules := shippedRuleset()
 	rules[0].Clusters = []string{"prod", "staging"}
-	trust := StaticTrust{{Cluster: "prod", Operation: remediate.OpRolloutRestart}: "3 converged"}
+	trust := StaticTrust{subjectOf(proposal()): "3 converged"}
 
 	staging := proposal()
 	staging.Cluster, staging.Target.Cluster = "staging", "staging"
@@ -432,11 +458,11 @@ func TestDecide_IsDeterministic(t *testing.T) {
 		{Name: "a-restart", Clusters: []string{"prod", "staging"}, Namespaces: []string{"payments", "web"}, Operations: []remediate.Operation{remediate.OpRolloutRestart}},
 		{Name: "b-restart", Clusters: []string{"prod"}, Namespaces: []string{"payments"}, Operations: []remediate.Operation{remediate.OpRolloutRestart, remediate.OpDeletePod}, MaxReversibility: remediate.ReversibilityRecreatedByController},
 	}
-	trust := StaticTrust{
-		{Cluster: "prod", Operation: remediate.OpRolloutRestart}:    "3 converged",
-		{Cluster: "prod", Operation: remediate.OpDeletePod}:         "5 converged",
-		{Cluster: "staging", Operation: remediate.OpRolloutRestart}: "9 converged",
-	}
+	prodDelete := proposal()
+	prodDelete.Operation = remediate.OpDeletePod
+	stagingRestart := proposal()
+	stagingRestart.Cluster, stagingRestart.Target.Cluster = "staging", "staging"
+	trust := trusting(proposal(), prodDelete, stagingRestart)
 
 	cases := []remediate.Proposal{proposal()}
 	for _, op := range []remediate.Operation{remediate.OpDeletePod, remediate.OpCordonNode, remediate.OpRollbackRevision, "unknown"} {

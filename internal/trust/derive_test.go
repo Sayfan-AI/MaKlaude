@@ -59,6 +59,7 @@ func (lc lifecycle) records() []audit.Record {
 			Operation:     shape.Operation,
 			Target:        remediate.Target{Cluster: shape.Cluster, Kind: "deployment", Namespace: "payments", Name: "web"},
 			Reversibility: remediate.ReversibilityReversible,
+			Fingerprint:   fixtureFP,
 			ProposedAt:    proposedAt,
 		},
 		Approver: audit.Approver{Authority: lc.authority, Identity: "the-gigi", Ref: lc.ref},
@@ -291,7 +292,7 @@ func TestARollbackGetsItsOwnKey(t *testing.T) {
 	if got := l.Len(); got != 2 {
 		t.Fatalf("Len = %d, want 2: the rollback collapsed into the execution", got)
 	}
-	if st := l.Standing(shape); !st.Blocked {
+	if st := l.Standing(subject); !st.Blocked {
 		t.Error("the rollback did not block trust")
 	}
 }
@@ -482,11 +483,11 @@ func TestASyntheticTrailHistoryEarnsAutonomy(t *testing.T) {
 		}
 	}
 
-	if ev := l.Trust(shape); !ev.Trusted {
+	if ev := l.Trust(subject); !ev.Trusted {
 		t.Fatalf("%d converged human-approved lifecycles did not earn autonomy: %s",
-			PromotionThreshold, l.Explain(shape))
+			PromotionThreshold, l.Explain(subject))
 	}
-	if !strings.Contains(l.Trust(shape).Citation, testRef) {
-		t.Errorf("the citation does not point at the approval artifact: %s", l.Trust(shape).Citation)
+	if !strings.Contains(l.Trust(subject).Citation, testRef) {
+		t.Errorf("the citation does not point at the approval artifact: %s", l.Trust(subject).Citation)
 	}
 }

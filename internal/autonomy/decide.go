@@ -66,7 +66,7 @@ func Decide(cluster string, p remediate.Proposal, rs Ruleset, trust TrustOracle)
 	if matched == nil {
 		return verdict(nearestReason, nearest)
 	}
-	return decideTrust(cluster, p.Operation, matched.Name, trust)
+	return decideTrust(cluster, p, matched.Name, trust)
 }
 
 // refuse runs the three unconditional checks — the ones no configuration can
@@ -153,11 +153,19 @@ func covers(r *Rule, p remediate.Proposal) (Reason, bool) {
 // The three ways to fail here are separate reasons rather than one, because they
 // need three different responses from an operator: wire up the ledger, wait for the
 // history to accumulate, or fix a ledger that is claiming trust it cannot evidence.
-func decideTrust(cluster string, op remediate.Operation, rule string, trust TrustOracle) Verdict {
+//
+// The whole proposal is taken rather than its operation, because the question is not
+// only "has this shape earned autonomy" but "did a human approve THIS fix" — see
+// [Subject] and [remediate.Proposal.Fingerprint]. Computing the fingerprint here keeps
+// [Decide] pure: it is a hash of fields already in hand, with no clock and no I/O.
+func decideTrust(cluster string, p remediate.Proposal, rule string, trust TrustOracle) Verdict {
 	if trust == nil {
 		return verdict(ReasonNoTrustLedger, rule)
 	}
-	evidence := trust.Trust(Shape{Cluster: cluster, Operation: op})
+	evidence := trust.Trust(Subject{
+		Shape:       Shape{Cluster: cluster, Operation: p.Operation},
+		Fingerprint: p.Fingerprint(),
+	})
 	if !evidence.Trusted {
 		return verdict(ReasonUntrustedShape, rule)
 	}
