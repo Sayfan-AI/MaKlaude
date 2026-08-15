@@ -343,6 +343,15 @@ type Report struct {
 	Target        remediate.Target
 	Reversibility remediate.Reversibility
 
+	// Fingerprint is the validity token of the fix that was attempted. See
+	// [remediate.Proposal.Fingerprint].
+	//
+	// It is carried on the report rather than recomputed by the audit layer for the
+	// same reason ProposedAt is: a rollback has no proposal in hand, only the report of
+	// the action it undoes, and one derivation is what keeps the two from describing
+	// the same action differently.
+	Fingerprint remediate.Fingerprint
+
 	// ProposedAt is when the proposal was computed. It is carried so the report — and
 	// the audit record derived from it — can state the whole lifecycle from proposal
 	// to outcome without a second lookup, including how long the action waited for a

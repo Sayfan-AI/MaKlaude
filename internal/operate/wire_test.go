@@ -119,7 +119,10 @@ func TestAutonomyFromEnv_Wires(t *testing.T) {
 // the word "earned" a lie.
 func TestAutonomyFromEnv_ColdStartIsTrustedNothing(t *testing.T) {
 	c := wiredCycle(t)
-	evidence := c.oracle.Trust(autonomy.Shape{Cluster: "staging", Operation: remediate.OpRolloutRestart})
+	evidence := c.oracle.Trust(autonomy.Subject{
+		Shape:       autonomy.Shape{Cluster: "staging", Operation: remediate.OpRolloutRestart},
+		Fingerprint: "fp1:anything",
+	})
 	if evidence.Trusted {
 		t.Fatalf("a fresh ledger must trust nothing, got %+v", evidence)
 	}

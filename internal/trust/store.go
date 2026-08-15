@@ -39,26 +39,37 @@ import (
 // wireEntry is the on-disk shape of an [Entry]. It exists so the file format is a
 // deliberate, reviewable thing rather than whatever the struct fields happen to be
 // called this month, and so the enums travel as tokens.
+//
+// The fingerprint is `omitempty` and its absence is meaningful rather than merely
+// tolerated: a line written before issue #167 has no such key, decodes to the empty
+// fingerprint, and thereby promotes nothing while still counting toward its shape's
+// failures. That is the intended reading of a history whose fixes are no longer
+// identifiable, so the format needs no version bump and no migration — see
+// [Entry.Fingerprint].
 type wireEntry struct {
-	Key       string    `json:"key"`
-	Cluster   string    `json:"cluster"`
-	Operation string    `json:"operation"`
-	Authority string    `json:"authority"`
-	Outcome   string    `json:"outcome"`
-	At        time.Time `json:"at"`
-	Ref       string    `json:"ref,omitempty"`
+	Key         string    `json:"key"`
+	Identity    string    `json:"identity,omitempty"`
+	Cluster     string    `json:"cluster"`
+	Operation   string    `json:"operation"`
+	Fingerprint string    `json:"fingerprint,omitempty"`
+	Authority   string    `json:"authority"`
+	Outcome     string    `json:"outcome"`
+	At          time.Time `json:"at"`
+	Ref         string    `json:"ref,omitempty"`
 }
 
 // marshal renders one entry as a single JSON line, newline included.
 func marshal(e Entry) ([]byte, error) {
 	line, err := json.Marshal(wireEntry{
-		Key:       e.Key,
-		Cluster:   e.Shape.Cluster,
-		Operation: string(e.Shape.Operation),
-		Authority: e.Authority.String(),
-		Outcome:   e.Outcome.String(),
-		At:        e.At.UTC(),
-		Ref:       e.Ref,
+		Key:         e.Key,
+		Identity:    string(e.Identity),
+		Cluster:     e.Shape.Cluster,
+		Operation:   string(e.Shape.Operation),
+		Fingerprint: string(e.Fingerprint),
+		Authority:   e.Authority.String(),
+		Outcome:     e.Outcome.String(),
+		At:          e.At.UTC(),
+		Ref:         e.Ref,
 	})
 	if err != nil {
 		return nil, err
@@ -90,12 +101,14 @@ func unmarshal(line []byte) (Entry, error) {
 	}
 
 	return Entry{
-		Key:       w.Key,
-		Shape:     autonomy.Shape{Cluster: w.Cluster, Operation: remediate.Operation(w.Operation)},
-		Authority: authority,
-		Outcome:   outcome,
-		At:        w.At,
-		Ref:       w.Ref,
+		Key:         w.Key,
+		Identity:    remediate.ProposalIdentity(w.Identity),
+		Shape:       autonomy.Shape{Cluster: w.Cluster, Operation: remediate.Operation(w.Operation)},
+		Fingerprint: remediate.Fingerprint(w.Fingerprint),
+		Authority:   authority,
+		Outcome:     outcome,
+		At:          w.At,
+		Ref:         w.Ref,
 	}, nil
 }
 

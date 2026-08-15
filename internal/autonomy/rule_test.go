@@ -166,17 +166,30 @@ func TestCatalogOperation_IsAnExplicitSwitch(t *testing.T) {
 // usable oracle that trusts nothing. A ledger that has not been populated yet must
 // not be a nil-pointer panic in the middle of a remediation cycle.
 func TestStaticTrust(t *testing.T) {
-	shape := Shape{Cluster: "prod", Operation: remediate.OpRolloutRestart}
+	subject := Subject{
+		Shape:       Shape{Cluster: "prod", Operation: remediate.OpRolloutRestart},
+		Fingerprint: "fp1:abc",
+	}
 
-	if got := StaticTrust(nil).Trust(shape); got.Trusted || got.Citation != "" {
+	if got := StaticTrust(nil).Trust(subject); got.Trusted || got.Citation != "" {
 		t.Errorf("nil StaticTrust returned %#v, want the untrusted zero value", got)
 	}
-	if got := (StaticTrust{}).Trust(shape); got.Trusted {
-		t.Errorf("empty StaticTrust trusted %s", shape)
+	if got := (StaticTrust{}).Trust(subject); got.Trusted {
+		t.Errorf("empty StaticTrust trusted %s", subject)
 	}
-	got := StaticTrust{shape: "3 converged"}.Trust(shape)
+	got := StaticTrust{subject: "3 converged"}.Trust(subject)
 	if !got.Trusted || got.Citation != "3 converged" {
-		t.Errorf("Trust(%s) = %#v, want trusted with the citation carried through", shape, got)
+		t.Errorf("Trust(%s) = %#v, want trusted with the citation carried through", subject, got)
+	}
+
+	// The fingerprint is part of the key, not decoration on it. A seeded subject must
+	// not answer for the same shape carrying a different fix — that is the whole of
+	// issue #167 expressed at the smallest oracle there is.
+	other := subject
+	other.Fingerprint = "fp1:def"
+	if got := (StaticTrust{subject: "3 converged"}).Trust(other); got.Trusted {
+		t.Errorf("Trust(%s) = %#v on an oracle seeded only for %s; trust must not carry across fingerprints",
+			other, got, subject)
 	}
 }
 

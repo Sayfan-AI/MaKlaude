@@ -3,6 +3,7 @@ package operate
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/approve"
 	"github.com/Sayfan-AI/MaKlaude/internal/audit"
@@ -13,6 +14,7 @@ import (
 	"github.com/Sayfan-AI/MaKlaude/internal/execute"
 	"github.com/Sayfan-AI/MaKlaude/internal/health"
 	"github.com/Sayfan-AI/MaKlaude/internal/remediate"
+	"github.com/Sayfan-AI/MaKlaude/internal/trust"
 )
 
 // This file is the unattended half of the cycle, and it is the call site three earlier
@@ -64,14 +66,24 @@ import (
 // a thing a remediation pass should be able to do by accident.
 //
 // Both halves of the cycle write through it: the gated path hands it the
-// human-approved executions that promote a shape, and the unattended path hands it
-// the failures that demote one. Neither caller filters what it reports — what belongs
-// in the evaluation window is the ledger's own rule ([trust.Entry.Counts]), decided
+// human-approved executions that promote a fix, and the unattended path hands it
+// the failures that demote a shape. Neither caller filters what it reports — what
+// belongs in the history is the ledger's own rule ([trust.Entry.Counts]), decided
 // behind this interface rather than in front of it.
 type TrustRecorder interface {
 	// RecordLifecycle projects one action's audit lifecycle onto a ledger entry and
 	// records it, treating a lifecycle with no execution behind it as a no-op.
 	RecordLifecycle(recs []audit.Record) error
+
+	// NoteRecurrence records that a converged execution of this proposal did not hold,
+	// because the same fault has been diagnosed again within the ledger's recurrence
+	// horizon. It is a no-op when there is no such execution to contradict.
+	//
+	// This is on the write side rather than being inferred by the ledger because only
+	// the cycle knows a fault was diagnosed AGAIN: the ledger sees executions, and a
+	// recurrence is a proposal that should not have needed making. The cycle also owns
+	// the injected clock the horizon is measured against.
+	NoteRecurrence(identity remediate.ProposalIdentity, shape autonomy.Shape, now time.Time) error
 }
 
 // lifecycleReader is the audit sink's read side: the records for one action.
@@ -148,6 +160,77 @@ func (c *Cycle) revocations(ctx context.Context) revocationView {
 		return revocationView{err: err.Error()}
 	}
 	return revocationView{shapes: shapes}
+}
+
+// noteRecurrences tells the ledger which of this pass's proposals contradict a recent
+// claim of convergence, and reports the ones that did in a form a human can read.
+//
+// A proposal existing at all is the signal. Every proposal here was produced from a
+// fresh diagnosis of a fault that is happening NOW; if the ledger holds a converged
+// execution of that same proposal identity from within [trust.RecurrenceHorizon], then
+// MaKlaude reported that exact fault fixed and the cluster disagrees. The ledger owns
+// the horizon and the "was there such an execution" question — see
+// [TrustRecorder.NoteRecurrence] — so this loop is deliberately dumb: it offers every
+// proposal and lets the ledger decide which ones are contradictions.
+//
+// It runs whether or not autonomy is wired. A regression is a fact about the cluster
+// and about a fix that already ran, not a step in the unattended path, and a cycle that
+// only learned from its mistakes while autonomy happened to be configured would forget
+// exactly the history a later operator turning autonomy on most needs.
+//
+// A recording failure is reported and not returned. The pass has already produced its
+// proposals and a human still needs them; refusing to remediate because a demotion could
+// not be written would convert a bookkeeping fault into an outage. The failure is loud
+// in the report because it means the next pass may trust a fix this one knows is broken.
+func (c *Cycle) noteRecurrences(proposals []remediate.Proposal) []string {
+	if c.ledger == nil {
+		return nil
+	}
+	now := c.now().UTC()
+
+	var out []string
+	for _, p := range proposals {
+		shape := autonomy.Shape{Cluster: p.Cluster, Operation: p.Operation}
+		before := c.ledgerHolds(shape)
+		if err := c.ledger.NoteRecurrence(p.Identity, shape, now); err != nil {
+			out = append(out, fmt.Sprintf(
+				"%s on %s: a recurrence of this fault could not be recorded (%s), so a fix that may not "+
+					"have held keeps whatever trust it has",
+				p.Operation, p.Target.String(), err))
+			continue
+		}
+		// Asking the ledger whether it grew is how this reports a recurrence without a
+		// second copy of the horizon arithmetic living out here. Two implementations of
+		// "is this a regression" would be two chances to disagree, and the disagreement
+		// would be invisible: the ledger's answer is what actually demotes, and this one
+		// is only what a human reads.
+		if after := c.ledgerHolds(shape); after > before {
+			out = append(out, fmt.Sprintf(
+				"%s on %s: MaKlaude reported this fixed within the last %s and the fault is back, so the "+
+					"fix did not hold and %s returns to the human gate",
+				p.Operation, p.Target.String(), trust.RecurrenceHorizon, shape))
+		}
+	}
+	return out
+}
+
+// ledgerHolds reports how many entries the ledger has for one shape, or -1 when the
+// wired recorder cannot say.
+//
+// The count is read through an optional interface rather than added to [TrustRecorder],
+// because a write-side interface that also reads is not a write-side interface, and the
+// two fakes in this package's tests would then have to implement a query none of their
+// assertions use. A recorder that cannot answer simply produces no recurrence lines —
+// the demotion still happened, only the prose is missing, which is the right thing to
+// lose.
+func (c *Cycle) ledgerHolds(shape autonomy.Shape) int {
+	counter, ok := c.ledger.(interface {
+		Standing(autonomy.Subject) trust.Standing
+	})
+	if !ok {
+		return -1
+	}
+	return counter.Standing(autonomy.Subject{Shape: shape}).Recorded
 }
 
 // autoApply runs the unattended half for one cluster.

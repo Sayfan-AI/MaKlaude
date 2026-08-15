@@ -208,6 +208,7 @@ func actionOf(rep Report) audit.Action {
 		Operation:     rep.Operation,
 		Target:        rep.Target,
 		Reversibility: rep.Reversibility,
+		Fingerprint:   rep.Fingerprint,
 		Title:         titleFor(rep.Operation),
 		ProposedAt:    rep.ProposedAt,
 	}

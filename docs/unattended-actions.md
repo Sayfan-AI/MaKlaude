@@ -78,9 +78,15 @@ Two labels are applied by MaKlaude and are worth knowing:
 > **Add the `autonomy:revoked` label to the disclosure issue.**
 
 That is the whole signal. It revokes autonomy for that action's **shape** — its
-`(cluster, operation)` pair, the granularity trust is earned at — and it takes effect on
-MaKlaude's next cycle, which reads the open disclosures before it decides anything. No
-configuration change, no restart, nothing else to remember.
+`(cluster, operation)` pair — and it takes effect on MaKlaude's next cycle, which reads
+the open disclosures before it decides anything. No configuration change, no restart,
+nothing else to remember.
+
+The shape is deliberately **broader than the unit trust is earned at**. Trust is earned
+per *fix* (see [The cold start](#the-cold-start-nothing-is-trusted-on-day-one)), but
+adding this label is a decision that this kind of act on this cluster needs a person
+again — so it blocks every fix of that shape, not the single one you happened to be
+looking at. Revocation fails wide, for the same reason demotion does.
 
 Three properties worth stating:
 
@@ -223,20 +229,70 @@ that granted autonomy without evidence would be the blank cheque
 
 So the first pass after enabling autonomy looks exactly like the last pass before it:
 every proposal goes to a person. What changed is that each approval is now **evidence**.
-Promotion needs, per `(cluster, operation)` shape:
 
-- **3 human-approved executions that converged**, and
-- **zero failures, rollbacks or drift-aborts** among the last **10** recorded executions
-  of that shape.
-
-The 3 must themselves be inside that window of 10 — the window is what the whole rule is
-evaluated over, so a shape that converged three times last year and has timed out on
-every attempt since loses trust on its own as the timeouts push the approvals out.
-Demotion is immediate on a single failure, rollback, or drift-abort.
+Promotion needs **3 human-approved executions that converged, carrying the same
+fingerprint** — and nothing demoting on the shape. The three don't have to be recent. An
+approval stays good until the fix it was given for changes or stops working, so an
+approval from a year ago counts exactly as much as one from this morning.
 
 An auto-applied success is worth nothing here: only an execution a *human* approved can
-promote, so autonomy does not compound. Enabling autonomy on a cluster and seeing nothing
+promote, so autonomy doesn't compound. Enabling autonomy on a cluster and seeing nothing
 auto-applied for weeks is the mechanism working.
+
+#### Trust attaches to the fix, not to the operation
+
+A **fingerprint** is a short opaque token summarizing everything a cached approval
+depends on: the planner version, the operation, *which* object (cluster, kind, namespace,
+name), the diagnosed cause, the reversibility, which preconditions the fix carries, and
+the expected values of the preconditions that bind. Change any of those and the proposal
+gets a new fingerprint, which no past approval covers, so it returns to the gate.
+
+Deliberately **not** in it: the target's `resourceVersion` (it moves on every write by
+anyone, so including it would re-gate everything every cycle — drift is caught at execute
+time by sending the precondition to the API server instead), the crashlooping pod's
+identity (a different object after every restart), the hypothesis and confidence, and
+every prose field. Trust must not lapse because someone fixed a typo. The full field-by-
+field reasoning is in [`internal/remediate/fingerprint.go`](../internal/remediate/fingerprint.go).
+
+This is what closes the hole the `(cluster, operation)` key had: three approved
+rollout-restarts on `prod` used to earn the right to restart *any* deployment on `prod`
+indefinitely, including workloads that didn't exist when the approvals were given.
+
+#### What ends trust
+
+Promotion is scoped to the fix; **demotion is scoped to the shape**. One demoting outcome
+anywhere in the shape's last **10** recorded executions blocks *every* fingerprint of that
+shape, not just the one that went wrong.
+
+That asymmetry is the safety argument. A restart that failed is evidence about restarting
+things on that cluster. If demotion were fingerprint-scoped, any change to the fix would
+mint a fresh fingerprint with a clean record — turning "the fix changed" from a reason to
+re-earn trust into a way to launder a failure. The narrow scope earns, the broad scope
+blocks, and each direction is the one that fails closed.
+
+| Trigger | Scope | What it means |
+| ------- | ----- | ------------- |
+| The fix changed | The fingerprint | The approved thing and the proposed thing aren't the same thing, so the cached approval doesn't cover it. Re-approval required |
+| Failure, rollback, or drift-abort | The shape, for its next 10 recorded executions | The fix stopped working. Immediate on a single occurrence |
+| **Regression** — the same fault diagnosed again on the same object within **1 hour** of an execution that reported convergence | The shape | A fix that has to be applied again isn't a fix. Recorded as `regressed`, and it demotes |
+| **Unobserved streak** — the 3 most recent executions all inconclusive | The shape | MaKlaude can no longer tell whether this fix works, so it stops acting as if it does |
+
+The last two carry weight that used to be carried by a counting window, and they're the
+reason removing it was safe. The window forced a person back into the loop on a schedule
+regardless of whether the health signal was telling the truth — dumb, but a backstop.
+Removing it would otherwise put the whole safety burden on MaKlaude's own convergence
+check, which is a bounded observation immediately after an action: structurally the same
+thing as the milestone-1 crashloop detector that read a pod one instant after a restart
+and concluded it was fine. Recurrence catches the convergence check saying yes and being
+wrong; the unobserved streak catches it being unable to say anything at all. Both source
+the backstop from evidence rather than from a schedule.
+
+The **10** is a recovery bound, not an evaluation window: without it, one failure would
+block a shape forever and the only escape would be hand-editing the ledger. A demoted
+shape climbs back by accumulating 10 further recorded executions with nothing demoting
+among them — and since an auto-applied success isn't recorded at all, every one of those
+is an execution a human approved. Recovery is real, bounded, and driven entirely by
+people.
 
 ### What it will and will not do once trusted
 
@@ -278,10 +334,16 @@ it is rebuilt, nothing is trusted.
 
 The trust ledger is a **cache** of the artifacts, not the authority over them. The hidden
 marker in each disclosure body is what makes that true rather than aspirational: it
-carries the fields `trust.EntryFrom` reads — proposal identity, cluster, operation,
-authority, convergence verdict, failure class, clean-abort flag, rollback-attempted flag,
-and the attempt's finishing instant — so a ledger rebuilt from nothing but the bodies
-reproduces the live one entry for entry.
+carries the fields `trust.EntryFrom` reads — proposal identity, **fingerprint**, cluster,
+operation, authority, convergence verdict, failure class, clean-abort flag,
+rollback-attempted flag, and the attempt's finishing instant — so a ledger rebuilt from
+nothing but the bodies reproduces the live one entry for entry.
+
+The fingerprint is carried with `omitempty`, so an artifact written before fingerprints
+existed rebuilds into an entry with the empty fingerprint. That's the correct reading
+rather than a lossy one: the empty fingerprint matches no computed fingerprint, so an
+old entry can never authorize anything on its own, and the rebuilt history stays a
+faithful record of what was approved.
 
 Two design notes that are easy to get wrong in the other direction:
 
@@ -297,14 +359,21 @@ Two design notes that are easy to get wrong in the other direction:
 
 ## An unattended success never builds more trust
 
-Only a **human-approved** execution can promote a shape. An auto-applied success is
-recorded nowhere in the ledger, and that is a correctness requirement rather than an
-oversight: the ledger's standing is computed over a fixed window of the most recent
-entries, so writing non-promoting successes into it would push the human approvals that
-earned the trust out of the window and silently un-earn it. A shape that worked perfectly
-would revoke its own autonomy after a handful of successes.
+Only a **human-approved** execution can promote. An auto-applied execution that converged
+is recorded nowhere in the ledger — it neither promotes nor erodes — and that's a
+correctness requirement rather than an oversight, for two reasons:
 
-Failures **are** recorded, which re-gates the shape until its history recovers.
+- **It preserves the meaning of the count.** The number measures how much a human has
+  sanctioned, not how much MaKlaude has done.
+- **It keeps recovery in human hands.** Demotion is cleared by 10 further recorded
+  executions with nothing demoting among them. If auto-applied successes were recorded,
+  a demoted shape could clear its own block simply by succeeding at what it was demoted
+  for — autonomy buying back its own autonomy.
+
+Note what the exclusion does **not** cover, because the two halves are easy to conflate.
+An auto-applied execution that **failed**, rolled back, drift-aborted, or regressed *is*
+recorded and demotes exactly like a human-approved one. Autonomy can't earn itself more
+autonomy, and it's fully able to lose the autonomy it has.
 
 ## Where this lives in the code
 

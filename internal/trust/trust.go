@@ -21,53 +21,97 @@
 // The consequence is that on a fresh install NOTHING is trusted and every proposal
 // gates. That is the correct day-one behavior, not a gap to close.
 //
-// # The promotion rule, and the one place this reading is stricter than the words
+// # Trust is a cached judgment that stays valid until something invalidates it
 //
-// The parameters were approved on the milestone plan and are not changed here:
+// This is the model issue #167 settled, and it replaced a counting window. The window
+// said trust was evaluated over a shape's last 10 recorded executions: promoting runs
+// had to be inside it, so a well-behaved fix re-earned its standing on a schedule
+// whether or not anything about it had changed. That is not a safety property, it is
+// a timer, and it was wrong in both directions at once — it expired approvals that
+// were still perfectly good, and it preserved them across changes that made them
+// meaningless. The counter was not measuring the thing that matters.
 //
-//   - Promotion needs 3 human-approved executions of the shape that converged, with
-//     zero failures or rollbacks among the last 10 recorded executions of that shape.
-//   - Demotion is immediate on a single failure, rollback, or drift-abort.
-//   - The shape is (cluster, operation) — see [autonomy.Shape] for why not per-object.
+// Two conditions end trust, and nothing else does:
 //
-// This package reads "the last 10 executions" as the WINDOW the whole rule is
-// evaluated over, so the 3 converged executions must themselves be inside it. The
-// looser reading — 3 converged executions found anywhere in history, plus a clean
-// last 10 — was rejected because of what it does with an outcome that is neither a
-// success nor a failure. A [OutcomeInconclusive] execution does not demote (the
-// approved parameters list what demotes, and this is not on it), so under the loose
-// reading a shape that converged three times last year and has timed out on every
-// attempt since would stay trusted forever. Under the window reading those timeouts
-// push the converged runs out of the last 10 and trust lapses on its own. Both
-// readings honor the sign-off; this one fails closed, so it is the one implemented.
+//  1. THE FIX CHANGED. The approved thing and the proposed thing are no longer the
+//     same thing, so the cached approval does not cover it. See
+//     [remediate.Proposal.Fingerprint] for what "the same thing" means and which
+//     differences are deliberately not counted.
+//  2. THE FIX STOPPED WORKING. A failure, rollback, or drift-abort demotes the shape
+//     outright, and so does a converged execution that turns out not to have held —
+//     see [OutcomeRegressed] and [Ledger.NoteRecurrence].
+//
+// What does NOT end trust is a fix doing exactly what a person sanctioned,
+// successfully, several times. An auto-approval is a human approval taken earlier and
+// at a higher level of abstraction; the evidence chain terminates at a person either
+// way, so nothing about repetition erodes the sanction.
+//
+// # The two scopes, and why they are different
+//
+// The parameters approved on the milestone plan are unchanged in magnitude —
+// [PromotionThreshold] is still 3, a single bad outcome still demotes — but they no
+// longer apply to the same unit, and the asymmetry is the safety argument:
+//
+//   - PROMOTION IS SCOPED TO THE FIX. Three human-approved converged executions
+//     carrying the same [remediate.Fingerprint] promote that fingerprint, at any
+//     distance in the past. This is the half issue #167 was filed about: under
+//     (cluster, operation) alone, three approved rollout-restarts on prod earned the
+//     right to restart ANY deployment on prod indefinitely, including workloads that
+//     did not exist when the approvals were given.
+//   - DEMOTION IS SCOPED TO THE SHAPE. One demoting outcome anywhere in the last
+//     [DemotionScope] recorded executions of the (cluster, operation) pair blocks every
+//     fingerprint of that shape, not merely the one that went wrong.
+//
+// Narrowing both would have been the obvious symmetry and it is the wrong one. A
+// restart that failed is evidence about restarting things on that cluster, and if
+// demotion were fingerprint-scoped then any change to the fix — a bumped
+// [remediate.PlannerVersion], a different target — would produce a fresh fingerprint
+// with a clean record, which turns "the fix changed" from a reason to re-earn trust
+// into a way to launder a failure. So the narrow scope earns and the broad scope
+// blocks, and each direction is the one that fails closed.
+//
+// [DemotionScope] is the counting window's one surviving job and is kept deliberately
+// rather than by omission; see the constant for why an unbounded version would make a
+// single failure permanent.
+//
+// # The risk this model carries that the window did not, and what carries it
+//
+// The window was dumb, but its dumbness was a backstop: it forced a person back into
+// the loop on a schedule regardless of whether the health signal was telling the
+// truth. Removing it puts the whole safety burden on MaKlaude's own convergence
+// check — and a convergence check is a bounded observation immediately after an
+// action, which is structurally the same thing as the milestone-1 crashloop detector
+// that read a pod one instant after a restart, saw it was not currently in
+// CrashLoopBackOff, and concluded it was fine.
+//
+// So convergence is not the last word here. Recurrence is: if the same fault is
+// diagnosed again on the same object within [RecurrenceHorizon] of an execution that
+// reported convergence, that execution is recorded as [OutcomeRegressed] and the shape
+// is demoted. A fix that has to be applied again is not a fix, and a shape whose fixes
+// keep being reapplied is the last one that should be acting with nobody watching.
+// That is the strength the window used to supply, sourced from evidence rather than
+// from a schedule.
 //
 // # Autonomy does not compound
 //
 // Only an execution a HUMAN approved can promote. An auto-applied execution that
 // converged perfectly is not evidence for further autonomy: it neither promotes nor
-// erodes, and it does not occupy a window slot at all. [Entry.Counts] is that rule,
-// and it is consulted inside [Ledger.Record] and [Ledger.Rebuild] so the live append
-// path and a rebuild from the artifacts cannot disagree about what the window holds.
-// The decision is recorded on issue #166: flushing the human approvals that earned
-// trust out of the window, so that a shape working perfectly revokes its own autonomy,
-// would make a person re-approve a fix that has never once failed — the kind of
-// nagging that gets a safety feature switched off.
+// erodes, and it is not recorded at all. [Entry.Counts] is that rule, and it is
+// consulted inside [Ledger.Record] and [Ledger.Rebuild] so the live append path and a
+// rebuild from the artifacts cannot disagree about what the history holds. The
+// decision is recorded on issue #166.
 //
 // The asymmetry is not needed to stop trust being self-reinforcing, because an
 // auto-approval IS a human approval. It is taken earlier and at a higher level of
 // abstraction — over a policy rather than over one action — but the chain of authority
-// still terminates at a person. What the asymmetry preserves is what the window
-// measures: how much a human has sanctioned, not how much MaKlaude has done.
+// still terminates at a person. What the asymmetry preserves is the meaning of the
+// count: how much a human has sanctioned, not how much MaKlaude has done.
 //
-// The exposure that buys is written down rather than left implicit: with successes
-// excluded from the window, no amount of clean unattended operation expires trust on
-// its own. Once earned, it lapses only when an execution demotes the shape — a
-// failure, rollback, or drift-abort — or when inconclusive outcomes crowd the
-// approvals out of the window. A shape passing permanently out of human oversight is a
-// real danger; a counting window was the wrong remedy for it, and condition-based
-// invalidation — trust as a cached judgment that stays valid until something
-// invalidates it — is the right one. That model is issue #167, and it is where the
-// expiry question gets settled.
+// Note what this exclusion does NOT cover, because the two halves are easy to
+// conflate. An auto-applied execution that converged is not recorded; an auto-applied
+// execution that FAILED, rolled back, drift-aborted, or regressed is recorded and
+// demotes exactly like a human-approved one. Autonomy cannot earn itself more
+// autonomy, and it is fully able to lose the autonomy it has.
 //
 // # The ledger is a cache; the approval artifacts are the authority
 //
@@ -87,6 +131,7 @@ import (
 
 	"github.com/Sayfan-AI/MaKlaude/internal/audit"
 	"github.com/Sayfan-AI/MaKlaude/internal/autonomy"
+	"github.com/Sayfan-AI/MaKlaude/internal/remediate"
 )
 
 // Outcome is what one recorded execution did, reduced to the only distinctions the
@@ -141,6 +186,25 @@ const (
 	// remediation someone reversed is one that should not have run, whatever the
 	// convergence window said at the time.
 	OutcomeRolledBack
+
+	// OutcomeRegressed means an execution that reported convergence did not actually
+	// fix anything: the same fault was diagnosed again, on the same object, soon
+	// enough afterwards that the fix cannot be said to have worked.
+	//
+	// It is the outcome issue #167 required and it exists because of what removing the
+	// counting window gave up. The window was dumb, but its dumbness was a backstop: it
+	// forced a shape back to a person on a schedule whether or not the health signal
+	// was telling the truth. With expiry moved to invalidation, the entire safety
+	// burden lands on the convergence check — and a convergence check is a bounded
+	// observation immediately after an action, which is exactly the shape of the
+	// milestone-1 crashloop bug, where reading a pod one instant after a restart and
+	// finding it not currently in CrashLoopBackOff was mistaken for health.
+	//
+	// So convergence is no longer the last word on whether a fix worked. Recurrence is.
+	// [Ledger.NoteRecurrence] is how one gets recorded, and it demotes: a fix that has
+	// to be applied again is not a fix, and a shape whose fixes keep being reapplied is
+	// the last shape that should be acting with nobody watching.
+	OutcomeRegressed
 )
 
 // String renders the outcome as a stable lowercase token. The tokens are written to
@@ -160,6 +224,8 @@ func (o Outcome) String() string {
 		return "drift-aborted"
 	case OutcomeRolledBack:
 		return "rolled-back"
+	case OutcomeRegressed:
+		return "regressed"
 	default:
 		return "outcome(" + strconv.Itoa(int(o)) + ")"
 	}
@@ -197,7 +263,7 @@ func (o Outcome) Demotes() bool {
 func parseOutcome(token string) (Outcome, bool) {
 	for _, o := range []Outcome{
 		OutcomeUnrecorded, OutcomeConverged, OutcomeInconclusive,
-		OutcomeFailed, OutcomeDriftAborted, OutcomeRolledBack,
+		OutcomeFailed, OutcomeDriftAborted, OutcomeRolledBack, OutcomeRegressed,
 	} {
 		if o.String() == token {
 			return o, true
@@ -228,17 +294,51 @@ func parseAuthority(token string) (audit.Authority, bool) {
 // field would be a second place for the cluster-derived free text that trail is
 // careful to redact to end up.
 type Entry struct {
-	// Key identifies the execution this entry describes. Recording the same key twice
+	// Key identifies the EXECUTION this entry describes. Recording the same key twice
 	// is a no-op, which is what makes the live append path and a full [Ledger.Rebuild]
 	// from the same artifacts produce the same ledger.
 	//
-	// It is the proposal identity, suffixed for a rollback, because undoing an action
-	// is a second thing that happened to the same proposal and both belong in the
-	// history. See [EntryFrom].
+	// It is the proposal identity, the instant the attempt finished, and a suffix for a
+	// rollback or a recurrence. See [EntryFrom] for the composition.
+	//
+	// The instant is load-bearing and was not always there. The key used to be the
+	// proposal identity alone, which silently collapsed EVERY execution of one fix on
+	// one object into a single entry: a deployment that crashlooped and was approved and
+	// restarted five times recorded one approval, not five. Under the old
+	// (cluster, operation) trust key that under-count was invisible, because the three
+	// approvals promotion needs came from three different objects. Under issue #167 the
+	// approvals must share a fingerprint, an object's fingerprint is stable across its
+	// own repeated faults, and so the collapse would have made promotion unreachable
+	// rather than merely inaccurate — trust that can never be earned, presenting as
+	// autonomy that is configured and simply never fires.
 	Key string
 
-	// Shape is the (cluster, operation) pair trust is earned at.
+	// Identity is the proposal this execution was of. It is carried rather than parsed
+	// back out of Key, because Key is a composed string and a cluster name is
+	// operator-chosen text that can contain the separator. A key is for equality; a
+	// field is for asking questions.
+	Identity remediate.ProposalIdentity
+
+	// Shape is the (cluster, operation) pair. It is the scope a demoting outcome
+	// poisons and the scope a person revokes; it is NOT by itself the scope trust is
+	// earned at — see Fingerprint below and the package doc.
 	Shape autonomy.Shape
+
+	// Fingerprint identifies the fix this execution was of. See
+	// [remediate.Proposal.Fingerprint]. Only entries carrying the fingerprint of the
+	// proposal in hand can promote it.
+	//
+	// It is EMPTY on two legitimate kinds of entry and both must be unable to promote
+	// anything, which is what an empty fingerprint already means to [Ledger.Standing]:
+	// an entry written by a build from before issue #167, and one rebuilt from an
+	// artifact whose lifecycle marker predates the field. Neither is corrupt and
+	// neither should be rejected — a shape's failures still count from them, which is
+	// the half of the history that must survive a format change — so [validate] does
+	// not require it. The consequence is stated rather than hidden: on upgrade, every
+	// shape that had earned autonomy returns to the human gate and re-earns it against
+	// a fingerprint. That is the correct reading of "we no longer know which fix those
+	// approvals were for".
+	Fingerprint remediate.Fingerprint
 
 	// Authority is the kind of authority the execution ran under. Only
 	// [audit.AuthorityHuman] can build trust; see the package doc on why an

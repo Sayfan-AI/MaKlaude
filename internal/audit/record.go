@@ -34,6 +34,27 @@ type Action struct {
 	// undo. It is what set the approver's level of scrutiny, so the record keeps it.
 	Reversibility remediate.Reversibility
 
+	// Fingerprint is the validity token for the fix this record concerns. See
+	// [remediate.Proposal.Fingerprint].
+	//
+	// It is recorded rather than recomputed later, and that is the point of storing it
+	// at all: a trust decision has to compare the fix being proposed NOW against the
+	// fix a human approved THEN, and "then" is only recoverable if the record says so.
+	// Recomputing from the other fields could not work anyway — the fingerprint covers
+	// the proposal's preconditions and [remediate.PlannerVersion], neither of which a
+	// record carries.
+	//
+	// The token is a hash, which is what makes it safe to keep here. Its inputs include
+	// a namespace and an object name; a record is rendered into a world-readable
+	// artifact, so storing those inputs would widen the surface this package redacts,
+	// while storing their digest carries no content and supports the only operation the
+	// trust model performs on it, which is equality.
+	//
+	// Empty means the record was written before fingerprints existed. That is a valid
+	// record and it must stay readable — see [trust.Entry.Fingerprint] for what an
+	// empty one can and cannot authorize.
+	Fingerprint remediate.Fingerprint
+
 	// Title is the short human-readable label for the action, taken from the proposal.
 	Title string
 

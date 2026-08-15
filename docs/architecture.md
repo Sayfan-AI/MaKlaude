@@ -48,7 +48,7 @@ Milestone 5 added a sixth condition on top of those five and removed none of the
 | Stage | Package | What it does | Model in the path? |
 | ----- | ------- | ------------ | ------------------ |
 | Decide | `internal/autonomy` | Answers auto-apply / gate / refuse for **one** proposal. A pure function — no client, no file, no clock, no environment | No |
-| Earn | `internal/trust` | Derives whether a `(cluster, operation)` shape has earned autonomy, from a durable history of recorded executions | No |
+| Earn | `internal/trust` | Derives whether a fix has earned autonomy, from a durable history of recorded executions. Promotion is scoped to the fix's fingerprint; demotion is scoped to its `(cluster, operation)` shape | No |
 | Bound | `internal/budget` | Caps auto-applies per cluster per pass, cools down a target, and trips a per-cluster circuit breaker | No |
 | Disclose | `internal/disclose` | Opens one GitHub artifact per unattended action *before* it runs, and reads the label that revokes a shape | No |
 

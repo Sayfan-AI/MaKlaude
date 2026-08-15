@@ -40,14 +40,14 @@ func TestLedgerSurvivesAProcessRestart(t *testing.T) {
 			t.Fatalf("recording: %v", err)
 		}
 	}
-	before := first.Trust(shape)
+	before := first.Trust(subject)
 	if !before.Trusted {
-		t.Fatalf("precondition failed: %s", first.Explain(shape))
+		t.Fatalf("precondition failed: %s", first.Explain(subject))
 	}
 
 	// A second Open against the same path is what a restart looks like from here.
 	second := openLedger(t, path)
-	after := second.Trust(shape)
+	after := second.Trust(subject)
 
 	if after != before {
 		t.Fatalf("the verdict did not survive a restart:\nbefore: %+v\nafter:  %+v", before, after)
@@ -61,7 +61,7 @@ func TestLedgerSurvivesAProcessRestart(t *testing.T) {
 		t.Fatalf("recording the failure: %v", err)
 	}
 	third := openLedger(t, path)
-	if ev := third.Trust(shape); ev.Trusted {
+	if ev := third.Trust(subject); ev.Trusted {
 		t.Fatalf("a recorded failure did not survive the restart: %+v", ev)
 	}
 }
@@ -74,7 +74,7 @@ func TestOpeningAMissingLedgerIsAnEmptyHistory(t *testing.T) {
 	if l.Len() != 0 {
 		t.Errorf("Len = %d, want 0", l.Len())
 	}
-	if ev := l.Trust(shape); ev.Trusted {
+	if ev := l.Trust(subject); ev.Trusted {
 		t.Fatalf("a fresh install trusted something: %+v", ev)
 	}
 }
@@ -144,8 +144,8 @@ func TestRebuildReplacesTheWholeHistory(t *testing.T) {
 			t.Fatalf("recording: %v", err)
 		}
 	}
-	if !l.Trust(shape).Trusted {
-		t.Fatalf("precondition failed: %s", l.Explain(shape))
+	if !l.Trust(subject).Trusted {
+		t.Fatalf("precondition failed: %s", l.Explain(subject))
 	}
 
 	// ...and a rebuild that finds the artifacts only support one approval.
@@ -156,7 +156,7 @@ func TestRebuildReplacesTheWholeHistory(t *testing.T) {
 	if got := l.Len(); got != 1 {
 		t.Errorf("Len after rebuild = %d, want 1", got)
 	}
-	if ev := l.Trust(shape); ev.Trusted {
+	if ev := l.Trust(subject); ev.Trusted {
 		t.Fatalf("trust survived a rebuild that removed its evidence: %+v", ev)
 	}
 
@@ -195,10 +195,10 @@ func TestRebuildFromTheArtifactsReproducesTheLiveLedger(t *testing.T) {
 		t.Fatalf("rebuilding: %v", err)
 	}
 
-	if got, want := rebuilt.Trust(shape), live.Trust(shape); got != want {
+	if got, want := rebuilt.Trust(subject), live.Trust(subject); got != want {
 		t.Fatalf("a rebuild changed the verdict:\nlive:    %+v\nrebuilt: %+v", want, got)
 	}
-	if got, want := rebuilt.Standing(shape), live.Standing(shape); got != want {
+	if got, want := rebuilt.Standing(subject), live.Standing(subject); got != want {
 		t.Fatalf("a rebuild changed the standing:\nlive:    %+v\nrebuilt: %+v", want, got)
 	}
 	if got, want := len(rebuilt.Entries()), len(live.Entries()); got != want {
@@ -233,8 +233,8 @@ func TestARejectedRebuildLeavesTheLedgerIntact(t *testing.T) {
 	if got := l.Len(); got != PromotionThreshold {
 		t.Errorf("Len after a rejected rebuild = %d, want %d", got, PromotionThreshold)
 	}
-	if !l.Trust(shape).Trusted {
-		t.Errorf("a rejected rebuild demoted the shape: %s", l.Explain(shape))
+	if !l.Trust(subject).Trusted {
+		t.Errorf("a rejected rebuild demoted the shape: %s", l.Explain(subject))
 	}
 	if got := openLedger(t, path).Len(); got != PromotionThreshold {
 		t.Errorf("Len on disk after a rejected rebuild = %d, want %d", got, PromotionThreshold)
@@ -265,7 +265,7 @@ func TestDuplicateKeysOnDiskCollapse(t *testing.T) {
 	if got := l.Len(); got != 1 {
 		t.Errorf("Len = %d, want 1", got)
 	}
-	if ev := l.Trust(shape); ev.Trusted {
+	if ev := l.Trust(subject); ev.Trusted {
 		t.Fatalf("one execution written %d times bought trust: %+v", PromotionThreshold+2, ev)
 	}
 }

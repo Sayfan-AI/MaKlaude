@@ -301,9 +301,19 @@ func TestLedger_ReproducesTheLiveLedgerAcrossBothTrails(t *testing.T) {
 	// The arithmetic the entries exist for must also agree. Comparing the standing rather
 	// than only the entries is what catches a difference that survives field equality — an
 	// ordering that puts the same entries in a different window.
+	// Asked per (shape, fingerprint) actually recorded, because trust is keyed on both
+	// since issue #167 — comparing only shapes would pass on two ledgers that agreed
+	// about nothing except that neither had the fingerprint asked about.
+	subjects := map[autonomy.Subject]struct{}{}
+	for _, e := range liveEntries {
+		subjects[autonomy.Subject{Shape: e.Shape, Fingerprint: e.Fingerprint}] = struct{}{}
+	}
 	for _, shape := range shapes {
-		if want, got := live.Trust(shape), rebuilt.Trust(shape); want != got {
-			t.Errorf("shape %s: rebuilt trust %+v, live trust %+v", shape, got, want)
+		subjects[autonomy.Subject{Shape: shape}] = struct{}{}
+	}
+	for subject := range subjects {
+		if want, got := live.Trust(subject), rebuilt.Trust(subject); want != got {
+			t.Errorf("subject %s: rebuilt trust %+v, live trust %+v", subject, got, want)
 		}
 	}
 }
