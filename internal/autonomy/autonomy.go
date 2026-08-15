@@ -70,8 +70,10 @@
 // not as "go", until that layer exists.
 //
 // Loading rules from disk or environment is likewise not here. This package models
-// and validates a [Ruleset]; where the bytes come from is a configuration-surface
-// decision that belongs with the documentation describing it (task T7).
+// and validates a [Ruleset]; turning an operator's file into one is
+// [internal/rules], and the environment variable naming that file is
+// [operate.AutonomyRulesEnv]. Keeping the loader out means [Decide] stays a pure
+// function, and it means the format can change without touching the decision.
 package autonomy
 
 import (

@@ -9,12 +9,14 @@
 //     comms trail, then prints a structured report (text or JSON). scan never
 //     mutates a cluster; its only writes are to the escalation trail, and those
 //     degrade to an in-memory dry-run unless GitHub is configured.
-//   - remediate     — one pass of the GATED remediation cycle: observe, diagnose,
+//   - remediate     — one pass of the remediation cycle: observe, diagnose,
 //     propose, preview, ask a human, and execute only what they have already
 //     approved. It is off by default in the strongest sense available — without
 //     MAKLAUDE_EXECUTE_MODE it proposes and stops, constructing no write-capable
 //     client at all — and it relaxes none of the five gates the remediation
-//     design rests on.
+//     design rests on. It also carries the unattended half, off by default in the
+//     same sense: with MAKLAUDE_AUTONOMY_RULES unset no rule exists, so every
+//     proposal takes the human gate.
 //
 // The two commands are separate rather than one command with a flag because they
 // make different promises. scan's is that nothing it does can change a cluster,
@@ -91,6 +93,19 @@ read, and the resourceVersion the proposal was computed from. See docs/remediati
 Approvals travel over the same MAKLAUDE_GITHUB_* configuration the escalation trail
 uses. Without it the gate degrades to an in-memory trail nobody can approve on, so
 the cycle asks and nothing is ever authorized.
+
+EARNED AUTONOMY IS ALSO OFF BY DEFAULT, and off means no rule exists. An operator can
+allow specific (cluster, namespace, operation) shapes to run without a human once a
+recorded history of human approvals has earned it. All three are required together,
+and setting the first without the others refuses to start:
+
+  export MAKLAUDE_AUTONOMY_RULES=/etc/maklaude/autonomy.yaml            # the grant
+  export MAKLAUDE_TRUST_LEDGER=/var/lib/maklaude/trust.jsonl            # the history
+  export MAKLAUDE_AUTONOMY_STATE=/var/lib/maklaude/autonomy-state.json  # the ceiling
+
+Nothing is trusted on a fresh install, so every proposal gates until a shape earns it.
+The report's "Unattended actions:" line states the posture every pass, and says why
+autonomy is off when it is. See autonomy.example.yaml and docs/unattended-actions.md.
 
 Usage:
   maklaude remediate --config <path> [--json]

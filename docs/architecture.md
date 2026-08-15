@@ -37,9 +37,25 @@ Milestone 4 added the ability to *act*, and it is a seam in the same sense the A
 Two structural properties carry the safety, and both are about types rather than discipline:
 
 - **The write path is a sibling of the read path, not a mode of it.** `kube.Client` and `kube.Executor` build their `rest.Config`s through different functions that install different transport guards. The observation path's guard is unconditional and unparameterised, so nothing an operator does to enable execution — and no future refactor of the write path — can loosen it.
-- **Off by default means unreachable, not unset.** `kube.ExecuteMode`'s zero value is `disabled`, under which `kube.NewExecutor` refuses to build anything at all: a deployment that has not opted in holds no write-capable object. And as of today nothing in the binary constructs one — `maklaude` has `version` and `scan`, and no configuration surface reaches the executor.
+- **Off by default is a posture the binary holds, not a flag it reads.** `kube.ExecuteMode`'s zero value is `disabled`, under which `kube.NewExecutor` refuses to build anything at all: a deployment that has not opted in holds no write-capable object, because none was ever constructed. The write path is reachable from one command (`maklaude remediate`) and only once an operator sets `MAKLAUDE_EXECUTE_MODE`; `maklaude scan` cannot reach it under any argument.
 
 Beyond those, an action needs a separately-installed RBAC bundle bound to a separate ServiceAccount, an `approved` label event from an identity MaKlaude cannot forge, preconditions that still hold against a fresh read, and a matching `resourceVersion`. The seam stays deterministic throughout: proposals are computed by rule, and no model participates in deciding what to change or whether to change it. See [remediation.md](remediation.md).
+
+## The unattended seam
+
+Milestone 5 added a sixth condition on top of those five and removed none of them: an action whose shape a recorded history of human approvals has **earned** can run without a person. It is off by default — no rule exists until an operator writes one — and it is four packages, each of which deliberately refuses to reach past its own concern:
+
+| Stage | Package | What it does | Model in the path? |
+| ----- | ------- | ------------ | ------------------ |
+| Decide | `internal/autonomy` | Answers auto-apply / gate / refuse for **one** proposal. A pure function — no client, no file, no clock, no environment | No |
+| Earn | `internal/trust` | Derives whether a `(cluster, operation)` shape has earned autonomy, from a durable history of recorded executions | No |
+| Bound | `internal/budget` | Caps auto-applies per cluster per pass, cools down a target, and trips a per-cluster circuit breaker | No |
+| Disclose | `internal/disclose` | Opens one GitHub artifact per unattended action *before* it runs, and reads the label that revokes a shape | No |
+
+`internal/rules` turns the operator's file into the ruleset, and `internal/operate` owns the one thing none of the four would touch: the order they go in. Two properties are worth carrying over from the gated seam:
+
+- **The decision is deterministic and has no model in it.** Identical inputs produce an identical verdict, including the reason token and the rule name. A decision to mutate a cluster with nobody watching is exactly the wrong place for a probabilistic component, so there is no LLM anywhere in this path.
+- **Trust is derived, never declared.** There is no config key that asserts a shape is trustworthy — the honest version of that is `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE`, which says so in its name. So on day one nothing is trusted and everything gates. See [unattended-actions.md](unattended-actions.md).
 
 ## The one optional AI seam
 

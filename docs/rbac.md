@@ -189,6 +189,14 @@ in an apiserver audit log, a mutating request attributed to
 `system:serviceaccount:maklaude:maklaude` is by construction a bug or an
 intrusion, never normal operation.
 
+> **Unattended actions need no additional access.** Earned autonomy
+> ([unattended-actions.md](unattended-actions.md)) changes *who authorizes* an
+> action, not what MaKlaude is permitted to do: an auto-applied action runs as the
+> same `maklaude-executor` identity, through the same executor, with the same three
+> verbs, and is refused by the API server in exactly the same way if this bundle is
+> absent. There is no autonomy RBAC bundle, and deleting this one remains the
+> cheapest kill for every write — gated or not, and with no MaKlaude restart.
+
 ### What it grants
 
 One rule per primitive in

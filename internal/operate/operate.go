@@ -141,9 +141,9 @@ type Cycle struct {
 	// [Cycle.autonomyWired] — so nothing is auto-applied until an operator has written
 	// rules AND a ledger says the shape earned them.
 	//
-	// They are not read from the environment by [New]. Where the bytes come from is the
-	// configuration surface, which task T7 (#147) owns along with the documentation that
-	// describes it; this file owns what happens once they are here.
+	// [Cycle.autonomyFromEnv] is what fills them from an operator's environment: a rules
+	// file through [rules.Load], and a trust ledger file that serves as both the oracle
+	// and the recorder. This file owns what happens once they are here.
 	rules  autonomy.Ruleset
 	oracle autonomy.TrustOracle
 
@@ -159,6 +159,23 @@ type Cycle struct {
 	// demote one ([Cycle.recordTrust]). What belongs in the evaluation window is the
 	// ledger's rule, not either caller's — see [TrustRecorder].
 	ledger TrustRecorder
+
+	// autonomyOff is why the unattended half is not wired, in words, empty when it is
+	// wired or when nobody said.
+	//
+	// It is a rendered sentence rather than a code because of who reads it. "Autonomy is
+	// off" has half a dozen causes — no rules file, a rules file with the kill switch
+	// disabled, a disclosure trail nothing can reach — and they look identical from the
+	// outside: a report with no unattended actions in it. Naming the cause is the
+	// difference between an operator who knows they have one variable left to set and one
+	// who believes autonomy is on and is quietly wrong. See [Cycle.autonomyFromEnv].
+	autonomyOff string
+
+	// rulesPath and ledgerPath name the files autonomy was configured from, so the report
+	// can point an operator at them instead of making them re-derive their own
+	// environment. Both are empty for a cycle built by [NewForTest].
+	rulesPath  string
+	ledgerPath string
 
 	// live reports whether the approval gate is backed by a real comms system rather
 	// than the in-memory dry-run sink. Surfaced in the report because "nobody can
@@ -207,7 +224,7 @@ func (c *Cycle) Run(ctx context.Context, reg *cluster.Registry) (*Report, error)
 	// The revocation failure is stamped on afterwards rather than up front, because this
 	// line replaces the whole struct — an assignment before it would be silently lost,
 	// which is the failure mode of reporting a failure.
-	report.Autonomy = autonomyReport(c.budget)
+	report.Autonomy = autonomyReport(c.budget, c.posture())
 	report.Autonomy.RevocationError = revoked.err
 	report.finalize()
 	return report, nil

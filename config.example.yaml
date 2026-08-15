@@ -111,3 +111,57 @@ clusters:
 #
 # Full story: docs/remediation.md. Access model: docs/rbac.md.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# EARNED AUTONOMY (Milestone 5) — OFF BY DEFAULT, AND NOT CONFIGURABLE FROM THIS FILE.
+#
+# There is a second way for an action to be authorized, narrower than the blanket
+# bypass above: a rule an operator wrote, for a (cluster, operation) shape that a
+# recorded history of human approvals has EARNED. It adds a sixth condition on top
+# of the five gates above and removes none of them.
+#
+# It is off by default in the same sense the write path is: not a flag set to false,
+# but a rule that does not exist. With MAKLAUDE_AUTONOMY_RULES unset, every proposal
+# takes the human gate — byte for byte the behaviour above.
+#
+# The grant lives in ITS OWN FILE, not here, and there is deliberately no key in
+# this file that reaches it. This file is copied, templated and committed, and "the
+# checked-in example turned autonomy on" is a failure mode worth designing out.
+#
+#   export MAKLAUDE_AUTONOMY_RULES=/etc/maklaude/autonomy.yaml        # the grant
+#   export MAKLAUDE_TRUST_LEDGER=/var/lib/maklaude/trust.jsonl        # the history
+#   export MAKLAUDE_AUTONOMY_STATE=/var/lib/maklaude/autonomy-state.json  # the ceiling
+#
+# All three are required TOGETHER: setting the first without the other two makes
+# `maklaude remediate` refuse to start, naming the variable to fix. Rules with no
+# ledger could never promote a shape, and rules with no ceiling have nothing
+# bounding them — either one is autonomy that is configured, valid, and silently
+# unable to fire, which looks exactly like autonomy that is on and has earned
+# nothing yet.
+#
+# EARNED IS NOT THE SAME AS WAIVED. The bypass above means a person waived review
+# for everything and cites nothing; an earned rule means a person approved that
+# exact shape repeatedly, it converged, and the ledger promoted it — and the
+# citation is required, so a claim of trust with no history behind it is refused.
+# The two record different authorizing identities (`policy:<rule-name>` versus
+# `policy:MAKLAUDE_DANGEROUSLY_AUTO_APPROVE`) and travel on different trails.
+#
+# THERE IS NO WAY TO DECLARE TRUST. No seed, no bootstrap list, no "start trusted".
+# On day one nothing is trusted and everything gates, by design. Promotion needs 3
+# human-approved executions of the shape that converged, with zero failures,
+# rollbacks or drift-aborts among the last 10 recorded executions of it.
+#
+# The bounds are fixed and NOT configurable — a rules file can narrow what runs
+# unattended, never raise the ceiling: 2 auto-applies per cluster per pass, a
+# 30-minute cooldown per target, and a per-cluster circuit breaker that trips after
+# 2 consecutive auto-apply failures and takes that cluster fully gated until a human
+# clears it. A tripped breaker is printed in the state summary every pass.
+#
+# Every unattended action opens its own GitHub issue BEFORE it runs, so a live
+# comms trail (MAKLAUDE_GITHUB_REPO + MAKLAUDE_GITHUB_TOKEN) is required: with no
+# durable place to record it, autonomy stays off and the report says so. Adding the
+# `autonomy:revoked` label to any such issue revokes that shape.
+#
+# Format and a worked example: autonomy.example.yaml.
+# Full story, including how to revoke: docs/unattended-actions.md.
+# ---------------------------------------------------------------------------

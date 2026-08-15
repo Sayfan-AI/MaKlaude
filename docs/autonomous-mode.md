@@ -1,9 +1,10 @@
 # Autonomous mode — the approval bypass
 
 MaKlaude's default posture is that **a named human approves every mutating action
-before it runs**. Autonomous mode is the one supported way to turn that off:
+before it runs**. Autonomous mode is the blunt way to turn that off:
 `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE=1` lets MaKlaude authorize its own proposals and
-close the remediation loop unattended.
+close the remediation loop unattended. It is one of two supported ways, and the other
+is narrow rather than blanket — see the second note below.
 
 Read this page before you set it. The short version is on the tin — it is
 *dangerously* auto-approve, in the spirit of `claude --dangerously-skip-permissions` —

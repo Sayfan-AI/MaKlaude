@@ -18,7 +18,7 @@ Treat the well-known "multi-agent Kubernetes DevOps" pattern (a coordinator dele
 
 Full operator and architecture docs live in [`docs/`](docs/index.md). Start with [`docs/index.md`](docs/index.md) for the doc map and a suggested reading order.
 
-**Safety posture, stated accurately.** MaKlaude's observation path never mutates a cluster — that part is unconditional and proven four ways ([no-writes guarantee](docs/no-writes.md)). MaKlaude as a *whole* is not read-only: since Milestone 4 there is a separate, opt-in write path for remediation a human approved. It is off by default in the strongest available sense — the shipped binary has no command or config key that reaches it — and when wired up it stays gated on a separately-installed RBAC bundle, an in-process kill switch, an attributable approval, and preconditions re-checked against a fresh read. Every *mutating* action needs an explicit, attributable human approval **by default**, and there is exactly one supported way out of *that* gate: an operator deliberately setting `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE=1`, which waives the requirement for consent and nothing else, and records every action it waives as unreviewed in the artifact, the chat notice, the process log, and the audit trail. See [Gated remediation](#gated-remediation), [Approval gate & autonomous mode](#approval-gate--autonomous-mode), [`docs/remediation.md`](docs/remediation.md), and [`docs/autonomous-mode.md`](docs/autonomous-mode.md).
+**Safety posture, stated accurately.** MaKlaude's observation path never mutates a cluster — that part is unconditional and proven four ways ([no-writes guarantee](docs/no-writes.md)). MaKlaude as a *whole* is not read-only: since Milestone 4 there is a separate, opt-in write path for remediation a human approved. It is reachable from exactly one command (`maklaude remediate`) and only once an operator sets `MAKLAUDE_EXECUTE_MODE`; with that unset, no write-capable client is ever constructed, and `maklaude scan` cannot reach it under any argument. Enabled, it stays gated on a separately-installed RBAC bundle, an in-process kill switch, an attributable approval, and preconditions re-checked against a fresh read. Every *mutating* action needs an explicit, attributable human approval **by default**, and there are exactly two supported ways out of *that* gate, which are not the same thing: `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE=1`, a blanket switch that waives consent and nothing else and records every action it waives as unreviewed in the artifact, the chat notice, the process log, and the audit trail; and **earned autonomy**, a per-shape rule an operator writes that fires only once a recorded history of human approvals of that exact shape says it may, is bounded by a per-pass cap, a cooldown and a circuit breaker, and discloses every action it takes on its own GitHub issue before running it. Both are off by default and neither is a default anything reaches by accident. See [Gated remediation](#gated-remediation), [Approval gate & autonomous mode](#approval-gate--autonomous-mode), [Earned autonomy](#earned-autonomy-narrow-off-by-default), [`docs/remediation.md`](docs/remediation.md), [`docs/autonomous-mode.md`](docs/autonomous-mode.md), and [`docs/unattended-actions.md`](docs/unattended-actions.md).
 
 
 ## Architecture posture — deterministic product, AI dev system
@@ -226,13 +226,26 @@ Since Milestone 4, MaKlaude can carry out a fix — but only one a human approve
 on the object they approved it for, through a path that shares nothing with the
 observation path.
 
-**It is off by default, and "off" is stronger than a setting.** The shipped
-binary has two commands, `version` and `scan`. Nothing in the config file, the
-CLI, or a scheduled loop constructs an executor, so there is currently no way to
-reach the write path from a running MaKlaude at all. Wiring it up is a separate,
-deliberate step — which is why the sections below describe gates rather than
-enabling instructions: there is no `remediation:` block to add to your config,
-and no environment variable that turns writes on.
+**It is off by default, and "off" means no executor is ever constructed.** The
+write path is reachable from exactly one command — `maklaude remediate` — and only
+once an operator sets `MAKLAUDE_EXECUTE_MODE`. With that variable unset the command
+proposes and stops: it builds no write-capable client, opens no approval request,
+and sends nothing to any cluster. `maklaude scan` cannot reach the write path under
+any argument, which is why the two are separate commands rather than one command
+with a flag. There is still no `remediation:` block to add to your config file, and
+enabling execution is necessary but nowhere near sufficient — every gate below
+applies, and none was relaxed to make the command reachable.
+
+Every variable that touches the write path, in one place. All of them are unset by
+default, and unset is always the safe posture:
+
+| Variable | Effect when set |
+| -------- | --------------- |
+| `MAKLAUDE_EXECUTE_MODE` | `disabled` (or unset) proposes only; `dry-run` sends every request with `dryRun=All`; `enabled` lets an approved action change a cluster. An unrecognized value is a fatal startup error, not a guess in either direction |
+| `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE` | Waives the human approval requirement — consent and nothing else. See [Autonomous mode](#autonomous-mode-dangerous-off-by-default) |
+| `MAKLAUDE_AUTONOMY_RULES` | Path to the autonomy rules file: which shapes may run unattended *once earned*. See [Earned autonomy](#earned-autonomy-narrow-off-by-default) |
+| `MAKLAUDE_TRUST_LEDGER` | Path to the trust ledger — the recorded history autonomy is earned from. Required with `MAKLAUDE_AUTONOMY_RULES` |
+| `MAKLAUDE_AUTONOMY_STATE` | Path to the blast-radius state: per-cluster breakers and per-target cooldowns, which must survive a restart. Required with `MAKLAUDE_AUTONOMY_RULES` |
 
 ### The catalog is closed
 
@@ -352,6 +365,60 @@ is what this refuses.
 Full detail, including the exact list of what the bypass gives up:
 **[docs/autonomous-mode.md](docs/autonomous-mode.md)**.
 
+### Earned autonomy (narrow, off by default)
+
+Since Milestone 5 there is a second way an action can be authorized without a person
+in the loop, and it is the opposite of a blanket switch: a rule an operator wrote,
+for one `(cluster, operation)` shape, that fires only because the recorded history
+says a human approved *that exact shape* repeatedly and it worked.
+
+**Earned is not waived, and the code refuses to let the two read alike.** The bypass
+records `policy:MAKLAUDE_DANGEROUSLY_AUTO_APPROVE` and cites nothing, because it is a
+switch. An earned rule records `policy:<rule-name>` and **must** cite the ledger
+history behind it — a permission slip claiming trust with no citation is refused at
+the mint. They travel on different trails, and every unattended action opens its own
+GitHub issue *before* it runs, headed `NO HUMAN APPROVED THIS ACTION.`
+
+Off by default here means **no rule exists**, not a flag set to false. Turning it on
+is one file and three variables, all required together:
+
+```bash
+export MAKLAUDE_AUTONOMY_RULES=/etc/maklaude/autonomy.yaml            # the grant
+export MAKLAUDE_TRUST_LEDGER=/var/lib/maklaude/trust.jsonl            # the history it is earned from
+export MAKLAUDE_AUTONOMY_STATE=/var/lib/maklaude/autonomy-state.json  # the ceiling it runs under
+```
+
+Setting the first without the other two makes `maklaude remediate` refuse to start,
+naming the variable to fix — rules with no ledger can never promote a shape, and
+rules with no ceiling have nothing bounding them, so either one is autonomy that is
+configured, valid, and silently unable to fire.
+
+Four things worth knowing before you enable it:
+
+- **Nothing is trusted on day one.** There is no seed and no "start trusted" flag —
+  trust is *derived*, never declared. Promotion needs 3 human-approved executions of
+  the shape that converged, with zero failures, rollbacks or drift-aborts among the
+  last 10 recorded executions of it. Demotion is immediate on any one of those three.
+  So the first pass after enabling autonomy behaves exactly like the last pass before
+  it; what changed is that each approval is now evidence.
+- **An unattended success earns nothing.** Only an execution a *human* approved can
+  promote, so autonomy does not compound.
+- **The bounds are fixed, not configurable.** 2 auto-applies per cluster per pass, a
+  30-minute cooldown per target, and a circuit breaker that trips after 2 consecutive
+  auto-apply failures and takes that cluster fully gated until a person clears it. A
+  rules file can narrow what runs unattended; it cannot raise the ceiling.
+- **A bound holds an action back from running *unattended*, not from running.** A
+  suppressed auto-apply and a tripped breaker both fall through to the ordinary human
+  approval path, so a tripped cluster is one where MaKlaude still proposes and asks.
+
+Revoking is one action at whichever scope you want: the `autonomy:revoked` label on a
+disclosure issue (one shape), removing a cluster from the rule, deleting the trust
+ledger (all earned trust), unsetting `MAKLAUDE_AUTONOMY_RULES` (all unattended
+action), or `MAKLAUDE_EXECUTE_MODE=disabled` (all writes, gated included).
+
+Format and a worked example: **[`autonomy.example.yaml`](autonomy.example.yaml)**.
+Full story: **[docs/unattended-actions.md](docs/unattended-actions.md)**.
+
 ## Cluster configuration
 
 MaKlaude operates the Kubernetes clusters a human puts under its care. You
@@ -393,10 +460,13 @@ clusters. A handle becomes a live read-only `kube.Client` — and, only under th
 opt-in write path, a per-action `kube.Executor` scoped to that one cluster, so
 clusters cannot cross-contaminate in either direction.
 
-There is deliberately **no remediation section in this file.** Enabling writes is
-not a config-file decision: it takes a separately-installed RBAC bundle plus an
-explicitly-constructed executor, and neither is reachable from here. See
-[Gated remediation](#gated-remediation).
+There is deliberately **no remediation section and no autonomy section in this
+file.** Neither is a config-file decision: writes take a separately-installed RBAC
+bundle plus `MAKLAUDE_EXECUTE_MODE`, and autonomy takes its own separate file
+pointed at by `MAKLAUDE_AUTONOMY_RULES`. This file is copied, templated and
+committed, and "the checked-in example turned writes on" is a failure mode worth
+designing out. See [Gated remediation](#gated-remediation) and
+[Earned autonomy](#earned-autonomy-narrow-off-by-default).
 
 ### Read-only access (RBAC)
 
