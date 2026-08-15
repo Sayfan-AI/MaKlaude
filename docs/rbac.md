@@ -5,22 +5,25 @@ cannot mutate them at all. This document describes the least-privilege RBAC that
 grants it exactly the access it needs, how an operator installs it, how to wire
 the resulting identity into MaKlaude, and how to verify each grant.
 
-There are **two bundles and two identities**, and the separation between them is
-the point:
+There are **three bundles and three identities**, and the separation between them
+is the point:
 
 | Bundle | Identity | Grants | Installed by |
 | ------ | -------- | ------ | ------------ |
 | [`deploy/rbac/`](../deploy/rbac/) | `maklaude` | `get`/`list`/`watch` on a fixed resource set — **no mutating verb anywhere** | `kubectl apply -k deploy/rbac` |
 | [`deploy/rbac/write/`](../deploy/rbac/write/) — optional | `maklaude-executor` | the same reads, **plus** exactly three mutating verbs | `kubectl apply -k deploy/rbac/write` |
+| [`deploy/rbac/chaos/`](../deploy/rbac/chaos/) — optional | `maklaude-chaos` | `get`/`create`/`delete` on Chaos Mesh custom resources in **one** namespace, and nothing else | `kubectl apply -k deploy/rbac/chaos` |
 
 Install only the first and MaKlaude provably cannot change anything: everything
 that watches, collects, detects, correlates, diagnoses, and proposes runs as
-`maklaude`. The write bundle is a *delta* bound to a *different* account, so
-installing it grants the observation identity nothing — which is asserted in CI
-against a live cluster, not just claimed here.
+`maklaude`. Each optional bundle is a *delta* bound to a *different* account, so
+installing one grants the observation identity nothing, and the two deltas grant
+each other nothing — which is asserted in CI against a live cluster, not just
+claimed here.
 
-Most of this document is about the read-only bundle. The write bundle has its own
-section: [The optional minimal-write bundle](#the-optional-minimal-write-bundle).
+Most of this document is about the read-only bundle. The two deltas have their own
+sections: [The optional minimal-write bundle](#the-optional-minimal-write-bundle)
+and [The optional chaos bundle](#the-optional-chaos-bundle).
 
 ## The access model
 
@@ -313,17 +316,61 @@ namespaces, copy those two rules into a `Role` per namespace and bind them with
 tighter than what ships and requires no code change. Nodes are cluster-scoped and
 cannot be narrowed this way.
 
+## The optional chaos bundle
+
+Milestone 6 adds a **third** identity, `maklaude-chaos`, in
+[`deploy/rbac/chaos/`](../deploy/rbac/chaos/). It can create and delete Chaos Mesh
+custom resources in one namespace, and nothing else — no pods, no deployments, no
+nodes, in any verb, read or write.
+
+Three identities exist so that a mutating request says which *kind* of act it was
+in the API server's own audit log, without anyone correlating it against MaKlaude's
+logs:
+
+| ServiceAccount | A mutating request from it means |
+| -------------- | -------------------------------- |
+| `maklaude` | a bug or an intrusion — this identity has no mutating verb |
+| `maklaude-executor` | an approved remediation |
+| `maklaude-chaos` | a deliberate experiment on a cluster a human marked eligible |
+
+Two things differ from the write bundle above, both deliberate:
+
+- **It's a `Role`, not a `ClusterRole`**, bound in the `maklaude-chaos` namespace
+  where experiment objects live. So the grant can't follow the identity into another
+  namespace, and `kubectl get podchaos -n maklaude-chaos` is the complete list of
+  what MaKlaude has outstanding on the cluster.
+- **It gets no reads at all** — not even the additive `maklaude-readonly` binding
+  the executor needs. The chaos path re-reads only its own custom resources.
+  Everything MaKlaude observes about a cluster it has broken, it observes through
+  the observation identity.
+
+```bash
+kubectl apply -k deploy/rbac         # required first: reads + the maklaude SA
+kubectl apply -k deploy/rbac/write   # optional: approved remediation
+kubectl apply -k deploy/rbac/chaos   # optional: deliberate experiments
+kubectl delete -k deploy/rbac/chaos  # revoke chaos alone, no restart
+```
+
+Applying it enables nothing on its own: a per-cluster eligibility marker in the
+config and the `kube.ExecuteMode` kill switch are two further gates, in two other
+places. **And this Role does not bound an experiment's blast radius** — MaKlaude
+writes the CR, Chaos Mesh's controller does the killing with its own privileges.
+[`chaos.md`](chaos.md) is the whole story, including the `auth can-i` matrix (via
+`SubjectAccessReview`, since the CRDs may not be installed) and the
+permission-validation tension worth knowing about before you enable it.
+
 ## Validation status
 
-Both bundles assemble cleanly under `kubectl kustomize`, and their contents are
+All three bundles assemble cleanly under `kubectl kustomize`, and their contents are
 asserted by the unit suite in [`test/rbac/`](../test/rbac/), which runs on every
 PR without needing a cluster: `maklaude-readonly` grants **no** mutating verb,
-`maklaude-write` grants **exactly** the executor's three, no binding hands a
-mutating role to the observation identity, and the base kustomization does not
-pull in the write delta.
+`maklaude-write` grants **exactly** the executor's three, the chaos `Role` grants
+**exactly** the injector's three and is namespaced rather than cluster-wide, no
+binding hands a mutating or chaos role to another identity, and the base
+kustomization pulls in neither delta (nor does either delta pull in the other).
 
-Against a live API server, the `e2e` CI job applies both bundles to a `kind`
-cluster and runs every `auth can-i` assertion above — including the re-check that
-the observation identity is still denied writes *after* the write bundle is
-installed. The two layers answer different questions: the unit suite catches a
-widened manifest in seconds, `can-i` proves the cluster actually behaves that way.
+Against a live API server, the `e2e` CI job applies all three bundles to a `kind`
+cluster and runs every assertion above — including the re-check that the earlier
+identities are still denied *after* each new bundle is installed. The two layers
+answer different questions: the unit suite catches a widened manifest in seconds,
+and a live authorization check proves the cluster actually behaves that way.

@@ -192,6 +192,108 @@ jobs:
           [ "$fail" -eq 0 ] || { echo "minimal-write RBAC assertions failed"; exit 1; }
           echo "Minimal-write RBAC is scoped as expected, and the observation identity is unchanged."
 
+      # The optional chaos bundle (deploy/rbac/chaos), Milestone 6's third identity.
+      # It is applied here, after both sets of assertions above have passed, and the
+      # checks below re-run the denial assertions on BOTH earlier identities — so
+      # this step proves what makes a third write delta safe to install: granting
+      # MaKlaude the ability to ask Chaos Mesh to break something widens nothing for
+      # the account that reads and nothing for the account that remediates.
+      #
+      # This needs no Chaos Mesh installation, and the assertions are written so that
+      # it genuinely does not: they POST SubjectAccessReviews rather than shelling
+      # out to `kubectl auth can-i`. The two answer the same question, but `can-i`
+      # first maps the resource name through DISCOVERY, and `podchaos` has no CRD on
+      # this cluster — so its behaviour with an absent resource type would be the
+      # load-bearing detail of every assertion below. A SubjectAccessReview takes the
+      # group and resource as literal strings and is evaluated against the RBAC rules
+      # alone, which is the thing being tested. Whether an experiment actually RUNS
+      # is T8's job (issue #197) and needs the real Chaos Mesh.
+      - name: Apply and verify the chaos RBAC bundle
+        run: |
+          set -euo pipefail
+          kubectl apply -k deploy/rbac/chaos
+          kubectl -n maklaude get serviceaccount maklaude-chaos
+
+          SA=system:serviceaccount:maklaude:maklaude
+          EXEC=system:serviceaccount:maklaude:maklaude-executor
+          CHAOS=system:serviceaccount:maklaude:maklaude-chaos
+          echo "Grants for $CHAOS in maklaude-chaos:"
+          kubectl auth can-i --list --as="$CHAOS" -n maklaude-chaos || true
+
+          # can <user> <verb> <group> <resource> [namespace]
+          # An empty namespace asks the cluster-scoped question, which for a
+          # namespaced resource is "may this identity do it in ANY namespace" — the
+          # equivalent of `auth can-i -A`.
+          can() {
+            kubectl create -o jsonpath='{.status.allowed}' -f - <<EOF
+          apiVersion: authorization.k8s.io/v1
+          kind: SubjectAccessReview
+          spec:
+            user: "$1"
+            resourceAttributes:
+              verb: "$2"
+              group: "$3"
+              resource: "$4"
+              namespace: "${5:-}"
+          EOF
+          }
+
+          fail=0
+          assert_allowed() {
+            if [ "$(can "$@")" != "true" ]; then
+              echo "::error::expected ALLOWED but denied: $*"; fail=1
+            fi
+          }
+          assert_denied() {
+            if [ "$(can "$@")" = "true" ]; then
+              echo "::error::expected DENIED but allowed: $*"; fail=1
+            fi
+          }
+
+          # The injector's catalog: exactly the three calls in
+          # internal/chaos/injector.go, in the one namespace experiment objects live.
+          assert_allowed "$CHAOS" get    chaos-mesh.org podchaos maklaude-chaos
+          assert_allowed "$CHAOS" create chaos-mesh.org podchaos maklaude-chaos
+          assert_allowed "$CHAOS" delete chaos-mesh.org podchaos maklaude-chaos
+
+          # THE DONE CRITERION OF T2: the chaos identity cannot touch a workload
+          # directly. MaKlaude asks Chaos Mesh to kill a pod; it must not be able to
+          # kill one itself, in any namespace, with any verb.
+          assert_denied "$CHAOS" delete "" pods
+          assert_denied "$CHAOS" get    "" pods
+          assert_denied "$CHAOS" list   "" pods
+          assert_denied "$CHAOS" patch  apps deployments
+          assert_denied "$CHAOS" patch  "" nodes
+          assert_denied "$CHAOS" get    "" secrets
+
+          # A namespaced Role, so the grant cannot follow the identity elsewhere.
+          assert_denied "$CHAOS" create chaos-mesh.org podchaos default
+          assert_denied "$CHAOS" create chaos-mesh.org podchaos kube-system
+
+          # The neighbours an over-broad chaos role would acquire: bulk deletion of
+          # experiments, editing a live fault, and the kinds outside the closed
+          # one-kind catalog in internal/chaos.
+          assert_denied "$CHAOS" deletecollection chaos-mesh.org podchaos     maklaude-chaos
+          assert_denied "$CHAOS" update           chaos-mesh.org podchaos     maklaude-chaos
+          assert_denied "$CHAOS" patch            chaos-mesh.org podchaos     maklaude-chaos
+          assert_denied "$CHAOS" create           chaos-mesh.org networkchaos maklaude-chaos
+          assert_denied "$CHAOS" create           chaos-mesh.org schedules    maklaude-chaos
+          assert_denied "$CHAOS" create           chaos-mesh.org workflows    maklaude-chaos
+
+          # THE POINT OF THE THIRD IDENTITY: neither earlier account gained chaos.
+          assert_denied "$SA"   create chaos-mesh.org podchaos maklaude-chaos
+          assert_denied "$EXEC" create chaos-mesh.org podchaos maklaude-chaos
+          # And both are exactly as bounded as they were before this bundle existed.
+          assert_allowed "$SA"   list  "" pods
+          assert_denied  "$SA"   patch apps deployments
+          assert_denied  "$SA"   delete "" pods
+          assert_allowed "$EXEC" patch apps deployments
+          assert_denied  "$EXEC" deletecollection "" pods
+          assert_denied  "$EXEC" delete apps deployments
+
+          [ "$fail" -eq 0 ] || { echo "chaos RBAC assertions failed"; exit 1; }
+          echo "Chaos RBAC is scoped as expected; the observation and executor identities are unchanged."
+
       - name: Seed failure scenarios
         run: |
           set -euo pipefail

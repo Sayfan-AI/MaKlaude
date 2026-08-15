@@ -1,9 +1,16 @@
 # MaKlaude's least-privilege MINIMAL-WRITE ClusterRole.
 #
-# This is the only role in MaKlaude that carries a mutating verb. It exists for
-# the executor identity alone (see serviceaccount.yaml in this directory) and is
-# never bound to the observation ServiceAccount, so installing this bundle cannot
-# widen what the read/diagnose path is allowed to do.
+# It exists for the executor identity alone (see serviceaccount.yaml in this
+# directory) and is never bound to the observation ServiceAccount, so installing
+# this bundle cannot widen what the read/diagnose path is allowed to do.
+#
+# It is no longer the ONLY role here carrying a mutating verb: Milestone 6 added
+# deploy/rbac/chaos, whose Role can create and delete Chaos Mesh custom resources
+# on a cluster a human marked chaos-eligible. That role holds no verb on any
+# workload — no pods, deployments or nodes — so the two deltas do not overlap, and
+# they are opted into (and revoked) independently. The sentence this comment used
+# to open with said "only", which was true when it was written and is the kind of
+# claim that keeps reading as true after it stops being.
 #
 # Every rule below is one action in internal/kube/executor.go's catalog. The
 # catalog is closed: every primitive the executor exposes is a single mutating API
