@@ -71,6 +71,14 @@ elif argv[:2] == ["issue", "comment"]:
     pass
 elif argv[:2] == ["label", "create"]:
     pass
+elif argv[0] == "api" and "/installation/repositories" in argv:
+    # Identity probe. Readable only by a GitHub App installation token; a
+    # personal token gets 403. STUB_IDENTITY picks which side to play.
+    if os.environ.get("STUB_IDENTITY", "app") == "app":
+        sys.stdout.write("6\n")
+    else:
+        sys.stderr.write("gh: Resource not accessible by personal access token (HTTP 403)\n")
+        sys.exit(1)
 else:
     sys.stderr.write("stub gh: unsupported call: %s\n" % argv)
     sys.exit(64)
