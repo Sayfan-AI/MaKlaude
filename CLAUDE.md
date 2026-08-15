@@ -31,6 +31,41 @@ These are the principles this dev system operates by. Evolve them as the project
 - **Deterministic over agentic** — if a task is well-understood and doesn't need LLM judgment, build a deterministic tool (script, CLI, CI step). Reserve LLMs for fuzzy reasoning.
 - **Incremental planning** — only detail the current milestone. Future milestones stay high-level until they're next.
 
+## Milestone Roadmap
+
+The durable copy. It was previously only in comments on the onboarding issue and on
+whichever completion gate was open at the time, both of which get closed, and a
+comment on a closed issue is not a mode-independent carrier (see the note further
+down about `genesis serve` disabling every workflow). Planning reads this table.
+
+| # | Milestone | Status |
+|---|-----------|--------|
+| M1 | Read-only foundation: register clusters, watch health, escalate | done |
+| M2 | Slack / ChatOps integration | done |
+| M3 | Diagnosis & root-cause (read-only) | done |
+| M4 | Gated remediation | done |
+| M5 | Trust-earned safe-action allowlist | done |
+| M6 | **Chaos engineering** | next |
+| M7 | Extensibility packs | high-level |
+| M8 | Hardening & operator UX | high-level |
+
+Indices have shifted twice, and both shifts came from a human comment rather than a
+config change. Slack was inserted as M2, pushing diagnosis to M3. Chaos was inserted
+as M6, pushing extensibility packs to M7 and hardening to M8. When a milestone is
+inserted, renumber here in the same change.
+
+**M6, chaos engineering, in one paragraph:** everything proving remediation works has
+relied on hand-seeded fixtures, which prove the detectors read a broken cluster
+correctly and prove nothing about behaviour when a cluster breaks *while MaKlaude is
+working*. M6 gives MaKlaude the ability to break its own managed clusters on purpose
+through Chaos Mesh, on clusters explicitly marked eligible, routed through M5's gated
+path so experiments inherit earned autonomy, the blast-radius budget and the breaker.
+It is the project's first deliberate write path, so it needs its own package, client
+and ServiceAccount rather than `internal/kube`, whose transport allows only GET, HEAD
+and OPTIONS. The no-writes guarantee narrows to "no mutating verb except chaos CRDs on
+chaos-eligible clusters", which needs its own leak test and honest docs rather than
+prose that keeps the old sentence looking true.
+
 ## Agent Roster
 
 - **Onboarding** — refines goal with human, produces milestones (runs once at project start)
