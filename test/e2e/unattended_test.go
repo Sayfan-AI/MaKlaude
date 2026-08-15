@@ -293,7 +293,7 @@ func assertEarnedTrustAutoApplies(t *testing.T, reg *cluster.Registry, reader *k
 	if applied.Admission != "admitted" {
 		t.Errorf("the action records admission %q, want \"admitted\"", applied.Admission)
 	}
-	if !strings.Contains(applied.Evidence, "human-approved and converged") {
+	if !strings.Contains(applied.Evidence, "human-approved executions of this exact fix") {
 		t.Errorf("the action's trust citation does not state the evidence it rests on: %q", applied.Evidence)
 	}
 	if applied.Disclosure == "" {
@@ -847,7 +847,14 @@ func seededLedger(t *testing.T, fps fingerprints, targets ...string) *trust.Ledg
 				Authority:   audit.AuthorityHuman,
 				Outcome:     trust.OutcomeConverged,
 				At:          base.Add(time.Duration(n*trust.PromotionThreshold+i) * time.Minute),
-				Ref:         fmt.Sprintf("e2e-approval-artifact-%d-%d", n, i),
+				// Kept SHORT on purpose. The disclosure renders the trust citation
+				// through [redact.String], whose last rule blanks any unbroken run of
+				// 24+ characters from [A-Za-z0-9+/_-] as a high-entropy blob — and a
+				// hyphenated ref is exactly that shape. At 25 characters
+				// "e2e-approval-artifact-0-2" is redacted out of the artifact entirely,
+				// which reads as "the citation lost its evidence" rather than as "the
+				// fixture outgrew a redaction threshold". Keep this under 24.
+				Ref: fmt.Sprintf("e2e-approval-%d-%d", n, i),
 			}
 			if err := ledger.Record(entry); err != nil {
 				t.Fatalf("seeding trust entry %d for %s: %v", i, target, err)
@@ -966,13 +973,23 @@ func requireRollbackProposed(t *testing.T, p unattendedPass, namespace, name str
 // The citation is checked in FRAGMENTS rather than verbatim against
 // [operate.AutoApplyReport.Evidence], and the reason is worth recording so nobody
 // tightens it back: the artifact passes through the redactor on its way out, whose
-// high-entropy sweep rewrites the shape token — a long unbroken
-// `cluster/operation` run — as `[REDACTED]`. So the rendered evidence reads "3 of the
-// last 3 recorded executions of [REDACTED] were human-approved and converged", which is
-// the same collapse #132 reported against Change.Scope. The counts, the threshold and
-// the artifact reference all survive it, and they are what make the citation evidence
-// rather than a claim; the shape itself is stated un-redacted in the artifact's own
-// "Shape" row two lines above.
+// high-entropy sweep rewrites any unbroken 24+ character run of [A-Za-z0-9+/_-] as
+// `[REDACTED]`. Three tokens in the citation are that shape — the `cluster/operation`
+// shape, the fingerprint's hex digest, and a long enough approval reference — so the
+// rendered evidence reads "3 human-approved executions of this exact fix on [REDACTED]
+// converged (3 required) ... fingerprint fp1:[REDACTED] ... (ref e2e-approval-0-2)".
+// That is the same collapse #132 reported against Change.Scope.
+//
+// What survives is what makes the citation evidence rather than a claim: the counts,
+// the threshold, the "this exact fix" scoping, and the artifact reference — the last
+// only because [seededLedger] deliberately keeps its refs under the 24-character
+// threshold. The shape itself is stated un-redacted in the artifact's own "Shape" row
+// two lines above.
+//
+// The redacted FINGERPRINT is a real limitation rather than a property worth keeping:
+// it is a hash precisely so it can be published, and blanking it costs an operator the
+// one thing it is for — comparing two artifacts to see whether the fix changed. Filed
+// separately; the fix belongs in the redactor, not in a test.
 func assertDisclosureIsHonest(t *testing.T, sink *disclose.MemorySink, ref disclose.Ref) {
 	t.Helper()
 
@@ -988,12 +1005,15 @@ func assertDisclosureIsHonest(t *testing.T, sink *disclose.MemorySink, ref discl
 	for _, want := range []string{
 		// The evidence that stood in for an approver, and the numbers behind it.
 		"Trust evidence",
-		"human-approved and converged",
+		// Since issue #167 the citation has to say the approvals were of THIS fix, not
+		// merely of this shape — that distinction is the authorization, so an artifact
+		// that stated the weaker claim would be overstating what a human sanctioned.
+		"human-approved executions of this exact fix",
 		fmt.Sprintf("(%d required)", trust.PromotionThreshold),
 		// The most recent approval artifact the ledger cited. It is one of the references
 		// seededLedger wrote, so this also proves the citation was computed from the
 		// history under test rather than rendered from a template.
-		"e2e-approval-artifact-",
+		"e2e-approval-",
 		// The distinction the docs task (#147) exists to keep straight, stated on the
 		// artifact itself: an earned rule is not the blanket bypass.
 		"MAKLAUDE_DANGEROUSLY_AUTO_APPROVE",
