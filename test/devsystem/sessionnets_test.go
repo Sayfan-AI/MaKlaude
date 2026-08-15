@@ -171,12 +171,47 @@ func TestSessionNetsSurvivesNoGh(t *testing.T) {
 	}
 }
 
-// TestSessionStartHookRunsSessionNets ties the script to its trigger, the same
-// way TestScheduledOrchestratorRunsNudge ties nudge-gates.sh to the workflow
-// step. The check is worthless if nothing calls it — and "nothing calls it" is
-// exactly the defect being fixed, one mode over.
-func TestSessionStartHookRunsSessionNets(t *testing.T) {
-	path := filepath.Join("..", "..", ".claude", "settings.json")
+// TestSessionNetsNudgesOnceAcrossTwoRuns is the property that makes carrying the
+// net in two places safe. Under Actions the workflow's pre-agent step runs
+// nudge-gates.sh and then the agent's own session start runs it again, so the
+// net fires twice per run by design; when a key is provisioned and the Actions
+// path comes back, both carriers are live simultaneously. Exactly one nudge has
+// to reach the human out of that, and it is guaranteed by the `nudged:stale`
+// marker label rather than by a mode check — deliberately, because a second
+// guard that can disagree with the first is worse than none. Proven here rather
+// than assumed: the gh stub persists `issue edit --add-label`, so the second run
+// reads the label the first run wrote, which is the real idempotency path.
+func TestSessionNetsNudgesOnceAcrossTwoRuns(t *testing.T) {
+	env, _, logPath := gateEnv(t, []stubIssue{gate(76, "Milestone 4 plan", 21)})
+
+	first, _, code := runNets(t, env)
+	if code != 0 {
+		t.Fatalf("first session-nets.sh run exited %d", code)
+	}
+	if !strings.Contains(first, "#76") {
+		t.Fatalf("first run should have nudged #76; stdout was:\n%s", first)
+	}
+
+	second, _, code := runNets(t, env)
+	if code != 0 {
+		t.Fatalf("second session-nets.sh run exited %d", code)
+	}
+
+	if got := countCalls(t, logPath, "issue comment 76"); got != 1 {
+		t.Errorf("want exactly 1 nudge on #76 across two runs, got %d — the "+
+			"Actions-plus-hook case would double-nudge\ncalls:\n%s",
+			got, strings.Join(calls(t, logPath), "\n"))
+	}
+	if strings.TrimSpace(second) != "" {
+		t.Errorf("a run that wrote nothing must add nothing to the session context; stdout was:\n%s", second)
+	}
+}
+
+// sessionStartCommands returns the SessionStart hook commands from
+// .claude/settings.json in declaration order.
+func sessionStartCommands(t *testing.T) (path string, commands []string) {
+	t.Helper()
+	path = filepath.Join("..", "..", ".claude", "settings.json")
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
@@ -193,12 +228,23 @@ func TestSessionStartHookRunsSessionNets(t *testing.T) {
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		t.Fatalf("parse %s: %v", path, err)
 	}
-
 	for _, matcher := range cfg.Hooks["SessionStart"] {
 		for _, h := range matcher.Hooks {
-			if strings.Contains(h.Command, "session-nets.sh") {
-				return
-			}
+			commands = append(commands, h.Command)
+		}
+	}
+	return path, commands
+}
+
+// TestSessionStartHookRunsSessionNets ties the script to its trigger, the same
+// way TestScheduledOrchestratorRunsNudge ties nudge-gates.sh to the workflow
+// step. The check is worthless if nothing calls it — and "nothing calls it" is
+// exactly the defect being fixed, one mode over.
+func TestSessionStartHookRunsSessionNets(t *testing.T) {
+	path, commands := sessionStartCommands(t)
+	for _, c := range commands {
+		if strings.Contains(c, "session-nets.sh") {
+			return
 		}
 	}
 	t.Errorf("no SessionStart hook runs session-nets.sh (%s).\n"+
@@ -206,4 +252,55 @@ func TestSessionStartHookRunsSessionNets(t *testing.T) {
 		"disables every genesis-* workflow and runs `claude -p` directly — the "+
 		"SessionStart hook is the only seam both modes share, so without it the "+
 		"stale-gate check does not run in the mode this project executes in.", path)
+}
+
+// TestSessionStartNetIsIndependentOfTheActivityLog states the ordering, since
+// settings.json is JSON and cannot carry the reason itself.
+//
+// Two hooks now share SessionStart: `log.sh session-start`, which records that a
+// session began, and `session-nets.sh`, which spends up to
+// GENESIS_SESSION_NETS_TIMEOUT seconds on the network. The claim asserted here
+// holds under either hook-execution semantics, which is why it is the claim
+// rather than a run-order one: they are two separate commands, never chained,
+// and the log comes first in declaration order. Chaining is the failure to
+// avoid in both directions — `log.sh` exiting non-zero (the Loki 502 that
+// already manufactured one false escalation, #91) would suppress the net, and
+// the net's timeout would delay the record of the session having started. Order
+// then costs nothing and buys one thing: if the runner honours declaration
+// order, a session that stalls in the net is still logged as having begun.
+func TestSessionStartNetIsIndependentOfTheActivityLog(t *testing.T) {
+	path, commands := sessionStartCommands(t)
+
+	logIdx, netIdx := -1, -1
+	for i, c := range commands {
+		if strings.Contains(c, "log.sh") && logIdx < 0 {
+			logIdx = i
+		}
+		if strings.Contains(c, "session-nets.sh") && netIdx < 0 {
+			netIdx = i
+		}
+	}
+	if logIdx < 0 {
+		t.Fatalf("no SessionStart hook runs log.sh (%s)", path)
+	}
+	if netIdx < 0 {
+		t.Skip("session-nets.sh is not wired yet; TestSessionStartHookRunsSessionNets owns that failure")
+	}
+	if logIdx > netIdx {
+		t.Errorf("log.sh session-start should be declared before session-nets.sh in %s, "+
+			"so a session that stalls in the net is still recorded as having begun; got %v",
+			path, commands)
+	}
+	for _, c := range commands {
+		if !strings.Contains(c, "session-nets.sh") {
+			continue
+		}
+		for _, chain := range []string{"&&", "||", ";", "|"} {
+			if strings.Contains(c, chain) {
+				t.Errorf("session-nets.sh must be its own command, not %q-chained to another hook "+
+					"(a failing log.sh would suppress the net, and the net's timeout would delay the log): %q",
+					chain, c)
+			}
+		}
+	}
 }
