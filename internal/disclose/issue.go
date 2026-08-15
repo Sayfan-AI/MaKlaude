@@ -188,6 +188,29 @@ func writePreconditions(b *strings.Builder, p remediate.Proposal) {
 // A rule with no citation would be the blank cheque the whole milestone exists to avoid,
 // which is why [approve.GrantAutonomous] refuses to mint one — this section is where
 // that refusal becomes visible.
+//
+// # Why the fingerprint is its own row and not read out of the citation
+//
+// The citation names the fingerprint too, and there it is blanked: [redact.String]'s
+// high-entropy sweep cannot tell a 32-character hex digest that is a leaked credential
+// from one that is a deliberately-published hash, and it is right to blank by default
+// (see issue #185). But equality is the *only* operation a [remediate.Fingerprint]
+// supports, and `[REDACTED] == [REDACTED]` holds for every fix on every cluster — so a
+// citation is the one place the token cannot survive being useful. An operator asking
+// the question the invalidation model turns on, "is this the same fix that was approved
+// or did it change?", is comparing two artifacts by eye, and a blanked cell answers
+// yes for both.
+//
+// So it is stated structurally instead, exactly as the `Shape` row above already
+// restates the `cluster/operation` pair the same sweep collapses inside the citation.
+// That leaves the sweep untouched for every other caller of [redact], which is the
+// smaller blast radius: the alternative — teaching the redactor a rule that PRESERVES a
+// pattern — would be a new kind of rule in a shared security boundary, weakening it for
+// two packages to publish one token. Publishing the digest here is safe on the
+// fingerprint's own stated terms: it hashes the cluster-derived strings precisely so it
+// can go in a world-readable artifact carrying no content anyone has to redact, and
+// while its *inputs* include cluster-controlled names, its *output* is a digest, so no
+// attacker chooses the bytes rendered here.
 func writeAuthority(b *strings.Builder, a Action) {
 	b.WriteString("## Who permitted it\n\n")
 	b.WriteString("Nobody. There is no approver on this action and none was asked. It was authorized by policy:\n\n")
@@ -196,6 +219,11 @@ func writeAuthority(b *strings.Builder, a Action) {
 	fmt.Fprintf(b, "| Rule | `%s` |\n", cell(a.Verdict.Rule))
 	fmt.Fprintf(b, "| Recorded as | `%s` |\n", cell(a.Verdict.PolicyIdentity()))
 	fmt.Fprintf(b, "| Shape | `%s` |\n", a.Shape().String())
+	// Re-derived from the proposal rather than carried on the verdict, and the two
+	// cannot disagree: [autonomy.Decide] builds the subject it consults the ledger with
+	// from this same proposal by this same pure function, so there is one computation
+	// and no field to keep in step.
+	fmt.Fprintf(b, "| Fix fingerprint | `%s` |\n", cell(a.Proposal.Fingerprint().String()))
 	b.WriteString("\n**Trust evidence — the history that stood in for a review:**\n\n")
 	fmt.Fprintf(b, "> %s\n\n", redact.String(a.Verdict.Evidence))
 	b.WriteString("This is an *earned* rule, not the blanket auto-approve switch. " +

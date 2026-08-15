@@ -46,8 +46,13 @@ Opened before the action, under the label `maklaude-autonomous`:
    mode, diagnosis, intent, expected effect, and the preconditions re-checked immediately
    before acting.
 4. **Who permitted it** — the rule name, what it is recorded as (`policy:<rule-name>`),
-   the shape, and the **trust evidence**: the citation from the ledger that stood in for a
-   review.
+   the shape, the **fix fingerprint**, and the **trust evidence**: the citation from the
+   ledger that stood in for a review. The fingerprint is stated as its own field, in the
+   clear, because equality is the only thing it is for: comparing it against another
+   artifact's is how an operator answers "is this the same fix that was approved, or did
+   it change?". The citation names it too and is blanked there — the redaction sweep can't
+   distinguish a published hash from a leaked credential and is right to blank by default,
+   so the token is published structurally instead of by weakening the sweep.
 5. **The ceiling it ran under** — that the blast-radius budget admitted it, that admission
    consumed one of the pass's auto-applies for that cluster, and that the target's
    cooldown has started.
