@@ -58,9 +58,26 @@ tasks:
       - go test -tags e2e -count=1 -timeout 30m -v ./test/e2e/...
 
   vet:
-    desc: Run go vet
+    desc: Run go vet, including every build-tagged suite CI compiles
     cmds:
+      # Plain `go vet ./...` SKIPS build-tagged files silently — not as a warning,
+      # as a no-op. Every file in test/e2e is behind `//go:build e2e`, so that
+      # package can fail to COMPILE while this gate reports green, which reads as
+      # a flaky or environment-specific CI problem rather than as a type error the
+      # author just introduced. PR #183 cost a full CI round exactly that way:
+      # seven compile errors in test/e2e/unattended_test.go from a signature the
+      # PR changed, found by `e2e on kind` only after it had built a cluster and
+      # seeded fault scenarios.
+      #
+      # The tagged pass type-checks those files without running them — no cluster,
+      # no credentials, no env vars, about a second — so it runs anywhere the rest
+      # of this target already runs. Do NOT delete it as redundant with the line
+      # above: the two passes vet disjoint sets of files, which is the whole point.
+      # TestVetCoversEveryBuildTag pins this list to the tags actually present in
+      # the tree, so adding a second build tag without a line here fails the build
+      # rather than silently reopening the hole.
       - go vet ./...
+      - go vet -tags e2e ./...
 
   fmt:
     desc: Format all Go source files
