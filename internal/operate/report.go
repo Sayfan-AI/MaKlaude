@@ -58,6 +58,30 @@ type Report struct {
 // triage, ready-to-merge PRs). Printing them always, and saying "none", is what makes
 // the difference legible.
 type AutonomyReport struct {
+	// Autonomous reports whether this pass could auto-apply anything at all: rules, a
+	// trust oracle, a blast-radius ceiling and a disclosure trail, all four present.
+	//
+	// It is the first thing rendered and the first thing an operator should read, because
+	// it is the question every other line in this section is meaningless without. A
+	// deployment with a state file and no rules prints breakers and cooldowns exactly like
+	// a deployment that can act, and the two differ in whether MaKlaude may touch a
+	// cluster unattended.
+	Autonomous bool `json:"autonomous"`
+
+	// Off is why autonomy is not in force, in words, when [AutonomyReport.Autonomous] is
+	// false and something is known about the cause. See [Cycle.autonomyOff].
+	Off string `json:"off,omitempty"`
+
+	// Rules is how many grants were loaded, and RulesPath is the file they came from, so
+	// an operator can confirm the file MaKlaude read is the file they edited.
+	Rules     int    `json:"rules"`
+	RulesPath string `json:"rulesPath,omitempty"`
+
+	// LedgerPath names the trust ledger the evidence for every auto-apply is derived
+	// from. It is where an operator looks to answer "why did it think it could do that?",
+	// and deleting it is the broadest revocation available.
+	LedgerPath string `json:"ledgerPath,omitempty"`
+
 	// Configured reports whether a blast-radius budget is wired at all. When false
 	// nothing can be auto-applied, because the ceiling that would bound it does not
 	// exist — so this is a posture statement, not the absence of one.
@@ -97,18 +121,81 @@ type AutonomyReport struct {
 // autonomyReport projects a budget's status, or the not-configured posture when there
 // is no budget. The slices are always non-nil so the JSON form has the same shape
 // whether or not anything happened.
-func autonomyReport(b *budget.Budget) AutonomyReport {
+//
+// The posture argument carries the four-way "can this pass act unattended?" answer that
+// no budget can report on its own — a budget knows about ceilings, not about rules — so
+// it is passed in by the cycle rather than derived here.
+func autonomyReport(b *budget.Budget, p posture) AutonomyReport {
+	r := AutonomyReport{Breakers: []budget.Breaker{}, Suppressed: []budget.Suppression{}}
+	r.Autonomous, r.Off = p.autonomous, p.off
+	r.Rules, r.RulesPath, r.LedgerPath = p.rules, p.rulesPath, p.ledgerPath
 	if b == nil {
-		return AutonomyReport{Breakers: []budget.Breaker{}, Suppressed: []budget.Suppression{}}
+		return r
 	}
 	s := b.Status()
-	return AutonomyReport{
-		Configured: true,
-		Sealed:     s.Sealed,
-		SealDetail: s.SealDetail,
-		StatePath:  s.Path,
-		Breakers:   s.Breakers,
-		Suppressed: s.Suppressions,
+	r.Configured = true
+	r.Sealed, r.SealDetail, r.StatePath = s.Sealed, s.SealDetail, s.Path
+	r.Breakers, r.Suppressed = s.Breakers, s.Suppressions
+	return r
+}
+
+// posture is the cycle's answer to "may this pass act without a person, and if not
+// why not" — the fields a [budget.Budget] cannot know about.
+//
+// It is a small struct rather than four arguments so that adding a fifth thing autonomy
+// depends on cannot silently be passed in the wrong position.
+type posture struct {
+	autonomous bool
+	off        string
+	rules      int
+	rulesPath  string
+	ledgerPath string
+}
+
+// posture reports whether this cycle can act unattended, and why not when it cannot.
+//
+// The fallback matters as much as the reported reason. [NewForTest] and any caller that
+// wires autonomy directly through [Cycle.UseAutonomy] set no explanation, so an
+// unexplained not-autonomous cycle gets one derived from what is actually missing rather
+// than printing nothing — the absent section being the one rendering this must not have.
+func (c *Cycle) posture() posture {
+	p := posture{
+		autonomous: c.autonomyWired(),
+		off:        c.autonomyOff,
+		rules:      len(c.rules),
+		rulesPath:  c.rulesPath,
+		ledgerPath: c.ledgerPath,
+	}
+	if reporter, ok := c.ledger.(interface{ Path() string }); ok && p.ledgerPath == "" {
+		p.ledgerPath = reporter.Path()
+	}
+	if p.autonomous {
+		p.off = ""
+		return p
+	}
+	if p.off == "" {
+		p.off = c.missingForAutonomy()
+	}
+	return p
+}
+
+// missingForAutonomy names the first thing [Cycle.autonomyWired] is missing.
+//
+// It reports one piece rather than all of them because an operator fixes them one at a
+// time, and because the order is the order they are configured in: rules are the opt-in,
+// and the rest are what the opt-in requires.
+func (c *Cycle) missingForAutonomy() string {
+	switch {
+	case len(c.rules) == 0:
+		return "no autonomy rules are loaded, so every proposal takes the human gate"
+	case c.oracle == nil:
+		return "autonomy rules are loaded and no trust ledger is wired, so no shape can have earned anything"
+	case c.budget == nil:
+		return "autonomy rules are loaded and no blast-radius ceiling is wired, so nothing bounds an unattended action"
+	case c.disclosure == nil:
+		return "autonomy rules are loaded and there is nowhere to disclose an unattended action, so none is taken"
+	default:
+		return ""
 	}
 }
 
@@ -552,13 +639,41 @@ func (a AutonomyReport) writeRevocationError(b *strings.Builder) {
 		a.RevocationError)
 }
 
+// writeUnattended renders the one line that says whether MaKlaude may change a cluster
+// without asking, above everything that only makes sense once that is answered.
+//
+// The ON line names the rules file and the ledger rather than just asserting the state,
+// because "autonomy is on" is a claim an operator should be able to check: the file they
+// edited is the file MaKlaude read, and the ledger named here is the evidence behind any
+// auto-apply in the report — and the file whose deletion revokes every earned shape.
+func (a AutonomyReport) writeUnattended(b *strings.Builder) {
+	b.WriteString("\nUnattended actions: ")
+	if !a.Autonomous {
+		b.WriteString("OFF")
+		if a.Off != "" {
+			fmt.Fprintf(b, " — %s", a.Off)
+		}
+		b.WriteString("\n")
+		return
+	}
+	fmt.Fprintf(b, "ON — %d autonomy rule(s)", a.Rules)
+	if a.RulesPath != "" {
+		fmt.Fprintf(b, " from %s", a.RulesPath)
+	}
+	if a.LedgerPath != "" {
+		fmt.Fprintf(b, "; trust ledger %s", a.LedgerPath)
+	}
+	b.WriteString("\n  a shape still gates until it has EARNED autonomy, and every auto-apply is disclosed\n")
+}
+
 // writeText renders the blast-radius posture as two always-present sections.
 //
 // The sections are written even when both are empty, and the empty case says "none"
 // rather than being skipped — see [AutonomyReport] for why the absence of a section
 // is the one rendering this must not have.
 func (a AutonomyReport) writeText(b *strings.Builder) {
-	b.WriteString("\nAutonomy (blast radius): ")
+	a.writeUnattended(b)
+	b.WriteString("Autonomy (blast radius): ")
 	if !a.Configured {
 		b.WriteString("not configured — no action can be auto-applied, so nothing is bounded and nothing is suppressed.\n")
 		a.writeRevocationError(b)

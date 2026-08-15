@@ -697,11 +697,14 @@ type unattendedPass struct {
 // pass over the live cluster.
 //
 // Everything here is the shipped machinery. The cycle is [operate.NewForTest] rather
-// than [operate.New] for one reason and it is not the autonomy: New reads its
-// configuration from the environment and, by deliberate design, wires no ruleset at all
-// (see its doc — rule loading lands with the documentation that describes it, T7). The
-// client builder, the mutator builder, the gate, the runner, the disclosure trail and
-// the budget are all the real ones.
+// than [operate.New] for one reason, and it is the SINKS rather than the autonomy: New
+// wires autonomy from the environment (T7) but requires a LIVE disclosure trail to do
+// it, because an unattended action whose only record dies with the process is what the
+// milestone forbids — and this test needs an in-memory disclosure sink it can read back,
+// plus an approval sink nobody can approve on. The client builder, the mutator builder,
+// the gate, the runner, the disclosure trail and the budget are all the real ones, and
+// [operate.New]'s own path over the same seam is covered by
+// internal/operate/wire_test.go.
 //
 // The approval gate is real and NOBODY can approve on it: an in-memory sink with no
 // decisions. That is what makes "the proposal went to a human" a checkable outcome

@@ -9,18 +9,23 @@ Read [`autonomous-mode.md`](autonomous-mode.md) alongside this one. That page
 describes the single supported way to switch the human requirement off; this page
 describes everything that stays on when you do.
 
-> **Where this stands today.** Every stage below is implemented and tested,
-> including end to end against a live `kind` cluster. What does **not** exist yet
-> is a way to reach it from the shipped binary: `maklaude` has two commands,
-> `version` and `scan`, and nothing in the configuration surface, the CLI, or a
-> scheduled loop constructs an executor. That is stated in the code as a property
-> rather than left implicit — see the package docs on
-> [`internal/execute`](../internal/execute/execute.go) ("Nothing constructs a
-> Runner yet") and [`kube.NewExecutor`](../internal/kube/executor.go). So "writes
-> are off by default" is currently a fact about what the binary *can do*, not a
-> setting anyone has to get right. The rest of this page describes the machinery
-> that a later wiring step will expose, and the gates it will have to pass
-> through.
+> **Where this stands today.** Every stage below is implemented, tested, and
+> **reachable from the shipped binary** — from exactly one command,
+> `maklaude remediate`. `maklaude scan` cannot execute anything, which is why the
+> two are separate commands rather than one command with a flag: scan's promise
+> that nothing it does can change a cluster is worth being unable to weaken by
+> passing an argument.
+>
+> `remediate` is itself propose-only until an operator sets `MAKLAUDE_EXECUTE_MODE`,
+> and with that variable unset it constructs no write-capable client at all. So
+> "writes are off by default" is one variable an operator has to set deliberately,
+> plus every gate below — none of which was relaxed to make the command reachable.
+>
+> Since Milestone 5 there is a second, narrower way for an action to be authorized:
+> a rule an operator wrote, for a shape a recorded history of human approvals has
+> **earned**. It is off by default in the same sense — no rule exists until an
+> operator writes one — and it opens exactly one of the five gates below. See
+> [`unattended-actions.md`](unattended-actions.md).
 
 ## The pipeline
 
@@ -80,6 +85,13 @@ Two consequences worth internalizing:
   relax the `resourceVersion` check. Auto-approval while the executor is in
   dry-run produces an unattended **rehearsal**, not a change. See
   [`autonomous-mode.md`](autonomous-mode.md).
+- **So does earned autonomy, and it is the same one.** A rule an operator wrote,
+  for a shape the recorded history has earned, substitutes for the human-approval
+  gate and for nothing else: same RBAC bundle, same kill switch, same fresh
+  precondition re-check, same `resourceVersion`. It also adds bounds the gated path
+  does not have — a per-pass cap, a per-target cooldown, a per-cluster circuit
+  breaker, and one disclosure artifact per action, opened *before* it runs. See
+  [`unattended-actions.md`](unattended-actions.md).
 
 ### The kill switch has three positions
 

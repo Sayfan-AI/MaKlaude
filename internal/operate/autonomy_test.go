@@ -145,7 +145,7 @@ func TestReport_SuppressedAutoApplyIsPrintedWithItsBound(t *testing.T) {
 		b.Admit(testCluster, budgetTarget(name), fixedTime)
 	}
 
-	report.Autonomy = autonomyReport(b)
+	report.Autonomy = autonomyReport(b, posture{})
 	var buf bytes.Buffer
 	if err := report.WriteText(&buf); err != nil {
 		t.Fatalf("WriteText: %v", err)
@@ -205,7 +205,7 @@ func TestReport_AutonomySectionSurvivesAnEmptyRegistry(t *testing.T) {
 	b := memoryBudget()
 	b.Trip(testCluster, "an anomalous burst", fixedTime)
 
-	report := &Report{GeneratedAt: fixedTime, Mode: kube.ExecuteDisabled.String(), Autonomy: autonomyReport(b)}
+	report := &Report{GeneratedAt: fixedTime, Mode: kube.ExecuteDisabled.String(), Autonomy: autonomyReport(b, posture{})}
 	var buf bytes.Buffer
 	if err := report.WriteText(&buf); err != nil {
 		t.Fatalf("WriteText: %v", err)

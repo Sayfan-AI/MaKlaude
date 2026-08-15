@@ -14,6 +14,8 @@ import (
 	"github.com/Sayfan-AI/MaKlaude/internal/disclose"
 	"github.com/Sayfan-AI/MaKlaude/internal/execute"
 	"github.com/Sayfan-AI/MaKlaude/internal/kube"
+	"github.com/Sayfan-AI/MaKlaude/internal/rules"
+	"github.com/Sayfan-AI/MaKlaude/internal/trust"
 )
 
 // ExecuteModeEnv is the single environment variable that opts a deployment into the
@@ -58,6 +60,38 @@ func ExecuteModeFromEnv(getenv func(string) string) (kube.ExecuteMode, error) {
 // tripped it is a cluster MaKlaude is wrong about, and that outlasts any one run.
 const AutonomyStateEnv = "MAKLAUDE_AUTONOMY_STATE"
 
+// AutonomyRulesEnv points at the file granting autonomy: the operator's allowlist of
+// (cluster, namespace, operation) shapes that may run unattended once they have EARNED
+// it. See [rules] for the format and docs/autonomous-mode.md for the whole posture.
+//
+// Unset — the shipped default — means no rule exists, so [autonomy.Decide] returns
+// [autonomy.ReasonAutonomyNotConfigured] for every proposal and every one of them takes
+// the human gate. That is byte-for-byte Milestone 4's behaviour.
+//
+// It is a path to a SEPARATE file rather than a key in the cluster registry, for the
+// reason [ExecuteModeEnv] is not in that file either: the registry is copied, templated
+// and committed, and "the checked-in example turned autonomy on" is a failure mode worth
+// designing out. The registry describes what to look at; this describes what may be
+// changed without asking, and the two do not belong in one blast radius.
+const AutonomyRulesEnv = "MAKLAUDE_AUTONOMY_RULES"
+
+// TrustLedgerEnv points at the file the trust ledger keeps its history of recorded
+// executions in — the evidence that decides whether a shape has earned autonomy.
+//
+// It is required whenever [AutonomyRulesEnv] is set, and [New] refuses to start without
+// it rather than falling back to an in-memory ledger. An in-memory ledger starts empty
+// on every run, so no shape could ever accumulate the three human-approved executions
+// promotion needs: the rules would be configured, valid, and silently incapable of ever
+// firing. That is the exact failure this milestone's documentation criterion exists to
+// prevent — a claim in the docs that is unreachable in the binary.
+//
+// The file is a CACHE and not the authority. The durable record of a human's approval is
+// the approval artifact; the ledger is a local projection of those artifacts, kept so a
+// trust decision never depends on an API call that can rate-limit. It can be deleted and
+// rebuilt — see [internal/rebuild] — and deleting it revokes every earned shape until the
+// history is rebuilt, which is the cheapest revocation there is.
+const TrustLedgerEnv = "MAKLAUDE_TRUST_LEDGER"
+
 // New builds the production cycle from the environment.
 //
 // Under [kube.ExecuteDisabled] — the default — it builds NO approval gate and leaves
@@ -76,25 +110,25 @@ const AutonomyStateEnv = "MAKLAUDE_AUTONOMY_STATE"
 // opted-in mode is a legitimate configuration — it rehearses the whole path with an
 // in-memory trail nobody can approve on — so it is reported rather than refused.
 //
-// # Autonomy is NOT wired here
+// # Autonomy is opt-in, and every way of half-configuring it is an error
 //
-// A cycle built by this function auto-applies nothing: it has no ruleset, no trust
-// oracle and no disclosure trail, so [Cycle.autonomyWired] is false and every proposal
-// takes the human gate. That is the shipped posture and it is byte-for-byte Milestone
-// 4's behaviour.
+// With [AutonomyRulesEnv] unset — the shipped default — a cycle built here auto-applies
+// nothing: it has no ruleset, no trust oracle and no disclosure trail, so
+// [Cycle.autonomyWired] is false and every proposal takes the human gate. That is
+// byte-for-byte Milestone 4's behaviour, and [Cycle.autonomyOff] says so in the report
+// rather than leaving an operator to infer it from an absence.
 //
-// The missing piece is deliberately a CONFIGURATION surface rather than a mechanism.
-// [autonomy]'s own doc places rule loading with the documentation that describes it —
-// task T7 (#147) — and the reason is worth restating where the wiring is: the bytes that
-// grant a machine permission to change a production cluster unattended are the single
-// most consequential thing an operator will write in this system, and shipping a loader
-// ahead of the document that explains the format is how somebody ends up with autonomy
-// they did not understand they had enabled. [Cycle.UseAutonomy] is the seam T7 fills;
-// everything behind it is complete and tested.
+// With it set, [Cycle.autonomyFromEnv] requires the other two paths as well — a state
+// file for the blast-radius ceiling and a ledger file for the history trust is derived
+// from — and refuses to start without them. Each missing piece would otherwise produce a
+// deployment where autonomy is configured, valid, and silently incapable of ever firing,
+// which is indistinguishable from one where no shape has earned trust yet.
 //
-// Note that the disclosure trail is not built here either, even though it needs no new
-// configuration knob (it reuses MAKLAUDE_GITHUB_*). Building it would make every pass
-// list the disclosure trail over the network in order to discover that autonomy is off.
+// The one exception is the kill switch. Under [kube.ExecuteDisabled] autonomy is not
+// wired even when its files are configured, and that is NOT an error: setting
+// MAKLAUDE_EXECUTE_MODE=disabled must always be a safe action, and a binary that refused
+// to start because of it would turn the kill switch into an outage. The report states the
+// posture instead.
 func New() (c *Cycle, live bool, err error) {
 	mode, err := ExecuteModeFromEnv(os.Getenv)
 	if err != nil {
@@ -122,6 +156,7 @@ func New() (c *Cycle, live bool, err error) {
 		cyc.budget = b
 	}
 	if mode == kube.ExecuteDisabled {
+		cyc.autonomyOff = disabledByKillSwitch(os.Getenv)
 		return cyc, false, nil
 	}
 
@@ -131,7 +166,103 @@ func New() (c *Cycle, live bool, err error) {
 	}
 	cyc.gate = gate
 	cyc.live = live
+
+	if err := cyc.autonomyFromEnv(os.Getenv); err != nil {
+		return nil, false, err
+	}
 	return cyc, live, nil
+}
+
+// autonomyFromEnv wires the unattended half from the environment, or records why it is
+// off. It returns an error only for a configuration that cannot be honored as written.
+//
+// # The four things it has to assemble, and why each one is required
+//
+// [Cycle.UseAutonomy] takes rules, a trust oracle, a disclosure trail and a ledger, and
+// [Cycle.autonomyWired] additionally requires the blast-radius budget. This function is
+// where an operator's environment becomes those five things, so it is also where every
+// partial configuration has to be caught:
+//
+//   - RULES, from [AutonomyRulesEnv]. Absent means fully gated, which is a posture and
+//     not an error.
+//   - THE LEDGER, from [TrustLedgerEnv]. Required with rules: an in-memory ledger is
+//     empty on every start, so nothing could ever earn autonomy.
+//   - THE BUDGET, from [AutonomyStateEnv], opened by [New] before this runs. Required
+//     with rules: eligibility with no ceiling is the failure [budget]'s doc opens with,
+//     and a breaker that forgets it tripped across a restart is not a breaker.
+//   - THE DISCLOSURE TRAIL, from the MAKLAUDE_GITHUB_* variables the escalation trail
+//     already uses. It needs no new knob, but it does need to be LIVE: an in-memory trail
+//     means an unattended mutation whose only record dies with the process, and that is
+//     the one outcome this milestone forbids outright. A non-live trail therefore leaves
+//     autonomy unwired rather than failing the run — the gated path is unaffected, and the
+//     posture names the variables to set.
+//
+// The ledger is passed twice, as the oracle and as the recorder, because it is one
+// object playing both roles: [trust.Ledger.Trust] answers whether a shape earned
+// autonomy, and [trust.Ledger.RecordLifecycle] is how the gated path's approvals get
+// into the history that answer is derived from. Wiring them from one file is what makes
+// the cold start work — every human approval recorded through the gate is evidence, so a
+// deployment that has enabled autonomy and trusts nothing yet is a deployment earning
+// trust, not one waiting for a switch.
+func (c *Cycle) autonomyFromEnv(getenv func(string) string) error {
+	rulesPath := strings.TrimSpace(getenv(AutonomyRulesEnv))
+	if rulesPath == "" {
+		c.autonomyOff = fmt.Sprintf(
+			"no autonomy rules are configured (%s is unset), so every proposal takes the human gate", AutonomyRulesEnv)
+		return nil
+	}
+
+	rs, err := rules.Load(rulesPath)
+	if err != nil {
+		return fmt.Errorf("%s: %w", AutonomyRulesEnv, err)
+	}
+
+	ledgerPath := strings.TrimSpace(getenv(TrustLedgerEnv))
+	if ledgerPath == "" {
+		return fmt.Errorf("%s names a rules file (%s) but %s is unset: trust is derived from a durable history of human-approved executions, so an in-memory ledger would start empty on every run and no shape could ever earn autonomy — the rules would be valid and silently unable to fire",
+			AutonomyRulesEnv, rulesPath, TrustLedgerEnv)
+	}
+	if c.budget == nil {
+		return fmt.Errorf("%s names a rules file (%s) but %s is unset: an unattended action needs a blast-radius ceiling (per-pass cap, per-target cooldown, per-cluster circuit breaker), and that state has to outlive the process — a breaker that forgets it tripped on restart is not a breaker",
+			AutonomyRulesEnv, rulesPath, AutonomyStateEnv)
+	}
+
+	ledger, err := trust.Open(ledgerPath)
+	if err != nil {
+		return fmt.Errorf("%s: %w", TrustLedgerEnv, err)
+	}
+
+	trail, live := disclose.TrailFromEnv()
+	switch {
+	case trail == nil:
+		return fmt.Errorf("%s names a rules file (%s) and the disclosure trail could not be built, so an unattended action would have nowhere to be recorded",
+			AutonomyRulesEnv, rulesPath)
+	case !live:
+		c.autonomyOff = fmt.Sprintf(
+			"autonomy rules are configured (%s) but the disclosure trail is not live, so an unattended action's only record would die with this process; set MAKLAUDE_GITHUB_REPO and MAKLAUDE_GITHUB_TOKEN, or leave autonomy off",
+			rulesPath)
+		return nil
+	}
+
+	c.UseAutonomy(rs, ledger, trail, ledger)
+	c.ledgerPath = ledgerPath
+	c.rulesPath = rulesPath
+	return nil
+}
+
+// disabledByKillSwitch renders the posture for a cycle the kill switch stopped before
+// autonomy could be wired.
+//
+// It reports the two cases differently because they are different situations: an
+// operator who has never configured autonomy is running the shipped posture, while one
+// who configured it and then set the kill switch has deliberately turned off something
+// that is otherwise ready, and needs to see that MaKlaude noticed.
+func disabledByKillSwitch(getenv func(string) string) string {
+	if strings.TrimSpace(getenv(AutonomyRulesEnv)) == "" {
+		return fmt.Sprintf("execution is disabled and no autonomy rules are configured (%s is unset)", AutonomyRulesEnv)
+	}
+	return fmt.Sprintf("autonomy rules are configured (%s) but %s is disabled, so nothing is applied at all — gated or not",
+		strings.TrimSpace(getenv(AutonomyRulesEnv)), ExecuteModeEnv)
 }
 
 // NewForTest builds a cycle with every seam supplied explicitly. now may be nil, in

@@ -1,0 +1,133 @@
+# MaKlaude autonomy rules — example configuration.
+#
+# This file is how you GRANT AUTONOMY: it lists the (cluster, namespace, operation)
+# shapes MaKlaude may act on without asking a person first — but only once each shape
+# has EARNED it. Copy it, edit it, and point MaKlaude at your copy:
+#
+#   export MAKLAUDE_AUTONOMY_RULES=/etc/maklaude/autonomy.yaml
+#   export MAKLAUDE_TRUST_LEDGER=/var/lib/maklaude/trust.jsonl
+#   export MAKLAUDE_AUTONOMY_STATE=/var/lib/maklaude/autonomy-state.json
+#
+# All three are required together, and `maklaude remediate` REFUSES TO START if you
+# set the first without the other two. The reason is worth reading once: a rules file
+# with no trust ledger is a grant with no history behind it, so no shape could ever
+# earn anything, and the rules would be valid and silently unable to fire — which
+# looks exactly like a working deployment where nothing has earned trust yet. A rules
+# file with no state file has no ceiling: no per-pass cap, no cooldown, no circuit
+# breaker.
+#
+# READ docs/unattended-actions.md BEFORE USING THIS FILE. It is a separate file from
+# the cluster registry (config.example.yaml) on purpose — that file is copied,
+# templated and committed, and "the checked-in example turned autonomy on" is a
+# failure mode worth designing out.
+#
+# ---------------------------------------------------------------------------
+# WHAT A RULE IS, AND WHAT IT IS NOT
+#
+# A rule makes a shape ELIGIBLE. It never makes it permitted. Every auto-apply needs
+# all of:
+#
+#   1. a rule below that names the cluster, the namespace, and the operation;
+#   2. EARNED TRUST for that (cluster, operation) shape — 3 human-approved
+#      executions that converged, with zero failures, rollbacks or drift-aborts
+#      among the last 10 recorded executions of the shape;
+#   3. room under the blast-radius ceiling — 2 auto-applies per cluster per pass,
+#      a 30-minute cooldown per target, and a per-cluster circuit breaker that
+#      trips after 2 consecutive auto-apply failures;
+#   4. a live disclosure trail to record it on (MAKLAUDE_GITHUB_REPO + TOKEN);
+#   5. every gate the gated path already had — the write RBAC bundle, the
+#      MAKLAUDE_EXECUTE_MODE kill switch, freshly re-checked preconditions, and the
+#      resourceVersion the proposal was computed from.
+#
+# THERE IS NO WAY TO DECLARE TRUST IN THIS FILE. No `trusted:` key, no seed, no
+# bootstrap list. Trust is derived from recorded history and never asserted, so on
+# day one NOTHING is trusted and every proposal gates — by design, not as a gap. If
+# what you actually want is "act without asking and skip the history", that is
+# MAKLAUDE_DANGEROUSLY_AUTO_APPROVE, which is honest about being a blank cheque.
+# See docs/autonomous-mode.md.
+#
+# The bounds in (3) are NOT configurable from this file. A rules file can narrow what
+# runs unattended; it cannot raise the ceiling it runs under.
+# ---------------------------------------------------------------------------
+
+# The format version. Required — a file that does not state its version is one
+# nobody can tell apart from a file written for a different one.
+version: 1
+
+rules:
+  # Every selector is REQUIRED and every one is an explicit list. There is no
+  # wildcard, no "all namespaces" spelling, and no empty-means-everything field: an
+  # empty selector makes a rule INVALID rather than permissive, and one invalid rule
+  # gates the entire ruleset. Typos and omissions are the failure modes of a config
+  # file, so each one lands on the safe side of a decision that otherwise changes a
+  # cluster with nobody watching.
+  - name: staging-web-restart        # lowercase, interior hyphens; recorded as
+                                     # `policy:staging-web-restart` wherever an
+                                     # unattended action is attributed, so make it
+                                     # something you would want to read in an
+                                     # incident review
+    clusters: [staging]              # registered cluster names, from your registry
+    namespaces: [web, api]           # the blast-radius bound
+    operations: [rolloutrestart]     # rolloutrestart | rollbackrevision | deletepod | cordonnode
+    maxReversibility: reversible     # optional ceiling; omitted means `reversible`,
+                                     # the strictest setting
+
+  # A second rule, deliberately narrower: production gets one namespace and the
+  # safest operation, and nothing else. Autonomy is granted per cluster and never
+  # globally — trust earned on staging says nothing about production, and a cluster
+  # no rule names is untouched by the whole ruleset.
+  - name: prod-web-restart
+    clusters: [prod-us-east]
+    namespaces: [web]
+    operations: [rolloutrestart]
+
+  # ---------------------------------------------------------------------------
+  # An example of what NOT to write, kept commented out because it is the mistake
+  # this format is shaped to prevent:
+  #
+  #   - name: everything
+  #     clusters: [prod-us-east]
+  #     namespaces: []               # INVALID — not "all namespaces". An empty
+  #                                  # selector makes this rule invalid, and one
+  #                                  # invalid rule gates the entire ruleset, so
+  #                                  # this file would turn autonomy OFF, not up.
+  #     operations: [deletepod]
+  #     maxReversibility: irreversible   # REJECTED — an irreversible action is
+  #                                      # refused before any rule is read, so
+  #                                      # allowing it here would be a setting that
+  #                                      # does nothing.
+  #
+  # Three operations are in MaKlaude's catalog and absent from the examples above on
+  # purpose. They are not forbidden — you may list them — but each is worth a
+  # deliberate decision rather than a default:
+  #
+  #   deletepod         destroys the evidence a human would want from a crashed pod
+  #   rollbackrevision  mutates declared intent and can fight a GitOps controller
+  #   cordonnode        has cluster-wide scheduling effect — and note that a
+  #                     cluster-scoped target has no namespace, so it can never
+  #                     match any rule and is therefore NEVER auto-applied,
+  #                     whatever you write here
+  # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# HOW TO CONFIRM WHAT YOU JUST CONFIGURED
+#
+#   ./bin/maklaude remediate --config config.yaml
+#
+# The report's first autonomy line answers the only question that matters:
+#
+#   Unattended actions: ON — 2 autonomy rule(s) from /etc/maklaude/autonomy.yaml; ...
+#   Unattended actions: OFF — <the exact reason, naming the variable to fix>
+#
+# HOW TO REVOKE — three scopes, all of them one action:
+#
+#   one shape     add the `autonomy:revoked` label to its disclosure issue
+#   one cluster   remove it from the `clusters:` list here, or trip its breaker
+#   everything    unset MAKLAUDE_AUTONOMY_RULES, or set
+#                 MAKLAUDE_EXECUTE_MODE=disabled to stop ALL writes, gated or not
+#
+# Deleting the trust ledger also revokes every earned shape until its history is
+# rebuilt from the approval artifacts. Deleting the write RBAC bundle
+# (`kubectl delete -k deploy/rbac/write`) stops every write at the API server and
+# needs no MaKlaude restart.
+# ---------------------------------------------------------------------------

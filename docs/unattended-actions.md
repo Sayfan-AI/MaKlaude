@@ -126,27 +126,153 @@ two authorized the action rather than merely mentioning both.
 
 All four, and none of them defaults:
 
-1. **A rule** naming the cluster, the namespace, and the operation. There is no wildcard;
-   an empty selector makes a rule invalid rather than permissive, and one invalid rule
-   gates the entire ruleset.
-2. **Earned trust** — a ledger citation for that shape. A ledger that claims trust and
-   cites nothing is refused.
-3. **A blast-radius budget** — the per-pass cap, the per-target cooldown, and the
-   per-cluster circuit breaker. Eligibility with no ceiling is how one bad diagnosis
-   becomes fifty restarts, so an unbounded deployment auto-applies nothing.
-4. **A disclosure trail** to write to. An unattended mutation with no record is the one
-   outcome this milestone forbids, so *nowhere to disclose* means *nothing to disclose*.
+| # | What | Where it comes from |
+| - | ---- | ------------------- |
+| 1 | **A rule** naming the cluster, the namespace, and the operation. There is no wildcard; an empty selector makes a rule invalid rather than permissive, and one invalid rule gates the entire ruleset | `MAKLAUDE_AUTONOMY_RULES` |
+| 2 | **Earned trust** — a ledger citation for that shape. A ledger that claims trust and cites nothing is refused | `MAKLAUDE_TRUST_LEDGER` |
+| 3 | **A blast-radius budget** — the per-pass cap, the per-target cooldown, and the per-cluster circuit breaker. Eligibility with no ceiling is how one bad diagnosis becomes fifty restarts, so an unbounded deployment auto-applies nothing | `MAKLAUDE_AUTONOMY_STATE` |
+| 4 | **A disclosure trail** to write to. An unattended mutation with no record is the one outcome this milestone forbids, so *nowhere to disclose* means *nothing to disclose* | `MAKLAUDE_GITHUB_REPO` + `MAKLAUDE_GITHUB_TOKEN` |
 
 Plus the two gates that were already there: the write-path kill switch
 (`MAKLAUDE_EXECUTE_MODE`) and everything in [`remediation.md`](remediation.md) — the
 scoped RBAC bundle, the precondition re-check, the `resourceVersion` enforcement. Earned
 autonomy opens exactly one of them.
 
-> **Configuring the rules is not wired yet.** The mechanism is complete and tested; where
-> the ruleset and the ledger path come from is the configuration surface, and it lands
-> with the document that describes it (task T7, issue #147). A deployment today has no
-> rules, so `autonomy` is off and every proposal takes the human gate — which is
-> Milestone 4's behaviour exactly.
+## Enabling it
+
+**Autonomy is off by default**, and off means no rule exists — not a flag set to false.
+With `MAKLAUDE_AUTONOMY_RULES` unset, `autonomy.Decide` answers
+`autonomy-not-configured` for every proposal and every one of them takes the human gate,
+which is Milestone 4's behaviour exactly.
+
+Turning it on is three variables and one file:
+
+```bash
+export MAKLAUDE_EXECUTE_MODE=enabled                              # or dry-run to rehearse
+export MAKLAUDE_AUTONOMY_RULES=/etc/maklaude/autonomy.yaml        # the grant
+export MAKLAUDE_TRUST_LEDGER=/var/lib/maklaude/trust.jsonl        # the history it is earned from
+export MAKLAUDE_AUTONOMY_STATE=/var/lib/maklaude/autonomy-state.json  # the ceiling it runs under
+export MAKLAUDE_GITHUB_REPO=owner/repo                            # where each action is disclosed
+export MAKLAUDE_GITHUB_TOKEN=...                                  # token with issues:write
+```
+
+The rules file is documented, with a worked example and the mistakes it is shaped to
+prevent, in [`autonomy.example.yaml`](../autonomy.example.yaml). The shape of one rule:
+
+```yaml
+version: 1
+rules:
+  - name: staging-web-restart
+    clusters: [staging]
+    namespaces: [web, api]
+    operations: [rolloutrestart]
+    maxReversibility: reversible   # optional; omitted means the strictest class
+```
+
+It is a **separate file from the cluster registry** on purpose. That file is copied,
+templated and committed, and "the checked-in example turned autonomy on" is a failure
+mode worth designing out.
+
+### Half-configuring it is an error, not a quieter posture
+
+Setting the rules variable without the ledger or the state file makes
+`maklaude remediate` **refuse to start**, naming the variable to fix. That is deliberate,
+and the reason is the failure mode rather than tidiness: rules with no ledger can never
+promote a shape, and rules with no ceiling have nothing to bound them, so either one
+produces a deployment where autonomy is configured, valid, and silently incapable of ever
+firing — which is indistinguishable from one where nothing has earned trust yet. A
+malformed or unreadable rules file refuses to start for the same reason; an empty ruleset
+would grant nothing, which is a perfectly safe way to be completely wrong.
+
+Two configurations are reported rather than refused, and both leave autonomy **off**:
+
+- **The kill switch.** `MAKLAUDE_EXECUTE_MODE=disabled` with autonomy fully configured is
+  not an error. Setting the kill switch must always be a safe action; a binary that
+  refused to start because of it would turn the kill switch into an outage.
+- **A disclosure trail that reaches nobody.** With no `MAKLAUDE_GITHUB_*` configuration
+  the trail degrades to an in-memory one, so an unattended action's only record would die
+  with the process. Autonomy does not engage, the gated path is unaffected, and the report
+  names the variables to set.
+
+### Confirming what you configured
+
+The report's first autonomy line is the posture, printed every pass whether or not
+anything happened:
+
+```
+Unattended actions: ON — 2 autonomy rule(s) from /etc/maklaude/autonomy.yaml; trust ledger /var/lib/maklaude/trust.jsonl
+  a shape still gates until it has EARNED autonomy, and every auto-apply is disclosed
+```
+
+```
+Unattended actions: OFF — no autonomy rules are configured (MAKLAUDE_AUTONOMY_RULES is unset), so every proposal takes the human gate
+```
+
+`OFF` always states its cause, because "autonomy is off" has half a dozen of them and
+they all look identical from the outside: a report with no unattended actions in it. The
+distinction that matters is between an operator who has one variable left to set and one
+who believes autonomy is on and is quietly wrong.
+
+### The cold start: nothing is trusted on day one
+
+A freshly enabled deployment auto-applies **nothing**, and keeps auto-applying nothing
+until a shape has earned it. There is no seed, no bootstrap list and no "start trusted"
+flag, because trust is derived from recorded history and never declared — a config file
+that granted autonomy without evidence would be the blank cheque
+`MAKLAUDE_DANGEROUSLY_AUTO_APPROVE` already is, wearing the word "earned".
+
+So the first pass after enabling autonomy looks exactly like the last pass before it:
+every proposal goes to a person. What changed is that each approval is now **evidence**.
+Promotion needs, per `(cluster, operation)` shape:
+
+- **3 human-approved executions that converged**, and
+- **zero failures, rollbacks or drift-aborts** among the last **10** recorded executions
+  of that shape.
+
+The 3 must themselves be inside that window of 10 — the window is what the whole rule is
+evaluated over, so a shape that converged three times last year and has timed out on
+every attempt since loses trust on its own as the timeouts push the approvals out.
+Demotion is immediate on a single failure, rollback, or drift-abort.
+
+An auto-applied success is worth nothing here: only an execution a *human* approved can
+promote, so autonomy does not compound. Enabling autonomy on a cluster and seeing nothing
+auto-applied for weeks is the mechanism working.
+
+### What it will and will not do once trusted
+
+The bounds are **not configurable** — a rules file can narrow what runs unattended, never
+raise the ceiling it runs under:
+
+| Bound | Value | What it does |
+| ----- | ----- | ------------ |
+| Per-cluster, per-pass cap | 2 | The most actions one cluster may auto-apply in a single pass. Admission *consumes*: it counts against the cap and starts the cooldown |
+| Per-target cooldown | 30 minutes | One target is off limits to autonomy for this long after an auto-apply is admitted for it |
+| Circuit breaker | 2 consecutive failures | Trips that cluster's breaker and takes it **fully gated** until a human clears it. Consecutive: one success resets the count |
+
+A breaker is not a quiet state. Every pass prints the **Autonomy (blast radius)** section
+whether or not anything is tripped, tripped breakers name the cluster and the instant, and
+a failure run that has *not* yet tripped is printed separately — the warning before the
+outage. A tripped breaker also survives a restart, because the condition that tripped it
+is a cluster MaKlaude is wrong about and that outlasts any one process.
+
+Note what a bound does **not** do: it holds an action back from running *unattended*, not
+from running at all. A suppressed auto-apply and a tripped breaker both fall through to
+the ordinary human approval path, so a tripped cluster is one where MaKlaude still
+proposes and asks — not one where it has gone quiet.
+
+### Revoking it — five scopes
+
+| Scope | How | Takes effect |
+| ----- | --- | ------------ |
+| One **shape** | Add `autonomy:revoked` to its disclosure issue | Next cycle, before anything is decided. See [above](#revoking-an-actions-autonomy) |
+| One **cluster** | Remove it from the rule's `clusters:` list, or trip its breaker | Next pass |
+| All **earned trust** | Delete the trust ledger file | Next pass — every shape re-gates until the history is rebuilt from the artifacts |
+| All **unattended action** | Unset `MAKLAUDE_AUTONOMY_RULES` | Next start |
+| All **writes**, gated too | `MAKLAUDE_EXECUTE_MODE=disabled`, or `kubectl delete -k deploy/rbac/write` | Next start; the RBAC deletion is immediate and needs no restart |
+
+Deleting the ledger is safe in the direction that matters: it is a cache of the approval
+artifacts, not the authority, so nothing is lost that a rebuild cannot recover — and until
+it is rebuilt, nothing is trusted.
 
 ## Rebuilding the trust ledger from the artifacts
 

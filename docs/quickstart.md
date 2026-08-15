@@ -123,6 +123,10 @@ the separate trail mutating actions travel on.
 - [`docs/remediation.md`](remediation.md) — the separate, opt-in write path: what
   MaKlaude can fix once approved, and the five gates it has to pass first. Nothing
   in this quickstart enables any of it.
+- [`docs/unattended-actions.md`](unattended-actions.md) — and only after that: how a
+  shape *earns* the right to run without a person, what enabling it takes, and what
+  bounds it. Nothing in this quickstart enables that either; a fresh install trusts
+  nothing and gates everything.
 - [`docs/rbac.md`](rbac.md) — the full read-only access model and verification.
 - [`docs/slack.md`](slack.md) — optional Slack / ChatOps notifications; unset by
   default and degrades cleanly to GitHub + email with zero behavior change.
