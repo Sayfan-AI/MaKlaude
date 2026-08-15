@@ -45,7 +45,7 @@ down about `genesis serve` disabling every workflow). Planning reads this table.
 | M3 | Diagnosis & root-cause (read-only) | done |
 | M4 | Gated remediation | done |
 | M5 | Trust-earned safe-action allowlist | done |
-| M6 | **Chaos engineering** | next |
+| M6 | **Chaos engineering** | in progress |
 | M7 | Extensibility packs | high-level |
 | M8 | Hardening & operator UX | high-level |
 

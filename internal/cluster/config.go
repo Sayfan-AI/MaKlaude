@@ -53,6 +53,11 @@ type Spec struct {
 	Kubeconfig string `yaml:"kubeconfig"`
 	// Context is the name of the kubeconfig context to use for this cluster.
 	Context string `yaml:"context"`
+	// Chaos is the optional, explicit acknowledgement that MaKlaude may
+	// deliberately break this cluster (Milestone 6). Omitted — which is every
+	// config written before that milestone — the cluster is not chaos-eligible
+	// and no chaos capability can be obtained for it. See [ChaosEligibility].
+	Chaos *ChaosEligibility `yaml:"chaos"`
 }
 
 // LoadConfig reads and parses the YAML configuration file at path. It does not

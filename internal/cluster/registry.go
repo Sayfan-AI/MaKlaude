@@ -21,6 +21,13 @@ type Handle struct {
 	name       string
 	kubeconfig string
 	context    string
+	// chaosAcknowledgement holds the verified acknowledgement sentence for a
+	// chaos-eligible cluster, and is empty for every other cluster. It is
+	// unexported and has no accessor on purpose: the only thing that reads it is
+	// [Handle.ChaosTarget], which mints a capability token. Exposing it (or a
+	// bool derived from it) would re-create the caller-must-check surface the
+	// token exists to eliminate.
+	chaosAcknowledgement string
 }
 
 // Name returns the unique name of the cluster.
@@ -34,9 +41,18 @@ func (h *Handle) Kubeconfig() string { return h.kubeconfig }
 func (h *Handle) Context() string { return h.context }
 
 // String returns a short, secret-free description of the handle suitable for
-// logs. It never includes credentials — only the name, path, and context.
+// logs. It never includes credentials — only the name, path, and context, plus a
+// chaos-eligible marker when the cluster carries one.
+//
+// The marker is there so an eligible cluster is visible in a log line rather
+// than only in a config file. It is prose for a human, not an API: code that
+// needs to know asks for a [ChaosTarget] and handles the error.
 func (h *Handle) String() string {
-	return fmt.Sprintf("cluster %q (kubeconfig=%s, context=%s)", h.name, h.kubeconfig, h.context)
+	s := fmt.Sprintf("cluster %q (kubeconfig=%s, context=%s)", h.name, h.kubeconfig, h.context)
+	if h.chaosAcknowledgement != "" {
+		s += " [chaos-eligible]"
+	}
+	return s
 }
 
 // Registry holds the validated set of clusters MaKlaude operates. Handles are
@@ -83,10 +99,15 @@ func NewRegistry(cfg *Config) (*Registry, error) {
 		c := cfg.Clusters[i]
 		// Each Handle gets its own copy of the (resolved) fields — no aliasing
 		// of slices or pointers, so handles are fully isolated.
+		name := strings.TrimSpace(c.Name)
 		h := &Handle{
-			name:       strings.TrimSpace(c.Name),
+			name:       name,
 			kubeconfig: expandPath(strings.TrimSpace(c.Kubeconfig)),
 			context:    strings.TrimSpace(c.Context),
+			// Re-verified here from the spec rather than trusted from
+			// validation — see [resolveChaosEligibility]. Only the resolved
+			// string is kept, so the handle aliases nothing in cfg.
+			chaosAcknowledgement: resolveChaosEligibility(name, c.Chaos),
 		}
 		reg.order = append(reg.order, h.name)
 		reg.handles[h.name] = h
@@ -173,6 +194,18 @@ func (c *Config) Validate() error {
 
 		if strings.TrimSpace(cc.Context) == "" {
 			problems = append(problems, fmt.Sprintf("%s: missing required field 'context'", label))
+		}
+
+		// A `chaos` block that is present but does not verify is an error, not a
+		// silent downgrade to ineligible. Both outcomes are safe — neither
+		// grants chaos — but silence would let an operator believe they had
+		// marked a cluster eligible when they had not, and the copy-paste case
+		// this block exists to catch is precisely the one worth saying out loud.
+		// Absence stays silent: it is the default.
+		if cc.Chaos != nil && name != "" {
+			for _, p := range cc.Chaos.problems(name) {
+				problems = append(problems, fmt.Sprintf("%s: %s", label, p))
+			}
 		}
 	}
 
