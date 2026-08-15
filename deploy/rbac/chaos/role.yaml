@@ -1,8 +1,8 @@
 # MaKlaude's chaos Role — the narrowest of the three, and a Role rather than a
 # ClusterRole on purpose.
 #
-# It grants three verbs on one resource in one namespace. Every one of them is a
-# call in internal/chaos/injector.go, and the mapping is exact:
+# It grants four verbs on one resource in one namespace. Every one of them is a
+# call in internal/chaos, and the mapping is exact:
 #
 #   get    podchaos.chaos-mesh.org : Injector.Inject's absence check — the
 #                                    create-shaped precondition. A create has no
@@ -12,8 +12,22 @@
 #   create podchaos.chaos-mesh.org : Injector.Inject — one POST of one CR whose
 #                                    name is derived from the experiment, never
 #                                    server-generated.
+#   list   podchaos.chaos-mesh.org : Reaper.Reap — the sweep that removes objects a
+#                                    dead MaKlaude left behind. It is the only way
+#                                    to find them: a process that was SIGKILLed
+#                                    holds no record of what it created, so the
+#                                    next run has to ask the cluster. See
+#                                    internal/chaos/reaper.go for why enumerating
+#                                    is not the same as owning, and why every
+#                                    listed object is re-checked locally against
+#                                    three independent ownership signals before it
+#                                    is touched.
 #   delete podchaos.chaos-mesh.org : Injector.Remove — teardown, conditioned on the
-#                                    created object's UID.
+#                                    created object's UID. The reaper deletes
+#                                    through this same call rather than a second
+#                                    path, so the UID precondition covers a swept
+#                                    orphan exactly as it covers a deliberate
+#                                    teardown.
 #
 # WHAT IS DELIBERATELY ABSENT:
 #
@@ -23,11 +37,11 @@
 #                                   things; it cannot touch a workload itself.
 #                                   `kubectl auth can-i` proves it (see
 #                                   docs/chaos.md) and the e2e job asserts it (T8).
-#   - list / watch                : the reaper that sweeps orphaned experiments
-#                                   (T3) will need `list`. It does not exist yet,
-#                                   so the verb is not granted yet. A role that
-#                                   grants what the code will need next is a role
-#                                   nobody can audit against the code.
+#   - watch                       : the reaper is a poll on a schedule, not a
+#                                   controller. Nothing here reacts to an
+#                                   experiment changing — an experiment is created
+#                                   and deleted, and its status in between is Chaos
+#                                   Mesh's business.
 #   - update / patch              : an experiment is created and deleted, never
 #                                   edited. Editing a live experiment would change
 #                                   a fault while it runs, so the outcome MaKlaude
@@ -35,7 +49,14 @@
 #   - deletecollection            : one request that removes every experiment. The
 #                                   scope guard pins an exact object path and so
 #                                   cannot express it; this role does not grant it
-#                                   either, so the guard and the RBAC agree.
+#                                   either, so the guard and the RBAC agree. Note
+#                                   this is what the reaper would have been if it
+#                                   were written the obvious way, and why it is
+#                                   not: a sweep deletes objects ONE AT A TIME,
+#                                   each addressed by name and conditioned on its
+#                                   UID, because a shared Chaos Mesh holds a
+#                                   human's own experiments too and a bulk delete
+#                                   cannot tell them apart.
 #   - other chaos-mesh.org kinds  : networkchaos, stresschaos, iochaos, schedules,
 #                                   workflows — none granted. internal/chaos has a
 #                                   closed one-kind catalog, and adding a kind
@@ -73,4 +94,4 @@ rules:
   - apiGroups: ["chaos-mesh.org"]
     resources:
       - podchaos
-    verbs: ["get", "create", "delete"]
+    verbs: ["get", "list", "create", "delete"]

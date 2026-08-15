@@ -1,0 +1,38 @@
+# A chaos experiment MaKlaude did not create, standing in for the operator's own.
+#
+# This is the negative control for the reaper, and it is deliberately the HARDEST
+# negative available rather than an obviously-foreign object. It carries MaKlaude's
+# exact ownership labels — so it comes back from the reaper's server-side label
+# selector — and it sits in MaKlaude's own chaos namespace. The only thing that
+# distinguishes it is what a human cannot accidentally reproduce: its name is not one
+# [chaos.Experiment.ObjectName] derives, and it carries no
+# chaos.maklaude.dev/cluster annotation naming this cluster.
+#
+# If the reaper ever deletes this object, the failure in production is MaKlaude
+# cancelling an engineer's experiment mid-run on a shared Chaos Mesh — which is worse
+# than the leak the reaper exists to prevent, and is why the labels here are the
+# matching ones instead of a token difference that would let a weaker ownership test
+# pass.
+#
+# The selector matches nothing on purpose: this object exists to be enumerated and
+# left alone, not to break anything. It names a namespace no seed creates, so Chaos
+# Mesh finds no target and the experiment stays inert while the object persists,
+# which is exactly the state a leaked-looking CR is in.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: operator-own-experiment
+  namespace: maklaude-chaos
+  labels:
+    app.kubernetes.io/name: maklaude
+    app.kubernetes.io/component: chaos
+    app.kubernetes.io/managed-by: maklaude
+spec:
+  action: pod-failure
+  mode: all
+  duration: 5m
+  selector:
+    namespaces:
+      - maklaude-chaos-no-such-namespace
+    labelSelectors:
+      scenario: nothing-matches-this

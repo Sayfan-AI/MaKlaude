@@ -612,3 +612,230 @@ jobs:
           if [ -n "${AUDIT_LOG_DIR:-}" ] && [ -f "${AUDIT_LOG_DIR}/audit.log" ]; then
             grep "system:serviceaccount:maklaude:maklaude" "${AUDIT_LOG_DIR}/audit.log" | tail -50 || true
           fi
+
+  # ---------------------------------------------------------------------------
+  # Milestone 6, T3: the chaos experiment lifecycle against a real Chaos Mesh.
+  #
+  # A SEPARATE job with its own kind cluster, not extra steps on the one above,
+  # for a reason that is about signal rather than tidiness. The job above asserts
+  # that MaKlaude detects faults and converges the workloads it remediates; this
+  # one deliberately makes pods unavailable. Sharing a cluster would let one
+  # test's fault become another's flake, and the resulting red check would read
+  # as a remediation bug. The two also install different things — this cluster
+  # gets a fault injector with cluster-wide privileges of its own — and keeping
+  # that off the remediation cluster keeps the zero-writes and convergence proofs
+  # above exactly as narrow as they were.
+  #
+  # It gates merges like every other check here. "Installs reproducibly on kind
+  # in CI and locally" is one of T3's done criteria, and the only thing that can
+  # hold it is the install running on every PR through the same script `task
+  # chaos:install` runs locally.
+  # ---------------------------------------------------------------------------
+  chaos:
+    name: chaos on kind
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # No audit-policy mount here. The audit log exists to prove the OBSERVATION
+      # identity sent no mutating verb, which the job above proves on the cluster
+      # that matters for it. This cluster's whole purpose is mutating requests
+      # from the chaos identity, so the same log would be a list of the writes
+      # this job is asserting happen.
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.10.0
+        with:
+          version: ${{ env.KIND_VERSION }}
+          node_image: ${{ env.KIND_NODE_IMAGE }}
+          cluster_name: ${{ env.CLUSTER_NAME }}-chaos
+          wait: 120s
+
+      # Both bundles. The chaos bundle is what the test authenticates as; the
+      # read-only bundle is only used to corroborate that a fault visibly landed,
+      # and having it here is also what proves the two identities stay separate on
+      # a cluster where chaos is live (the chaos SA cannot read a pod, so the
+      # observation has to come from somewhere else).
+      - name: Apply the read-only and chaos RBAC bundles
+        run: |
+          set -euo pipefail
+          kubectl apply -k deploy/rbac
+          kubectl apply -k deploy/rbac/chaos
+          kubectl -n maklaude get serviceaccount maklaude
+          kubectl -n maklaude get serviceaccount maklaude-chaos
+
+      # The same script `task chaos:install` runs. Pinned chart version, kind's
+      # containerd socket, and a wait that covers both the Deployments being ready
+      # and the CRD plus admission webhook actually serving — because what runs
+      # next creates a PodChaos, and a race here would read as a flaky test rather
+      # than as an install that had not finished.
+      - name: Install Chaos Mesh
+        run: task chaos:install
+
+      # Now that the CRD exists, discovery can resolve `podchaos`, so these use
+      # plain `kubectl auth can-i`. The job above asserts the same grants through
+      # SubjectAccessReviews precisely because it has no CRD; this is the
+      # complementary check that the Role works against a real resource type.
+      #
+      # `list` is the verb T3 added, and it is the one worth asserting most
+      # carefully: it is what the reaper needs, and granting it is what makes a
+      # sweep possible at all.
+      - name: Verify the chaos Role against the real CRD
+        run: |
+          set -euo pipefail
+          CHAOS=system:serviceaccount:maklaude:maklaude-chaos
+          SA=system:serviceaccount:maklaude:maklaude
+          echo "Grants for $CHAOS in maklaude-chaos:"
+          kubectl auth can-i --list --as="$CHAOS" -n maklaude-chaos || true
+
+          fail=0
+          assert_yes() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" != "yes" ]; then
+              echo "::error::expected ALLOWED but denied: $*"; fail=1
+            fi
+          }
+          assert_no() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" = "yes" ]; then
+              echo "::error::expected DENIED but allowed: $*"; fail=1
+            fi
+          }
+
+          # The injector's and reaper's exact call set, in the one namespace
+          # experiment objects live.
+          assert_yes get    podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_yes list   podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_yes create podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_yes delete podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+
+          # Adding `list` must not have widened anything else.
+          assert_no  watch            podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_no  deletecollection podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_no  update           podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_no  patch            podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+          assert_no  list             podchaos.chaos-mesh.org --as="$CHAOS" -n default
+          assert_no  create           networkchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
+
+          # The chaos identity still cannot touch a workload itself: Chaos Mesh
+          # does the killing, with its own privileges, and that boundary is the
+          # reason for a third identity.
+          assert_no  list   pods --as="$CHAOS" -A
+          assert_no  delete pods --as="$CHAOS" -A
+          assert_no  get    secrets --as="$CHAOS" -A
+
+          # And the observation identity gained no chaos from any of this.
+          assert_no  create podchaos.chaos-mesh.org --as="$SA" -n maklaude-chaos
+          assert_no  list   podchaos.chaos-mesh.org --as="$SA" -n maklaude-chaos
+          assert_yes list   pods --as="$SA" -A
+
+          [ "$fail" -eq 0 ] || { echo "chaos Role assertions failed against the real CRD"; exit 1; }
+          echo "The chaos Role is exactly the injector's and reaper's call set."
+
+      - name: Seed the chaos target workload
+        run: |
+          set -euo pipefail
+          kubectl apply -f test/e2e/manifests/chaos-target.yaml
+          kubectl -n maklaude-chaos-target rollout status deployment/victim --timeout=180s
+          kubectl -n maklaude-chaos-target get pods -o wide
+
+      # The reaper's negative control: an experiment MaKlaude did not create,
+      # wearing MaKlaude's own ownership labels. If a sweep ever deletes it, the
+      # production equivalent is MaKlaude cancelling an engineer's experiment
+      # mid-run on a shared Chaos Mesh.
+      - name: Seed the operator's own experiment (the reaper must not touch it)
+        run: |
+          set -euo pipefail
+          kubectl apply -f test/e2e/manifests/chaos-foreign.yaml
+          kubectl -n maklaude-chaos get podchaos operator-own-experiment
+
+      - name: Mint the chaos and read-only ServiceAccount kubeconfigs
+        run: |
+          set -euo pipefail
+          CTX="${CLUSTER_NAME}-chaos"
+          SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+          kubectl config view --minify --raw \
+            -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > "${RUNNER_TEMP}/ca.crt"
+
+          # Two separate files with two separate credentials, for the same reason
+          # the job above keeps the executor's apart from the observer's: a mix-up
+          # must fail as "no such credential" rather than silently test the wrong
+          # identity.
+          mint() {
+            sa="$1"; out="$2"
+            token=$(kubectl -n maklaude create token "$sa" --duration=1h)
+            kubectl --kubeconfig "$out" config set-cluster "$CTX" \
+              --server="$SERVER" --certificate-authority="${RUNNER_TEMP}/ca.crt" --embed-certs=true
+            kubectl --kubeconfig "$out" config set-credentials "$sa" --token="$token"
+            kubectl --kubeconfig "$out" config set-context "$CTX" --cluster="$CTX" --user="$sa"
+            kubectl --kubeconfig "$out" config use-context "$CTX"
+            chmod 600 "$out"
+          }
+
+          mint maklaude-chaos "${RUNNER_TEMP}/maklaude-chaos.kubeconfig"
+          mint maklaude       "${RUNNER_TEMP}/maklaude-sa.kubeconfig"
+
+          echo "MAKLAUDE_E2E_CHAOS_KUBECONFIG=${RUNNER_TEMP}/maklaude-chaos.kubeconfig" >> "$GITHUB_ENV"
+          echo "MAKLAUDE_E2E_KUBECONFIG=${RUNNER_TEMP}/maklaude-sa.kubeconfig" >> "$GITHUB_ENV"
+          echo "MAKLAUDE_E2E_CONTEXT=${CTX}" >> "$GITHUB_ENV"
+
+      - name: Run the chaos lifecycle e2e (create -> observe -> terminate -> sweep)
+        env:
+          MAKLAUDE_E2E_CHAOS_KUBECONFIG: ${{ env.MAKLAUDE_E2E_CHAOS_KUBECONFIG }}
+          MAKLAUDE_E2E_KUBECONFIG: ${{ env.MAKLAUDE_E2E_KUBECONFIG }}
+          MAKLAUDE_E2E_CONTEXT: ${{ env.MAKLAUDE_E2E_CONTEXT }}
+        run: task e2e:chaos
+
+      # The milestone's worst outcome, asserted on the way out rather than assumed:
+      # nothing of MaKlaude's is left on the cluster, and the operator's own
+      # experiment still is. This runs `always()` so it reports on a failed run
+      # too — a leak is most likely precisely when a test failed partway through,
+      # and that is the case a passing-run-only check would never see.
+      - name: Assert no MaKlaude experiment leaked
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "=== every PodChaos on the cluster ==="
+          kubectl get podchaos -A -o wide || true
+
+          leaked=$(kubectl get podchaos -A \
+            -l app.kubernetes.io/managed-by=maklaude,app.kubernetes.io/component=chaos \
+            -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' \
+            | grep -E '/maklaude-[a-z0-9]+-[0-9a-f]{12}$' || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::MaKlaude experiments outlived the run:"
+            echo "$leaked"
+            exit 1
+          fi
+          echo "No MaKlaude-derived experiment objects remain."
+
+          # The other half: the sweep must not have taken the operator's with it.
+          if ! kubectl -n maklaude-chaos get podchaos operator-own-experiment >/dev/null 2>&1; then
+            echo "::error::the operator's own experiment is gone; a sweep deleted an experiment MaKlaude did not create"
+            exit 1
+          fi
+          echo "The operator's own experiment is untouched."
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== chaos-mesh pods ==="
+          kubectl -n chaos-mesh get pods -o wide || true
+          kubectl -n chaos-mesh describe pods || true
+          echo "=== chaos-mesh controller logs ==="
+          kubectl -n chaos-mesh logs -l app.kubernetes.io/component=controller-manager --tail=200 || true
+          echo "=== experiments ==="
+          kubectl get podchaos -A -o yaml || true
+          echo "=== target workload ==="
+          kubectl -n maklaude-chaos-target get deployments,pods -o wide || true
+          kubectl -n maklaude-chaos-target describe pods || true

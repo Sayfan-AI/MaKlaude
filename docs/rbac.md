@@ -12,7 +12,7 @@ is the point:
 | ------ | -------- | ------ | ------------ |
 | [`deploy/rbac/`](../deploy/rbac/) | `maklaude` | `get`/`list`/`watch` on a fixed resource set — **no mutating verb anywhere** | `kubectl apply -k deploy/rbac` |
 | [`deploy/rbac/write/`](../deploy/rbac/write/) — optional | `maklaude-executor` | the same reads, **plus** exactly three mutating verbs | `kubectl apply -k deploy/rbac/write` |
-| [`deploy/rbac/chaos/`](../deploy/rbac/chaos/) — optional | `maklaude-chaos` | `get`/`create`/`delete` on Chaos Mesh custom resources in **one** namespace, and nothing else | `kubectl apply -k deploy/rbac/chaos` |
+| [`deploy/rbac/chaos/`](../deploy/rbac/chaos/) — optional | `maklaude-chaos` | `get`/`list`/`create`/`delete` on Chaos Mesh custom resources in **one** namespace, and nothing else | `kubectl apply -k deploy/rbac/chaos` |
 
 Install only the first and MaKlaude provably cannot change anything: everything
 that watches, collects, detects, correlates, diagnoses, and proposes runs as
@@ -339,10 +339,14 @@ Two things differ from the write bundle above, both deliberate:
   where experiment objects live. So the grant can't follow the identity into another
   namespace, and `kubectl get podchaos -n maklaude-chaos` is the complete list of
   what MaKlaude has outstanding on the cluster.
-- **It gets no reads at all** — not even the additive `maklaude-readonly` binding
-  the executor needs. The chaos path re-reads only its own custom resources.
-  Everything MaKlaude observes about a cluster it has broken, it observes through
-  the observation identity.
+- **It gets no reads of any workload** — not even the additive `maklaude-readonly`
+  binding the executor needs. The two reads it does have, `get` and `list`, cover only
+  its own custom resources: `get` is the create-shaped precondition (a create has no
+  `resourceVersion` to condition on, so the guard is "no experiment with this derived
+  name is live"), and `list` is how the reaper finds objects a *killed* run left behind
+  — a process that was `SIGKILL`ed holds no record of what it created, so the next run
+  has to ask the cluster. Everything MaKlaude observes about a cluster it has broken,
+  it observes through the observation identity.
 
 ```bash
 kubectl apply -k deploy/rbac         # required first: reads + the maklaude SA
@@ -365,7 +369,8 @@ All three bundles assemble cleanly under `kubectl kustomize`, and their contents
 asserted by the unit suite in [`test/rbac/`](../test/rbac/), which runs on every
 PR without needing a cluster: `maklaude-readonly` grants **no** mutating verb,
 `maklaude-write` grants **exactly** the executor's three, the chaos `Role` grants
-**exactly** the injector's three and is namespaced rather than cluster-wide, no
+**exactly** the four calls `internal/chaos` makes and is namespaced rather than
+cluster-wide, no
 binding hands a mutating or chaos role to another identity, and the base
 kustomization pulls in neither delta (nor does either delta pull in the other).
 

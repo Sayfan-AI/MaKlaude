@@ -357,3 +357,189 @@ func TestKindResource_AgreesWithTheActionCatalog(t *testing.T) {
 		}
 	}
 }
+
+// minimalFor builds a minimal valid experiment for any action in the catalog,
+// supplying a duration for exactly the actions whose fault needs one. The tests below
+// are written over the CATALOG rather than over the two actions that exist today, so
+// an action added later inherits every assertion instead of being exempt from it by
+// omission.
+func minimalFor(action Action) Experiment {
+	e := podKill()
+	e.Action = action
+	if actionKinds[action].selfLimit == SelfLimitServerDuration {
+		e.Duration = 30 * time.Second
+	}
+	return e
+}
+
+// TestEveryActionDeclaresASelfLimit is THE set guard for Milestone 6's load-bearing
+// property: nothing survives the process.
+//
+// The dangerous action is one whose fault PERSISTS and whose end depends on MaKlaude
+// coming back to request it, because a process can be SIGKILLed between the create
+// and the teardown. The zero value of [SelfLimit] belongs to no action, so adding a
+// catalog entry without saying how its fault ends on its own fails here — the check
+// is on the SET, not on the two members that happen to exist, which is the only shape
+// that holds for code nobody has written yet.
+func TestEveryActionDeclaresASelfLimit(t *testing.T) {
+	if len(actionKinds) == 0 {
+		t.Fatal("the action catalog is empty, so this guard would pass vacuously")
+	}
+	for action, spec := range actionKinds {
+		switch spec.selfLimit {
+		case SelfLimitServerDuration, SelfLimitInstant:
+			// Declared.
+		default:
+			t.Errorf("action %q declares no self-limit (%s): state how its fault ends without MaKlaude, "+
+				"or the only thing that ends it is a process that can be killed",
+				action, spec.selfLimit)
+		}
+	}
+}
+
+// TestEveryActionsDurationRuleFollowsItsSelfLimit proves the declaration is enforced
+// rather than decorative, in both directions, for every action in the catalog:
+// mandatory and bounded where the fault persists, refused where the controller would
+// ignore it.
+//
+// The bound is checked at its exact edge on both sides. An off-by-one at the ceiling
+// is the mistake that would let a fault run longer than the reaper's grace assumes is
+// impossible, and that grace is what makes a sweep unable to touch a live experiment
+// (see [NewReaper]).
+func TestEveryActionsDurationRuleFollowsItsSelfLimit(t *testing.T) {
+	for action, spec := range actionKinds {
+		t.Run(string(action), func(t *testing.T) {
+			if err := minimalFor(action).Validate(); err != nil {
+				t.Fatalf("the minimal experiment for %q must be valid, got: %v", action, err)
+			}
+
+			switch spec.selfLimit {
+			case SelfLimitServerDuration:
+				noDuration := minimalFor(action)
+				noDuration.Duration = 0
+				assertInvalid(t, noDuration, "requires a positive duration")
+
+				atCeiling := minimalFor(action)
+				atCeiling.Duration = MaxDuration()
+				if err := atCeiling.Validate(); err != nil {
+					t.Errorf("a duration exactly at the ceiling must be allowed, got: %v", err)
+				}
+
+				overCeiling := minimalFor(action)
+				overCeiling.Duration = MaxDuration() + time.Nanosecond
+				assertInvalid(t, overCeiling, "exceeds the maximum")
+
+			case SelfLimitInstant:
+				withDuration := minimalFor(action)
+				withDuration.Duration = time.Second
+				assertInvalid(t, withDuration, "must not be set")
+			}
+		})
+	}
+}
+
+// assertInvalid fails unless e is refused with [ErrInvalidExperiment] and a message
+// containing want.
+func assertInvalid(t *testing.T, e Experiment, want string) {
+	t.Helper()
+	err := e.Validate()
+	if !errors.Is(err, ErrInvalidExperiment) {
+		t.Fatalf("expected ErrInvalidExperiment, got %v", err)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("message %q does not mention %q", err.Error(), want)
+	}
+}
+
+// TestSelfLimitDecidesWhetherTheObjectCarriesADuration closes the gap between what
+// the validator demands and what actually goes on the wire.
+//
+// The two could disagree — a duration required by the validator and dropped from the
+// body, or set in the body for an action the controller applies once — and either
+// failure is invisible from the CR alone: the API server accepts both, and the second
+// tells a human triaging an incident that a fault self-reverts when it will not.
+func TestSelfLimitDecidesWhetherTheObjectCarriesADuration(t *testing.T) {
+	for action, spec := range actionKinds {
+		t.Run(string(action), func(t *testing.T) {
+			e := minimalFor(action)
+			spec2 := e.object("kind-lab", "ack").Object["spec"].(map[string]any)
+			got, present := spec2["duration"]
+
+			switch spec.selfLimit {
+			case SelfLimitServerDuration:
+				if !present {
+					t.Fatalf("action %q persists until Chaos Mesh reverts it, so spec.duration must be on the object", action)
+				}
+				if got != e.Duration.String() {
+					t.Errorf("spec.duration = %v, want the Go duration string %q", got, e.Duration.String())
+				}
+			case SelfLimitInstant:
+				if present {
+					t.Errorf("action %q is one-shot and Chaos Mesh ignores spec.duration, so it must be absent, got %v", action, got)
+				}
+			}
+
+			if e.SelfLimit() != spec.selfLimit {
+				t.Errorf("Experiment.SelfLimit() = %v, want %v", e.SelfLimit(), spec.selfLimit)
+			}
+		})
+	}
+}
+
+// TestObjectCarriesEveryOwnershipLabel ties the injector's stamp to the reaper's
+// ownership test.
+//
+// These are two files that must agree, and the failure if they drift is silent in the
+// worst direction: the reaper would stop recognising MaKlaude's own experiments and
+// report a clean sweep while every one of them leaked. Dropping a label from
+// [Experiment.object] fails here rather than in production six weeks later.
+func TestObjectCarriesEveryOwnershipLabel(t *testing.T) {
+	for action := range actionKinds {
+		e := minimalFor(action)
+		meta := e.object("kind-lab", "ack").Object["metadata"].(map[string]any)
+		objLabels, ok := meta["labels"].(map[string]any)
+		if !ok {
+			t.Fatalf("action %q: the object carries no labels", action)
+		}
+		for key, want := range ownershipLabels {
+			if got := objLabels[key]; got != want {
+				t.Errorf("action %q: label %s = %v, want %q (the reaper decides ownership on it)", action, key, got, want)
+			}
+		}
+		annotations := meta["annotations"].(map[string]any)
+		if annotations[keyPrefix+"cluster"] != "kind-lab" {
+			t.Errorf("action %q: the cluster annotation must name the cluster, got %v", action, annotations[keyPrefix+"cluster"])
+		}
+	}
+}
+
+// TestDerivedNameShape_MatchesWhatTheInjectorProduces is the other half of that
+// agreement: the reaper's third ownership signal is that a name looks derived, and the
+// pattern has to match every name the derivation actually produces.
+//
+// It also asserts the negatives, which are the point of the signal — a hand-written
+// name and a Chaos-Mesh-generated one must not match, because that is what stops a
+// sweep from deleting a human's own experiment.
+func TestDerivedNameShape_MatchesWhatTheInjectorProduces(t *testing.T) {
+	for action := range actionKinds {
+		name := minimalFor(action).ObjectName()
+		if !derivedNameShape.MatchString(name) {
+			t.Errorf("action %q: derived name %q does not match the reaper's shape %s", action, name, derivedNameShape)
+		}
+	}
+
+	for _, name := range []string{
+		"my-test-chaos",                      // a human's own experiment
+		"maklaude-podchaos",                  // prefix only, no digest
+		"maklaude-podchaos-",                 // empty digest
+		"maklaude-podchaos-notahexdigest",    // right length, not hex
+		"maklaude-podchaos-abc",              // too short
+		"maklaude-podchaos-0123456789abcdef", // too long
+		"chaos-mesh-podchaos-0123456789ab",   // MaKlaude's digest shape, someone else's prefix
+		"maklaude-podchaos-0123456789ab-x",   // trailing junk
+	} {
+		if derivedNameShape.MatchString(name) {
+			t.Errorf("name %q must NOT look MaKlaude-derived; a sweep would delete it", name)
+		}
+	}
+}

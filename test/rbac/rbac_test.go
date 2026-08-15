@@ -418,26 +418,34 @@ func TestBaseBundleDoesNotIncludeTheWriteDelta(t *testing.T) {
 	}
 }
 
-// TestChaosRoleGrantsExactlyTheInjectorCatalog pins the chaos Role to the three
-// calls in internal/chaos/injector.go, in both directions. A missing grant means an
-// experiment fails at the API server with a confusing Forbidden; an extra grant
-// means the chaos identity holds authority no code path exercises, which is
-// precisely the authority a later bug finds.
+// TestChaosRoleGrantsExactlyTheInjectorCatalog pins the chaos Role to the four calls
+// in internal/chaos, in both directions. A missing grant means an experiment fails at
+// the API server with a confusing Forbidden; an extra grant means the chaos identity
+// holds authority no code path exercises, which is precisely the authority a later bug
+// finds.
 //
-// Note what is NOT here: `list`. The reaper that sweeps orphaned experiments (T3)
-// will need it and does not exist yet, and a role that grants what the code will
-// need next is a role nobody can audit against the code.
+// `list` arrived with the reaper (T3, issue #192) and not before. That timing is the
+// convention this test enforces: the grant and the call that issues it land in one
+// change, so the Role is auditable against the code at every commit rather than
+// describing a future one. Note also what `list` did NOT bring with it — `watch`,
+// because the reaper polls on a schedule rather than reconciling, and
+// `deletecollection`, which is what a sweep would be if it were written the obvious
+// way. A sweep deletes one object at a time, each conditioned on its UID, because a
+// shared Chaos Mesh holds a human's own experiments and a bulk delete cannot tell them
+// apart.
 func TestChaosRoleGrantsExactlyTheInjectorCatalog(t *testing.T) {
 	role := namespacedRole(t, loadManifests(t, chaosDir), chaosSA)
 
-	// One entry per Injector call:
+	// One entry per call in internal/chaos:
 	//   Inject's absence check -> get    podchaos.chaos-mesh.org
 	//   Inject                 -> create podchaos.chaos-mesh.org
 	//   Remove                 -> delete podchaos.chaos-mesh.org
+	//   Reaper.Reap            -> list   podchaos.chaos-mesh.org
 	want := map[grant]bool{
 		{group: "chaos-mesh.org", resource: "podchaos", verb: "get"}:    true,
 		{group: "chaos-mesh.org", resource: "podchaos", verb: "create"}: true,
 		{group: "chaos-mesh.org", resource: "podchaos", verb: "delete"}: true,
+		{group: "chaos-mesh.org", resource: "podchaos", verb: "list"}:   true,
 	}
 	got := grantsOfRules(role.Rules)
 
@@ -513,7 +521,9 @@ func TestChaosRoleExcludesTheWorkloadItBreaks(t *testing.T) {
 		{grant{"", "pods", "list"}, "same: the chaos identity re-reads only its own custom resources"},
 		{grant{"apps", "deployments", "patch"}, "that is the executor's catalog, under a different identity and a human approval"},
 		{grant{"", "nodes", "patch"}, "cordoning is remediation, not chaos"},
-		{grant{"chaos-mesh.org", "podchaos", "deletecollection"}, "one request would remove every experiment; the WriteScope pins an exact object path and cannot express it"},
+		{grant{"chaos-mesh.org", "podchaos", "deletecollection"}, "one request would remove every experiment; the WriteScope pins an exact object path and cannot express it, and a sweep deletes one object at a time so a human's own experiment cannot be caught in it"},
+		{grant{"chaos-mesh.org", "podchaos", "watch"}, "the reaper polls on a schedule; nothing here reconciles on an experiment changing, and a fault's status while it runs is Chaos Mesh's business"},
+		{grant{"chaos-mesh.org", "networkchaos", "list"}, "list arrived for the reaper over the closed one-kind catalog, not for the group"},
 		{grant{"chaos-mesh.org", "podchaos", "update"}, "an experiment is created and deleted, never edited — editing a live fault would change what MaKlaude is measuring"},
 		{grant{"chaos-mesh.org", "podchaos", "patch"}, "same as update"},
 		{grant{"chaos-mesh.org", "networkchaos", "create"}, "internal/chaos has a closed one-kind catalog; adding a kind means adding it here in the same change"},
