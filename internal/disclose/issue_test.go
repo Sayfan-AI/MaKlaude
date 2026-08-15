@@ -9,6 +9,8 @@ import (
 	"github.com/Sayfan-AI/MaKlaude/internal/autonomy"
 	"github.com/Sayfan-AI/MaKlaude/internal/budget"
 	"github.com/Sayfan-AI/MaKlaude/internal/execute"
+	"github.com/Sayfan-AI/MaKlaude/internal/redact"
+	"github.com/Sayfan-AI/MaKlaude/internal/remediate"
 )
 
 // These tests assert what a PERSON reads, because for an unattended action that is the
@@ -174,6 +176,68 @@ func TestBody_KeepsTheStructuredIdentifiersLegible(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("redaction removed the structured identifier %q", want)
 		}
+	}
+}
+
+// TestBody_PublishesTheFixFingerprintComparably is the regression test for issue #185.
+//
+// It asserts the operation the fingerprint exists for rather than its presence: a
+// blanked token is still *there*, so "the body mentions a fingerprint" passes on the
+// bug. What has to hold is that two artifacts for two different fixes can be told apart
+// by eye, which is the whole of the invalidation model's audit story — and the reason
+// the citation alone cannot carry it, since [redact.String]'s high-entropy sweep
+// collapses every digest to one placeholder.
+func TestBody_PublishesTheFixFingerprintComparably(t *testing.T) {
+	approved := earnedAction()
+
+	// A changed fix, changed the way an invalidation actually happens: the operation is
+	// a fingerprint input, so this is a different act on the same object.
+	changed := earnedAction()
+	changed.Proposal.Operation = remediate.OpRollbackRevision
+
+	for _, a := range []Action{approved, changed} {
+		fp := a.Proposal.Fingerprint().String()
+		if !strings.Contains(Body(a), fp) {
+			t.Fatalf("the artifact does not publish the fix fingerprint %q, so nothing on it identifies which fix the cached approval covered:\n%s", fp, Body(a))
+		}
+	}
+
+	before, after := approved.Proposal.Fingerprint().String(), changed.Proposal.Fingerprint().String()
+	if before == after {
+		t.Fatalf("fixture bug: both actions fingerprint to %q, so this test cannot observe a fix changing", before)
+	}
+	if strings.Contains(Body(approved), after) || strings.Contains(Body(changed), before) {
+		t.Error("the two artifacts render each other's fingerprints, so a reader comparing them cannot tell a fix that changed from one that did not")
+	}
+}
+
+// TestBody_StillRedactsTheCitationsCopyOfTheFingerprint is the other side of #185: the
+// fix publishes the token structurally and must NOT have reached for the redactor to do
+// it. [internal/redact] is shared, and its sweep is the reason a leaked credential in a
+// free-text citation never reaches a world-readable artifact — so the sweep staying
+// exactly as blunt as it was is part of this fix, not collateral.
+func TestBody_StillRedactsTheCitationsCopyOfTheFingerprint(t *testing.T) {
+	a := earnedAction()
+	fp := a.Proposal.Fingerprint().String()
+	digest := fp[strings.LastIndex(fp, ":")+1:]
+	a.Verdict.Evidence = "3 approved executions of " + fp + " converged"
+
+	// Scoped to the quoted citation line, because the body now legitimately carries the
+	// token elsewhere — asserting over the whole body would be the bug this test guards
+	// against, read backwards.
+	var citation string
+	for _, line := range strings.Split(Body(a), "\n") {
+		if strings.HasPrefix(line, "> ") && strings.Contains(line, "approved executions") {
+			citation = line
+		}
+	}
+	switch {
+	case citation == "":
+		t.Fatalf("the artifact no longer quotes the trust citation at all:\n%s", Body(a))
+	case strings.Contains(citation, digest):
+		t.Errorf("the citation published a high-entropy digest, so the sweep was weakened for every caller of redact: %s", citation)
+	case !strings.Contains(citation, redact.Placeholder):
+		t.Errorf("the citation's copy of the fingerprint was neither swept nor published, so the sweep's behaviour here is no longer pinned: %s", citation)
 	}
 }
 
