@@ -163,22 +163,30 @@ func TestE2E_UnattendedAutonomy(t *testing.T) {
 	// object no phase is allowed to touch.
 	untouched := captureBeforeAutonomy(t, reader)
 
-	// --- (a) No trust history: the proposal is eligible and still goes to a human. ---
-	assertUntrustedShapeGates(t, reg, reader, blast)
+	// Every phase that seeds a trust history needs the fingerprint of the fix it is
+	// seeding for, and the fingerprints are read off real proposals rather than built
+	// here. See [discoverFingerprints]. This runs before (a) because it must observe
+	// the cluster in the state the later phases will propose against, and it is safe to
+	// run first because an empty ledger trusts nothing.
+	fps := discoverFingerprints(t, reg)
 
-	// --- (b) Seeded trust history: the same shape runs unattended and converges. ---
-	//         The same pass also carries (c)'s first half: `offlimits` has the same
-	//         trusted shape, is proposed, and is not covered by the rule.
-	assertEarnedTrustAutoApplies(t, reg, reader, collector, blast)
+	// --- (a) No trust history: the proposal is eligible and still goes to a human. ---
+	assertUntrustedShapeGates(t, reg, reader, blast, fps)
+
+	// --- (b) Seeded trust history: the same fix runs unattended and converges. ---
+	//         The same pass also carries (c)'s first half: `offlimits` is proposed and
+	//         its fix is trusted too, so the rule's namespace bound is the ONLY thing
+	//         holding it back. Seeding only `earned` here would make that half vacuous.
+	assertEarnedTrustAutoApplies(t, reg, reader, collector, blast, fps)
 
 	// --- (c) A ruleset that tries to permit an irreversible action grants nothing. ---
-	assertInvalidRulesetGrantsNothing(t, reg, reader, blast)
+	assertInvalidRulesetGrantsNothing(t, reg, reader, blast, fps)
 
 	// --- (d) A failed auto-apply trips the breaker and re-gates the shape. ---
-	assertFailedAutoApplyTripsBreaker(t, reg, blast)
+	assertFailedAutoApplyTripsBreaker(t, reg, blast, fps)
 
 	// --- (d, continued) The tripped breaker stops the NEXT pass. ---
-	assertTrippedBreakerSuppressesTheNextPass(t, reg, blast)
+	assertTrippedBreakerSuppressesTheNextPass(t, reg, blast, fps)
 
 	// --- (e) Nothing outside the stated bounds was ever written. ---
 	assertNothingOutOfBoundsChanged(t, reader, untouched)
@@ -195,7 +203,7 @@ func TestE2E_UnattendedAutonomy(t *testing.T) {
 // and what a pass with a typo in the namespace produces — so the assertion first
 // requires the rollback of `earned` to be present in the proposals, and only then
 // requires it not to have run.
-func assertUntrustedShapeGates(t *testing.T, reg *cluster.Registry, reader *kube.Client, blast *budget.Budget) {
+func assertUntrustedShapeGates(t *testing.T, reg *cluster.Registry, reader *kube.Client, blast *budget.Budget, fps fingerprints) {
 	t.Helper()
 
 	// An empty ledger, wired as the oracle AND as the demoter, is a cluster on its first
@@ -225,12 +233,12 @@ func assertUntrustedShapeGates(t *testing.T, reg *cluster.Registry, reader *kube
 	}
 
 	// The ledger's own account of why, asserted so the test fails differently when the
-	// shape gates for some unrelated reason.
-	shape := autonomy.Shape{Cluster: executorClusterName, Operation: remediate.OpRollbackRevision}
-	if standing := ledger.Standing(shape); standing.Trusted || standing.Approved != 0 {
-		t.Errorf("the empty ledger reports standing %+v for %s; it must trust nothing", standing, shape)
+	// fix gates for some unrelated reason.
+	subject := fps.subject(t, target(autoNamespace, earnedDeploy))
+	if standing := ledger.Standing(subject); standing.Trusted || standing.Approved != 0 {
+		t.Errorf("the empty ledger reports standing %+v for %+v; it must trust nothing", standing, subject)
 	}
-	t.Logf("untrusted shape %s gated: %s", shape, ledger.Explain(shape))
+	t.Logf("untrusted fix %s gated: %s", subject.Fingerprint, ledger.Explain(subject))
 }
 
 // --- (b) and the first half of (c) ---------------------------------------------------
@@ -245,10 +253,15 @@ func assertUntrustedShapeGates(t *testing.T, reg *cluster.Registry, reader *kube
 // operation, on the very same trust, DID run against the very same cluster isolates the
 // rule as the reason.
 func assertEarnedTrustAutoApplies(t *testing.T, reg *cluster.Registry, reader *kube.Client,
-	collector *health.Collector, blast *budget.Budget) {
+	collector *health.Collector, blast *budget.Budget, fps fingerprints) {
 	t.Helper()
 
-	ledger := seededLedger(t)
+	// Both fixes are trusted. `offlimits` is held back by the rule's namespace bound and
+	// by nothing else, which is the half of (c) this pass carries — seeding only `earned`
+	// would let it pass for the wrong reason.
+	ledger := seededLedger(t, fps,
+		target(autoNamespace, earnedDeploy),
+		target(offLimitsNamespace, offLimitsDeploy))
 	earnedBefore := generationOf(t, reader, autoNamespace, earnedDeploy)
 	offLimitsBefore := generationOf(t, reader, offLimitsNamespace, offLimitsDeploy)
 
@@ -351,7 +364,7 @@ func assertEarnedTrustAutoApplies(t *testing.T, reg *cluster.Registry, reader *k
 // the mistake: three rules' worth of autonomy and no signal. Here the operator's file
 // contains a rule that WOULD have auto-applied `earned`'s sibling fault, the shape is
 // trusted, and the answer is still nothing.
-func assertInvalidRulesetGrantsNothing(t *testing.T, reg *cluster.Registry, reader *kube.Client, blast *budget.Budget) {
+func assertInvalidRulesetGrantsNothing(t *testing.T, reg *cluster.Registry, reader *kube.Client, blast *budget.Budget, fps fingerprints) {
 	t.Helper()
 
 	rules := append(rollbackRule(suppressedRule, offLimitsNamespace), autonomy.Rule{
@@ -366,7 +379,7 @@ func assertInvalidRulesetGrantsNothing(t *testing.T, reg *cluster.Registry, read
 		t.Fatal("a ruleset permitting irreversible actions validated; the configuration surface no longer refuses the one setting it must")
 	}
 
-	ledger := seededLedger(t)
+	ledger := seededLedger(t, fps, target(offLimitsNamespace, offLimitsDeploy))
 	before := generationOf(t, reader, offLimitsNamespace, offLimitsDeploy)
 
 	p := runUnattendedPass(t, reg, blast, rules, ledger, ledger,
@@ -404,13 +417,14 @@ func assertInvalidRulesetGrantsNothing(t *testing.T, reg *cluster.Registry, read
 // (this SHAPE stops, on every cluster the ledger covers), and the rollback (the change
 // itself is undone). A regression that dropped any one of them would leave the other
 // two looking like a working failure path.
-func assertFailedAutoApplyTripsBreaker(t *testing.T, reg *cluster.Registry, blast *budget.Budget) {
+func assertFailedAutoApplyTripsBreaker(t *testing.T, reg *cluster.Registry, blast *budget.Budget, fps fingerprints) {
 	t.Helper()
 
-	ledger := seededLedger(t)
-	shape := autonomy.Shape{Cluster: executorClusterName, Operation: remediate.OpRollbackRevision}
-	if !ledger.Trust(shape).Trusted {
-		t.Fatalf("the seeded ledger does not trust %s, so this phase would prove nothing: %s", shape, ledger.Explain(shape))
+	doomed := target(failNamespace, neverReadyDeploy)
+	ledger := seededLedger(t, fps, doomed)
+	subject := fps.subject(t, doomed)
+	if !ledger.Trust(subject).Trusted {
+		t.Fatalf("the seeded ledger does not trust %s, so this phase would prove nothing: %s", doomed, ledger.Explain(subject))
 	}
 
 	p := runUnattendedPass(t, reg, blast, rollbackRule(failingRule, failNamespace), ledger, ledger,
@@ -449,9 +463,17 @@ func assertFailedAutoApplyTripsBreaker(t *testing.T, reg *cluster.Registry, blas
 	// The shape is re-gated in the ledger. This is the demotion as STATE rather than as
 	// a reported flag: the flag says the write was attempted, the standing says it took
 	// effect, and only the second one changes what the next pass may do.
-	standing := ledger.Standing(shape)
+	standing := ledger.Standing(subject)
 	if standing.Trusted || !standing.Blocked {
-		t.Errorf("the failed action left %s trusted (standing %+v); a failure must re-gate the shape", shape, standing)
+		t.Errorf("the failed action left %s trusted (standing %+v); a failure must re-gate the shape", doomed, standing)
+	}
+	// Demotion is scoped to the SHAPE, not to the fix that failed — so the fingerprint
+	// of a DIFFERENT rollback on this cluster is blocked too. That asymmetry is the
+	// safety argument behind issue #167: if demotion were fingerprint-scoped, changing
+	// the fix would mint a clean record and launder the failure.
+	if sibling := ledger.Standing(fps.subject(t, target(offLimitsNamespace, offLimitsDeploy))); !sibling.Blocked {
+		t.Errorf("a failure on %s left a sibling fix of the same shape unblocked (standing %+v); demotion must be shape-scoped",
+			doomed, sibling)
 	}
 
 	// The breaker as durable state, and as something an operator can SEE. A tripped
@@ -479,10 +501,10 @@ func assertFailedAutoApplyTripsBreaker(t *testing.T, reg *cluster.Registry, blas
 // bound in play — and the assertion is on the recorded suppression reason rather than
 // on the absence of an action, because absence is what every other failure also looks
 // like.
-func assertTrippedBreakerSuppressesTheNextPass(t *testing.T, reg *cluster.Registry, blast *budget.Budget) {
+func assertTrippedBreakerSuppressesTheNextPass(t *testing.T, reg *cluster.Registry, blast *budget.Budget, fps fingerprints) {
 	t.Helper()
 
-	ledger := seededLedger(t)
+	ledger := seededLedger(t, fps, target(offLimitsNamespace, offLimitsDeploy))
 	rules := append(rollbackRule(suppressedRule, offLimitsNamespace), rollbackRule(failingRule, failNamespace)...)
 
 	p := runUnattendedPass(t, reg, blast, rules, ledger, ledger,
@@ -807,30 +829,109 @@ func rollbackRule(name string, namespaces ...string) autonomy.Ruleset {
 // here is therefore a fixture convenience, not a workaround: this scenario is about
 // what a trusted shape may DO unattended, and three real approval round-trips through
 // the kind cluster would buy it nothing but wall-clock time.
-func seededLedger(t *testing.T) *trust.Ledger {
+func seededLedger(t *testing.T, fps fingerprints, targets ...string) *trust.Ledger {
 	t.Helper()
 
-	ledger := trust.NewMemory()
-	shape := autonomy.Shape{Cluster: executorClusterName, Operation: remediate.OpRollbackRevision}
-	base := time.Now().UTC().Add(-time.Hour)
-	for i := range trust.PromotionThreshold {
-		entry := trust.Entry{
-			Key:       fmt.Sprintf("e2e-seeded-approval-%d", i),
-			Shape:     shape,
-			Authority: audit.AuthorityHuman,
-			Outcome:   trust.OutcomeConverged,
-			At:        base.Add(time.Duration(i) * time.Minute),
-			Ref:       fmt.Sprintf("e2e-approval-artifact-%d", i),
-		}
-		if err := ledger.Record(entry); err != nil {
-			t.Fatalf("seeding trust entry %d: %v", i, err)
-		}
+	if len(targets) == 0 {
+		t.Fatal("seededLedger was given no targets, so it would earn trust for nothing")
 	}
-	if !ledger.Trust(shape).Trusted {
-		t.Fatalf("%d seeded human approvals did not earn trust for %s: %s",
-			trust.PromotionThreshold, shape, ledger.Explain(shape))
+	ledger := trust.NewMemory()
+	base := time.Now().UTC().Add(-time.Hour)
+	for n, target := range targets {
+		subject := fps.subject(t, target)
+		for i := range trust.PromotionThreshold {
+			entry := trust.Entry{
+				Key:         fmt.Sprintf("e2e-seeded-approval-%d-%d", n, i),
+				Shape:       subject.Shape,
+				Fingerprint: subject.Fingerprint,
+				Authority:   audit.AuthorityHuman,
+				Outcome:     trust.OutcomeConverged,
+				At:          base.Add(time.Duration(n*trust.PromotionThreshold+i) * time.Minute),
+				Ref:         fmt.Sprintf("e2e-approval-artifact-%d-%d", n, i),
+			}
+			if err := ledger.Record(entry); err != nil {
+				t.Fatalf("seeding trust entry %d for %s: %v", i, target, err)
+			}
+		}
+		if !ledger.Trust(subject).Trusted {
+			t.Fatalf("%d seeded human approvals did not earn trust for %s (%s): %s",
+				trust.PromotionThreshold, target, subject.Fingerprint, ledger.Explain(subject))
+		}
 	}
 	return ledger
+}
+
+// fingerprints maps a proposal target — "deployment/<namespace>/<name>" — to the
+// [remediate.Fingerprint] the pipeline actually computed for the rollback of it.
+//
+// Since issue #167 trust is keyed on the fix rather than on the (cluster, operation)
+// shape, so a phase that seeds a history has to seed it for a fingerprint the cycle
+// will recompute and recognize. One seeded fingerprint no longer covers two objects,
+// which is the whole point of the change and the reason the phases below name their
+// targets explicitly.
+type fingerprints map[string]remediate.Fingerprint
+
+// subject builds the [autonomy.Subject] the trust ledger answers about for one target.
+func (f fingerprints) subject(t *testing.T, target string) autonomy.Subject {
+	t.Helper()
+
+	fp, ok := f[target]
+	if !ok {
+		t.Fatalf("no rollback proposal was ever observed for %s, so there is no fingerprint to seed trust for; observed: %v",
+			target, f)
+	}
+	return autonomy.Subject{
+		Shape:       autonomy.Shape{Cluster: executorClusterName, Operation: remediate.OpRollbackRevision},
+		Fingerprint: fp,
+	}
+}
+
+// target renders the proposal target key for a Deployment.
+func target(namespace, name string) string { return "deployment/" + namespace + "/" + name }
+
+// discoverFingerprints runs one pass purely to read the fingerprints off the rollback
+// proposals the pipeline actually makes.
+//
+// They are READ rather than reconstructed. Building a [remediate.Proposal] by hand here
+// and hashing it would produce a fingerprint that differs from the real one the moment
+// any fingerprinted field drifts — a changed precondition set, a different cause, a
+// bumped [remediate.PlannerVersion] — and the failure would not look like a stale test.
+// It would look like a policy bug: trust seeded, rule matching, and nothing auto-applied.
+//
+// The pass is safe to run first because it trusts nothing. Its ledger is empty, so every
+// proposal gates and no write reaches any cluster, and it is given its own budget so it
+// spends none of the shared blast allowance the breaker phases depend on.
+func discoverFingerprints(t *testing.T, reg *cluster.Registry) fingerprints {
+	t.Helper()
+
+	scratch := budget.NewMemory(budget.Limits{
+		PerClusterPerPass: budget.DefaultPerClusterPerPass,
+		Cooldown:          budget.DefaultCooldown,
+		FailureThreshold:  1,
+	}, time.Now)
+	ledger := trust.NewMemory()
+
+	p := runUnattendedPass(t, reg, scratch, rollbackRule(earnedRule, autoNamespace), ledger, ledger,
+		execute.Policy{ObserveWindow: unattendedObserveWindow, ObserveInterval: unattendedObserveInterval})
+
+	if len(p.cluster.AutoApplied) != 0 {
+		t.Fatalf("the discovery pass auto-applied %d action(s) against an empty ledger: %+v",
+			len(p.cluster.AutoApplied), p.cluster.AutoApplied)
+	}
+
+	found := fingerprints{}
+	for _, proposal := range p.cluster.Proposals {
+		if proposal.Operation != remediate.OpRollbackRevision.String() {
+			continue
+		}
+		if proposal.Fingerprint == "" {
+			t.Fatalf("the pipeline proposed %s with an empty fingerprint; an empty fingerprint can never be trusted, so every seeded phase would gate",
+				proposal.Target)
+		}
+		found[proposal.Target] = remediate.Fingerprint(proposal.Fingerprint)
+	}
+	t.Logf("discovered %d rollback fingerprint(s): %v", len(found), found)
+	return found
 }
 
 // requireRollbackProposed fails the test unless the read-only pipeline actually proposed
