@@ -1,0 +1,20 @@
+# The namespace MaKlaude's chaos experiment OBJECTS live in.
+#
+# This is not where the faults land. A Chaos Mesh custom resource is a request —
+# "kill one pod matching these labels in namespace demo" — and it can sit anywhere
+# the requester is allowed to write it while affecting pods elsewhere. Keeping the
+# requests in a namespace of their own is what lets the chaos identity's Role be
+# namespaced (see role.yaml) instead of cluster-wide, and it gives an operator one
+# place to look: `kubectl get podchaos -n maklaude-chaos` is the complete list of
+# experiments MaKlaude has outstanding on this cluster.
+#
+# It is deliberately separate from the `maklaude` namespace that holds the
+# observation and executor identities, so a `kubectl get all -n maklaude-chaos`
+# during an incident shows chaos and nothing else.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: maklaude-chaos
+  labels:
+    app.kubernetes.io/name: maklaude
+    app.kubernetes.io/component: chaos

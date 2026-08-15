@@ -1,0 +1,43 @@
+# MaKlaude's OPTIONAL chaos RBAC bundle (Milestone 6).
+#
+# It is a sibling of deploy/rbac and deploy/rbac/write, and neither of those
+# references it. You get an identity that can create chaos experiments only by
+# naming this directory:
+#
+#   kubectl apply -k deploy/rbac         # required first: reads + the maklaude SA
+#   kubectl apply -k deploy/rbac/write   # optional: approved remediation
+#   kubectl apply -k deploy/rbac/chaos   # optional: deliberate experiments
+#
+# Unlike the write bundle, this one does NOT depend on the base bundle's
+# ClusterRole — the chaos identity gets no reads outside its own custom resources —
+# but it does expect the `maklaude` namespace to exist, which the base bundle
+# creates.
+#
+# APPLYING THIS BUNDLE DOES NOT ENABLE CHAOS. Three independent gates have to be
+# opened, by a person, in three different places:
+#
+#   1. this bundle (the API server will permit the CR write);
+#   2. a per-cluster eligibility block in MaKlaude's cluster config, naming the
+#      cluster and carrying the acknowledgement sentence verbatim — see
+#      cluster.ChaosEligibility and docs/chaos.md. Absent, the cluster mints no
+#      chaos capability and internal/chaos cannot be constructed for it at all;
+#   3. kube.ExecuteMode set to something other than disabled, which is the same
+#      kill switch approved remediation rides.
+#
+# Any one of the three closes the path. Revoke the fastest one:
+#
+#   kubectl delete -k deploy/rbac/chaos
+#
+# It also does not install Chaos Mesh. MaKlaude writes the custom resources; Chaos
+# Mesh's controller is what acts on them, and installing it — and choosing how
+# widely it is scoped — is the operator's decision. See docs/chaos.md for what
+# MaKlaude assumes about that installation, including the permission-validation
+# tension worth knowing about before you enable it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - role.yaml
+  - rolebinding.yaml

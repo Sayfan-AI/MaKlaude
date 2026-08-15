@@ -1,0 +1,76 @@
+# MaKlaude's chaos Role — the narrowest of the three, and a Role rather than a
+# ClusterRole on purpose.
+#
+# It grants three verbs on one resource in one namespace. Every one of them is a
+# call in internal/chaos/injector.go, and the mapping is exact:
+#
+#   get    podchaos.chaos-mesh.org : Injector.Inject's absence check — the
+#                                    create-shaped precondition. A create has no
+#                                    resourceVersion to be optimistic about, so
+#                                    the guard is "no experiment with this derived
+#                                    name is live".
+#   create podchaos.chaos-mesh.org : Injector.Inject — one POST of one CR whose
+#                                    name is derived from the experiment, never
+#                                    server-generated.
+#   delete podchaos.chaos-mesh.org : Injector.Remove — teardown, conditioned on the
+#                                    created object's UID.
+#
+# WHAT IS DELIBERATELY ABSENT:
+#
+#   - pods, deployments, nodes,   : NOT GRANTED, in any verb, read or write. This
+#     events, anything core         is the whole point of a third identity. The
+#                                   chaos identity can ask Chaos Mesh to break
+#                                   things; it cannot touch a workload itself.
+#                                   `kubectl auth can-i` proves it (see
+#                                   docs/chaos.md) and the e2e job asserts it (T8).
+#   - list / watch                : the reaper that sweeps orphaned experiments
+#                                   (T3) will need `list`. It does not exist yet,
+#                                   so the verb is not granted yet. A role that
+#                                   grants what the code will need next is a role
+#                                   nobody can audit against the code.
+#   - update / patch              : an experiment is created and deleted, never
+#                                   edited. Editing a live experiment would change
+#                                   a fault while it runs, so the outcome MaKlaude
+#                                   measures would not be the fault it recorded.
+#   - deletecollection            : one request that removes every experiment. The
+#                                   scope guard pins an exact object path and so
+#                                   cannot express it; this role does not grant it
+#                                   either, so the guard and the RBAC agree.
+#   - other chaos-mesh.org kinds  : networkchaos, stresschaos, iochaos, schedules,
+#                                   workflows — none granted. internal/chaos has a
+#                                   closed one-kind catalog, and adding a kind
+#                                   means adding it here too. That coupling is
+#                                   deliberate: an operator can read this file and
+#                                   know exactly which faults are possible.
+#   - escalate / bind /           : never granted. Any of them would let this
+#     impersonate                   identity grant itself what is missing above.
+#
+# WHAT THIS ROLE DOES NOT BOUND — read this before assuming it is the safety net:
+#
+# It does not bound the blast radius of an experiment. MaKlaude writes a CR; Chaos
+# Mesh's own controller does the killing, with its own (substantial) privileges. A
+# PodChaos created in maklaude-chaos whose selector names `kube-system` affects
+# kube-system, and no permission of MaKlaude's is consulted for that. What bounds
+# the damage is the selector MaKlaude writes (validated in internal/chaos, always
+# naming its target namespaces explicitly), Chaos Mesh's own installation scope,
+# and M5's blast-radius budget, cooldown and circuit breaker once chaos runs
+# through the decision path (T4). This role is what stops MaKlaude reaching PAST
+# Chaos Mesh; it is not what stops Chaos Mesh reaching far.
+#
+# DRY RUN NEEDS THE SAME VERBS, for the same reason the executor's role does:
+# Kubernetes authorizes a dryRun=All request with the identical verb it would use
+# for a real one. "Preview only" is enforced by the transport
+# (kube.ErrDryRunRequired) and by kube.ExecuteMode, never by RBAC.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: maklaude-chaos
+  namespace: maklaude-chaos
+  labels:
+    app.kubernetes.io/name: maklaude
+    app.kubernetes.io/component: chaos
+rules:
+  - apiGroups: ["chaos-mesh.org"]
+    resources:
+      - podchaos
+    verbs: ["get", "create", "delete"]

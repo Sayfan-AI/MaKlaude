@@ -489,6 +489,12 @@ Applying the base bundle alone leaves MaKlaude unable to change anything at the
 API server, which is the intended default. See
 [`docs/rbac.md`](docs/rbac.md#the-optional-minimal-write-bundle).
 
+Deliberately breaking a cluster — chaos engineering, on clusters a human explicitly
+marked eligible — needs a third identity, in a third separate bundle
+(`deploy/rbac/chaos/`) binding `maklaude-chaos`. It can create and delete Chaos Mesh
+custom resources in one namespace and holds no verb on any workload. See
+[`docs/chaos.md`](docs/chaos.md).
+
 ### Task runner
 
 This project uses [**Task**](https://taskfile.dev) as its task runner via

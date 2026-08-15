@@ -17,10 +17,26 @@ in-process kill switch, an attributable approval, and preconditions re-checked
 against a fresh read. [`remediation.md`](remediation.md) is the whole story;
 [`rbac.md`](rbac.md#the-optional-minimal-write-bundle) is the access model.
 
+**Since Milestone 6 there is a second write path, and it is not remediation.**
+MaKlaude can deliberately break a cluster — create and delete Chaos Mesh custom
+resources — on clusters carrying a human-written per-cluster eligibility marker, and
+on no others. It has its own package, its own ServiceAccount, and its own
+namespaced RBAC granting no verb on any workload; it reuses this write path's scope
+guard and kill switch rather than adding a second one.
+[`chaos.md`](chaos.md) is that story. Stated as narrowly as it deserves: the
+whole-system claim is now **"no mutating verb except chaos CRDs, on chaos-eligible
+clusters"**, and the old sentence is not reworded here to keep looking true.
+Encoding that narrowing in tests as precisely as in prose — including proving the
+exception cannot leak to a non-eligible cluster — is
+[issue #196](https://github.com/Sayfan-AI/MaKlaude/issues/196); what exists today is
+the in-process door (`kube.ChaosRestConfig`, which refuses any mutating scope
+outside the `chaos-mesh.org` group even on an eligible cluster) with its own unit
+tests.
+
 So the accurate one-line posture is **"reads are guaranteed, writes are gated"**,
 not "nothing is ever touched". The distinction is the entire subject of this
 document: everything below is about the **observation identity**, and every layer
-of it still holds exactly as it did before the write path existed.
+of it still holds exactly as it did before either write path existed.
 
 This document explains how that promise is enforced and, crucially, **cites the
 exact code and tests that back each layer** so the guarantee stays verifiable
