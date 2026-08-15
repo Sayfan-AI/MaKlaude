@@ -20,6 +20,7 @@ package devsystem
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,21 +45,17 @@ func runNets(t *testing.T, env []string) (stdout, stderr string, code int) {
 	cmd.Stderr = &errb
 	err := cmd.Run()
 	if err != nil {
+		// errors.As rather than a type assertion: a non-zero exit is the
+		// expected outcome to measure here, and an assertion would t.Fatal on a
+		// wrapped ExitError, reporting "cannot run the script" for a script that
+		// ran fine and returned a code.
 		var ee *exec.ExitError
-		if !asExitError(err, &ee) {
+		if !errors.As(err, &ee) {
 			t.Fatalf("run session-nets.sh: %v", err)
 		}
 		code = ee.ExitCode()
 	}
 	return out.String(), errb.String(), code
-}
-
-func asExitError(err error, target **exec.ExitError) bool {
-	ee, ok := err.(*exec.ExitError)
-	if ok {
-		*target = ee
-	}
-	return ok
 }
 
 // TestSessionNetsNudgesWhenActingAsTheApp is the reason the script exists: in a
