@@ -1,0 +1,70 @@
+# The workload T5's live timing case remediates, and that a real Chaos Mesh
+# experiment destroys mid-flight.
+#
+# It is separate from the `victim` deployment in the same namespace, and the
+# separation is what keeps two experiments from becoming each other's flake: the
+# lifecycle test aims `pod-failure` at `scenario: chaos-target`, this scenario aims
+# `pod-kill` at `scenario: chaos-remediation`, and neither selector can match the
+# other's pods. Same namespace, because the per-namespace chaos grant
+# (deploy/rbac/chaos/target-namespace-role.yaml) is applied to
+# maklaude-chaos-target and nowhere else — a second namespace would need a second
+# explicit grant and would prove nothing extra.
+#
+# # Why the container exits 1 rather than being given a bad image
+#
+# The fault has to be one MaKlaude's own pipeline classifies as CauseUnknown, because
+# that is the single cause for which `rolloutRestartRule` proposes a restart
+# (internal/remediate/propose.go: every classified cause either has a better-matched
+# action or has no safe action at all). An unpullable image would be diagnosed as
+# CauseBadImage and proposed as a *rollback*, whose preconditions name a revision
+# rather than a pod — and a precondition that names no pod cannot be drifted by a
+# fault that kills one, which would leave the scenario unarmable.
+#
+# So: a real userland, a pullable image, a container that runs and then exits
+# non-zero forever. No OOM kill, no unschedulable pod, no node failure, no image
+# problem — nothing for a specialized rule to match, which is what makes the
+# fallback fire.
+#
+# One replica, deliberately. `mode: all` on a single-pod selector affects exactly
+# the pod the proposal names, so the fault cannot land on a sibling and leave the
+# target intact — which would pass the injection step and then fail the drift
+# assertion for a reason nobody could see from the failure message.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: remediable
+  namespace: maklaude-chaos-target
+  labels:
+    app.kubernetes.io/part-of: maklaude-e2e
+    scenario: chaos-remediation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: maklaude-e2e
+      scenario: chaos-remediation
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: maklaude-e2e
+        scenario: chaos-remediation
+    spec:
+      containers:
+        - name: app
+          # The same pinned image the other seeds use, so the node already holds it
+          # and each restart costs a container start rather than a pull.
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          # Sleeps briefly so the container reaches Running before it dies: a
+          # container that exits instantly can be reported with a zero restart count
+          # for longer, and MaKlaude's crashloop detector wants either an
+          # instantaneous CrashLoopBackOff or two restarts with a non-zero
+          # termination (internal/health/collector.go, containerCrashLooping).
+          command: ["/bin/sh", "-c", "sleep 3; exit 1"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi

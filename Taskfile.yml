@@ -59,13 +59,21 @@ tasks:
 
   e2e:chaos:
     desc: |
-      Run ONLY the chaos lifecycle e2e, against a kind cluster that has Chaos Mesh
-      installed (`task chaos:install`) and the chaos seeds applied. Env vars:
-        MAKLAUDE_E2E_CHAOS_KUBECONFIG  the maklaude-chaos ServiceAccount kubeconfig
-                                       (deploy/rbac/chaos must be applied)
-        MAKLAUDE_E2E_KUBECONFIG        (optional) read-only SA kubeconfig, used only to
-                                       corroborate that the fault visibly landed
-        MAKLAUDE_E2E_CONTEXT           context to select within both kubeconfigs
+      Run ONLY the chaos e2e tests — lifecycle, eligibility, and the live timing case
+      — against a kind cluster that has Chaos Mesh installed (`task chaos:install`) and
+      both chaos seeds applied (test/e2e/manifests/chaos-target.yaml and
+      chaos-remediation-target.yaml). Env vars:
+        MAKLAUDE_E2E_CHAOS_KUBECONFIG     the maklaude-chaos ServiceAccount kubeconfig
+                                          (deploy/rbac/chaos must be applied)
+        MAKLAUDE_E2E_KUBECONFIG           (optional) read-only SA kubeconfig, used only
+                                          to corroborate that the fault visibly landed
+        MAKLAUDE_E2E_EXECUTOR_KUBECONFIG  the maklaude-executor kubeconfig
+                                          (deploy/rbac/write must be applied). Required
+                                          by the live timing case, which injects a real
+                                          experiment into the target of an approved
+                                          remediation: the identity under test is the
+                                          one that could have written.
+        MAKLAUDE_E2E_CONTEXT              context to select within the kubeconfigs
       It is a separate target from `e2e` because the two need different clusters: this
       one installs a fault injector, and the remediation suite asserts convergence on
       workloads a live experiment would disturb. The chaos test SKIPS under `task e2e`

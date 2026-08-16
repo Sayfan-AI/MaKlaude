@@ -663,17 +663,26 @@ jobs:
           cluster_name: ${{ env.CLUSTER_NAME }}-chaos
           wait: 120s
 
-      # Both bundles. The chaos bundle is what the test authenticates as; the
-      # read-only bundle is only used to corroborate that a fault visibly landed,
-      # and having it here is also what proves the two identities stay separate on
-      # a cluster where chaos is live (the chaos SA cannot read a pod, so the
-      # observation has to come from somewhere else).
-      - name: Apply the read-only and chaos RBAC bundles
+      # All three bundles, one per identity, because this job now runs a scenario
+      # that needs two of them at once.
+      #
+      # The chaos bundle is what the lifecycle tests authenticate as. The read-only
+      # bundle corroborates that a fault visibly landed, and having it here is also
+      # what proves the identities stay separate on a cluster where chaos is live
+      # (the chaos SA cannot read a pod, so the observation has to come from
+      # somewhere else). The write bundle is new: T5's timing case, live, injects a
+      # real experiment into the target of an approved REMEDIATION, so the run needs
+      # the executor identity — the one that could actually have written — for the
+      # assertion "no write reached the cluster" to be about MaKlaude's re-check
+      # rather than about a missing permission.
+      - name: Apply the read-only, write and chaos RBAC bundles
         run: |
           set -euo pipefail
           kubectl apply -k deploy/rbac
+          kubectl apply -k deploy/rbac/write
           kubectl apply -k deploy/rbac/chaos
           kubectl -n maklaude get serviceaccount maklaude
+          kubectl -n maklaude get serviceaccount maklaude-executor
           kubectl -n maklaude get serviceaccount maklaude-chaos
 
       # The same script `task chaos:install` runs. Pinned chart version, kind's
@@ -749,11 +758,18 @@ jobs:
           [ "$fail" -eq 0 ] || { echo "chaos Role assertions failed against the real CRD"; exit 1; }
           echo "The chaos Role is exactly the injector's and reaper's call set."
 
-      - name: Seed the chaos target workload
+      - name: Seed the chaos target workloads
         run: |
           set -euo pipefail
           kubectl apply -f test/e2e/manifests/chaos-target.yaml
           kubectl -n maklaude-chaos-target rollout status deployment/victim --timeout=180s
+
+          # The crashlooping workload T5's live timing case remediates. Deliberately no
+          # `rollout status` wait: this Deployment never becomes available — that is the
+          # fault — so waiting for it would time out by design. The test waits for
+          # MaKlaude's own detector to report the crashloop instead, which is the fact
+          # its proposal will rest on.
+          kubectl apply -f test/e2e/manifests/chaos-remediation-target.yaml
           kubectl -n maklaude-chaos-target get pods -o wide
 
       # The fourth gate, and the one that has to be opened per namespace rather than
@@ -874,17 +890,59 @@ jobs:
             chmod 600 "$out"
           }
 
-          mint maklaude-chaos "${RUNNER_TEMP}/maklaude-chaos.kubeconfig"
-          mint maklaude       "${RUNNER_TEMP}/maklaude-sa.kubeconfig"
+          mint maklaude-chaos    "${RUNNER_TEMP}/maklaude-chaos.kubeconfig"
+          mint maklaude          "${RUNNER_TEMP}/maklaude-sa.kubeconfig"
+          mint maklaude-executor "${RUNNER_TEMP}/maklaude-executor.kubeconfig"
 
           echo "MAKLAUDE_E2E_CHAOS_KUBECONFIG=${RUNNER_TEMP}/maklaude-chaos.kubeconfig" >> "$GITHUB_ENV"
           echo "MAKLAUDE_E2E_KUBECONFIG=${RUNNER_TEMP}/maklaude-sa.kubeconfig" >> "$GITHUB_ENV"
+          echo "MAKLAUDE_E2E_EXECUTOR_KUBECONFIG=${RUNNER_TEMP}/maklaude-executor.kubeconfig" >> "$GITHUB_ENV"
           echo "MAKLAUDE_E2E_CONTEXT=${CTX}" >> "$GITHUB_ENV"
 
-      - name: Run the chaos lifecycle e2e (create -> observe -> terminate -> sweep)
+      # The control that keeps the live timing case honest. Its central assertion is
+      # that no real write reached the cluster; that assertion is only about MaKlaude's
+      # precondition re-check if the identity making it COULD have written. So: the
+      # executor may perform the restart it is about to abandon, and the chaos identity
+      # still may not — the two deltas do not overlap, on a cluster where both are
+      # installed.
+      - name: Verify the executor identity can write what the drift scenario abandons
+        run: |
+          set -euo pipefail
+          EXEC=system:serviceaccount:maklaude:maklaude-executor
+          CHAOS=system:serviceaccount:maklaude:maklaude-chaos
+
+          fail=0
+          assert_yes() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" != "yes" ]; then
+              echo "::error::expected ALLOWED but denied: $*"; fail=1
+            fi
+          }
+          assert_no() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" = "yes" ]; then
+              echo "::error::expected DENIED but allowed: $*"; fail=1
+            fi
+          }
+
+          # A rollout restart is a PATCH of the Deployment, and the runner re-reads the
+          # target before sending, so the executor needs both verbs here.
+          assert_yes patch deployments.apps --as="$EXEC" -n maklaude-chaos-target
+          assert_yes get   deployments.apps --as="$EXEC" -n maklaude-chaos-target
+          assert_yes list  pods             --as="$EXEC" -n maklaude-chaos-target
+
+          # Installing the write bundle granted the executor no chaos, and the chaos
+          # identity gained no ability to touch the workload it may break.
+          assert_no create podchaos.chaos-mesh.org --as="$EXEC"  -n maklaude-chaos
+          assert_no create podchaos.chaos-mesh.org --as="$EXEC"  -n maklaude-chaos-target
+          assert_no patch  deployments.apps       --as="$CHAOS" -n maklaude-chaos-target
+
+          [ "$fail" -eq 0 ] || { echo "the executor/chaos identity split is not what the drift scenario assumes"; exit 1; }
+          echo "maklaude-executor may restart the remediable Deployment; maklaude-chaos may not touch it."
+
+      - name: Run the chaos e2e (lifecycle, eligibility, and the live timing case)
         env:
           MAKLAUDE_E2E_CHAOS_KUBECONFIG: ${{ env.MAKLAUDE_E2E_CHAOS_KUBECONFIG }}
           MAKLAUDE_E2E_KUBECONFIG: ${{ env.MAKLAUDE_E2E_KUBECONFIG }}
+          MAKLAUDE_E2E_EXECUTOR_KUBECONFIG: ${{ env.MAKLAUDE_E2E_EXECUTOR_KUBECONFIG }}
           MAKLAUDE_E2E_CONTEXT: ${{ env.MAKLAUDE_E2E_CONTEXT }}
         run: task e2e:chaos
 

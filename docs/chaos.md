@@ -341,6 +341,45 @@ deployments. **No catalogued action can perturb a Node**, which is why `cordonno
 the most-tested operation in the execution package — appears in none of these
 scenarios. Asserting an outcome for a fault nobody can inject would be fiction.
 
+### Window 1, live
+
+The half that a model cannot supply is in
+[`test/e2e/chaos_remediation_test.go`](../test/e2e/chaos_remediation_test.go), running in
+the `chaos on kind` job: a real Chaos Mesh `pod-kill` destroys the target of an approved
+remediation, and MaKlaude's own re-check must abandon the action having sent nothing.
+
+Everything in the path is the shipped one — `health.Collector`, `detect`, `correlate`,
+`diagnose`, `remediate.Hypotheses`, `approve.Gatekeeper`, `execute.Runner` — so the
+proposal *arrives from a diagnosis* rather than being constructed, and the permission
+slip is one the gate minted from a recorded human decision. Two faults appear and they
+have different jobs: the crashloop being remediated is **seeded** (whether a chaos action
+can produce a remediable fault, and whether the fix worked, is the scoring question
+below), and the pod-kill that lands mid-flight is **injected**, because a hand-mutated
+fixture cannot say anything about a cluster moving underneath a run.
+
+Three details are what make it a proof rather than a demonstration:
+
+- **"Nothing was sent" is read off the wire, not out of the report.** A report saying
+  "aborted" is the easiest thing for a broken implementation to produce. The executor
+  identity is registered through the recording reverse proxy T8's eligibility case
+  introduced, and the rule is not "no PATCH arrived" — one must, or the human approved
+  nothing — it is that **every mutating request on that route carries `dryRun=All`**. The
+  approval preview is a genuine mutating request; the real write is the one shape that
+  must be absent, corroborated from the Deployment's own `metadata.generation`.
+- **The identity that abandons the write is the identity that could have made it.** The
+  job installs `deploy/rbac/write` on the chaos cluster and asserts `patch
+  deployments.apps` is *allowed* for `maklaude-executor` in the target namespace. Without
+  that, "no write landed" would be equally true of a missing permission, and the test
+  would be measuring RBAC instead of the re-check.
+- **The fault is required to have landed.** Unlike the pod-level effect of a
+  `pod-failure`, which is corroboration and degrades to a warning, a `pod-kill` that
+  removed nothing makes every assertion vacuous: there is no drift to catch. So the test
+  waits for the pod to disappear *from MaKlaude's own snapshot* and fails if it doesn't.
+
+Window 3 (fault during the convergence watch) and window 2 stay modelled: the first
+needs a fault that provably persists across a rollout the test triggers, and the second
+is the microsecond interval no injector can be aimed at.
+
 ## Scoring a scenario: two questions, and only one of them is about convergence
 
 A scenario that asks "did the fault get fixed?" passes on exactly the cases this
