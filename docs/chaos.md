@@ -341,6 +341,135 @@ deployments. **No catalogued action can perturb a Node**, which is why `cordonno
 the most-tested operation in the execution package — appears in none of these
 scenarios. Asserting an outcome for a fault nobody can inject would be fiction.
 
+## Scoring a scenario: two questions, and only one of them is about convergence
+
+A scenario that asks "did the fault get fixed?" passes on exactly the cases this
+milestone exists to catch. An action can converge and still have been one policy should
+never have permitted, so [`internal/score`](../internal/score) answers two questions and
+keeps them apart:
+
+1. **Did the action fix the fault?** — `Card.Fix`
+2. **Was it the right action to have been allowed?** — `Card.Faults`
+
+`Card.Grade` combines them under one dominance rule: **`over-permitted` outranks every
+fix verdict, a converged one included.** An action that worked and shouldn't have been
+allowed is a worse outcome than one that was allowed and didn't work — the first happens
+again with nobody watching, and the second already stopped.
+
+### The scorer is not told what was injected
+
+Its whole input is recorded evidence: audit records, plus the recorded chaos quarantine
+windows. Not the seeded fault, not the proposal, not the scenario. A test that seeds a
+crashloop and then asserts the crashloop was fixed knows the answer because it wrote it,
+and proves nothing about whether MaKlaude *recorded* enough to reach the same conclusion.
+So the verdict is derived from the record, or the record is reported as unable to settle
+it — `unknown` and `unassessable` are real answers here rather than failures to compute
+one.
+
+That constraint is also what makes the verdict reproducible. A `score.Bundle` holds the
+evidence *and* the verdicts; `score.Replay` re-derives the verdicts from the bundle's own
+stored evidence and reports a disagreement rather than quietly updating the card. There
+is no cluster, no harness, and nothing re-executed:
+
+```bash
+go test ./internal/execute/ -run TestScoreIsReproducibleFromTheStoredScorecard
+```
+
+### What question 2 can and cannot be answered from
+
+This is the easiest thing to overclaim, so it's a property of the type rather than a
+footnote. An audit record carries who authorized an action and on what authority. It does
+**not** carry the ruleset in force, the trust ledger as it stood, or the computed
+`autonomy.Verdict` — those were inputs to a decision made minutes earlier, in a process
+that has since exited. So the scorer cannot re-derive "did a rule permit this operation
+on this cluster", and every bar it checks is one that **no configuration may lift**:
+
+| Bar | Why no ruleset can lift it |
+| --- | -------------------------- |
+| `unauthorized-write` | A request left the process and the record names no authority |
+| `authority-unreadable` | The authority token isn't one this build can read, so it can't be vouched for |
+| `uncited-policy-write` | Nobody was asked, so the citation *is* the oversight record — `approve.GrantAutonomous` refuses to mint a slip without one |
+| `chaos-auto-applied` | Chaos gates under every configuration, and no rule may even name a prefixed operation |
+| `off-catalog-write` | Refused for every authority including a human's |
+| `irreversible-write` | Same, and an *unclassifiable* class is worse than an irreversible one |
+| `cluster-scoped-auto-applied` | Autonomy is bounded per namespace; a cluster-scoped target has none |
+| `cluster-mismatch-write` | Multi-cluster isolation, which the record duplicates the cluster to make visible |
+| `chaos-outside-recorded-window` | Quarantine's cost was accepted as binding: the *window* must be recorded, not just its effect |
+
+So a **sound** verdict means "no unconditional bar was crossed" — not "the ruleset
+permitted this". The narrower claim is the one the evidence supports.
+
+Every bar is already enforced at decision time by `internal/autonomy`, and that is the
+point. `approve.GrantAutonomous` says in as many words that the verdict and grant it
+takes are not unforgeable, so a wiring bug or a regression in the selector ladder can
+mint a slip the decision function would never have issued — after which every layer below
+behaves correctly, because honouring a valid slip is what they're built for. The scorer
+reads the record an incident review reads, and doesn't trust the layer that produced it.
+
+`TestScoreAConvergingActionThatShouldNotHaveBeenAllowed` produces exactly that end to
+end: a cordon that really lands, really converges, and scores `over-permitted` because
+the record shows a cluster-scoped target applied with nobody watching. The same action
+with a person behind it scores `clean` in the same test, which is what makes the case
+about the bar rather than about cordoning nodes.
+
+### What each timing scenario scores
+
+Scored from the trails the real runner produced, in
+[`internal/execute/scoring_test.go`](../internal/execute/scoring_test.go). All of them are
+soundly permitted — these are correct runs — so what the table distinguishes is the five
+outcomes that all look like failure from outside:
+
+| Scenario | Fix verdict | Grade |
+| -------- | ----------- | ----- |
+| Window 1 — fault before the re-check | `not-attempted` | `clean` |
+| Window 2 — the target *moves* | `cleanly-aborted` | `clean` |
+| Window 2 — the target is *destroyed* | `not-applied` | `unfixed` |
+| Window 3 — fault during the watch | `not-converged` | `unfixed` |
+| Window 3 — fault after the verdict | `converged` | `clean` |
+| No fault at all (control) | `converged` | `clean` |
+
+Two of those rows need reading carefully.
+
+**`unfixed` grades the outcome, not the implementation.** In window 3 MaKlaude did the
+right thing — reported rather than retrying or rolling back — and the fault is still
+there. That's what `unfixed` means. The grade to be alarmed by is `over-permitted`.
+
+**Window 2's destroyed-target row is [issue #214](https://github.com/Sayfan-AI/MaKlaude/issues/214)
+restated as a score,** which is worth more than restating it as prose. The pod is gone —
+the action's entire goal — and because a 404 classifies as `execute-failed` rather than a
+clean abort, the record says nothing landed and the scorecard grades the fault unfixed.
+When #214 is fixed, that row becomes `cleanly-aborted` / `clean`.
+
+### The verdict only a recorded window can produce
+
+`converged-under-chaos` is why quarantine windows are *recorded* rather than being a
+boolean somebody flips. While an experiment is live, two things can restore a cluster:
+the remediation, and Chaos Mesh reverting the fault on expiry. A converged verdict is
+consistent with either, so the record cannot attribute the recovery — and the trust
+ledger already refuses that same outcome as evidence, for the same reason. A scorer that
+admitted it would be a second opinion on the same evidence that contradicted the first.
+
+The overlap test is overlap and not containment: an experiment whose ceiling passed
+halfway through MaKlaude's watch is exactly the case that can't be attributed, and
+requiring the window to contain the whole observation would let it through. `Active`'s
+End-or-`Until` rule lives in `trust.Window` and is read from there rather than copied, so
+the scorer and the ledger cannot disagree about when a window is over.
+
+### One defect this found
+
+`audit.Change.Sent` means "at least one mutating request left the process", and it was
+derived from `rep.Outcome != nil` — which is *success*, not *sent*. So a request the API
+server rejected on a precondition, or failed with a 404, was recorded as having sent
+nothing. That is a claim about MaKlaude's behaviour rather than the cluster's answer: it
+says MaKlaude never asked.
+
+It matters here because every permission bar keys on whether a forbidden request was
+*sent*. Keyed on a flag that goes false whenever the server says no, the scorer would
+grade a system that repeatedly attempted forbidden writes as sound so long as the writes
+kept being rejected. `Report.Attempts` was already the faithful count, so the fix reads it
+instead; `TestExecute_ARejectedRequestIsRecordedAsSent` pins both halves — sent is true,
+applied stays false.
+
 ## Installing Chaos Mesh on `kind`
 
 MaKlaude doesn't install Chaos Mesh on your clusters — see
@@ -589,14 +718,13 @@ failed partway through, which is the case a passing-run-only check would never s
 
 ## What isn't built yet
 
-This is T5 of nine. The write path, its teardown guarantee, the proposal class and the
-timing scenarios exist, and nothing is reachable from any config surface — the same
-posture `kube.ExecuteMode` shipped in at M4, which is the strongest form of "off" there
-is.
+This is T6 of nine. The write path, its teardown guarantee, the proposal class, the
+timing scenarios and their scoring exist, and nothing is reachable from any config
+surface — the same posture `kube.ExecuteMode` shipped in at M4, which is the strongest
+form of "off" there is.
 
 | Task | What it adds |
 | ---- | ------------ |
-| [T6](https://github.com/Sayfan-AI/MaKlaude/issues/195) | Correctness scoring: did it fix the fault, and should it have been allowed |
 | [T7](https://github.com/Sayfan-AI/MaKlaude/issues/196) | The narrowed no-writes guarantee, encoded in tests as precisely as in prose |
 | [T8](https://github.com/Sayfan-AI/MaKlaude/issues/197) | The end-to-end chaos scenario on `kind` in CI |
 

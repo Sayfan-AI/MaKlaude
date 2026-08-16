@@ -169,6 +169,48 @@ func TestExecute_ACleanAbortIsStillAudited(t *testing.T) {
 	}
 }
 
+// TestExecute_ARejectedRequestIsRecordedAsSent draws the line the test above is the other
+// side of, and it is a line the record used to get wrong.
+//
+// [audit.Change.Sent] means "at least one mutating request left the process", and it is
+// false for an abort that happened before the write path was reached — which the drift
+// case above is. A request the API server REJECTED is the opposite case: MaKlaude decided
+// to send it, on the authority it held, and the cluster's answer was no. Recording that
+// as having sent nothing is a claim about MaKlaude's behaviour rather than about the
+// cluster's answer; it says MaKlaude never asked.
+//
+// Both halves are asserted together because the field's two readings are only meaningful
+// against each other. Applied stays false — the distinction between "sent" and "landed"
+// is what [audit.Change] exists to keep — and Attempts stays 1, since a conflict is never
+// retried.
+func TestExecute_ARejectedRequestIsRecordedAsSent(t *testing.T) {
+	model := newClusterModel().withNode("node-a")
+	h := newHarness(t, model, fastPolicy())
+	// The node is cordoned by someone else between MaKlaude's re-check and its write, so
+	// the resourceVersion the request carries is stale and the API server refuses it.
+	h.mutator.beforeWrite = func() {
+		model.mutateNode("node-a", func(n *health.NodeSignal) { n.Unschedulable = true })
+	}
+
+	if _, err := h.execute(cordonProposal()); !errors.Is(err, kube.ErrPreconditionConflict) {
+		t.Fatalf("executing against a moved target returned %v, want a precondition conflict", err)
+	}
+
+	failed := h.recordFor(audit.PhaseFailed)
+	if !failed.Change.Sent {
+		t.Error("the record claims nothing was sent by an attempt the API server had to reject")
+	}
+	if failed.Change.Applied {
+		t.Error("the record claims a rejected request changed the cluster")
+	}
+	if failed.Change.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1 — a precondition conflict is never retried", failed.Change.Attempts)
+	}
+	if !failed.Outcome.CleanAbort {
+		t.Errorf("a conflict caught by the API server must read as a clean abort: %+v", failed.Outcome)
+	}
+}
+
 // TestExecute_AnUnauthorizedAttemptIsAuditedAndAttributedToNobody is the record that
 // matters most and is the easiest to omit, because there is no approval artifact to
 // post it to.

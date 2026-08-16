@@ -108,6 +108,21 @@ func (w Window) Active(at time.Time) bool {
 	return at.Before(w.Until)
 }
 
+// EffectiveEnd is the instant this window stopped being active: the close if there was
+// one, and the declared ceiling otherwise.
+//
+// It exists so a consumer asking about an INTERVAL rather than an instant does not have
+// to re-derive the End-or-Until rule that [Window.Active] already encodes. The scorer in
+// [score] asks exactly that question — did a remediation's observation window overlap a
+// quarantine — and a second copy of this rule living there would be a second definition
+// of when a window is over, which is the disagreement this method exists to prevent.
+func (w Window) EffectiveEnd() time.Time {
+	if !w.End.IsZero() && w.End.Before(w.Until) {
+		return w.End
+	}
+	return w.Until
+}
+
 // Expired reports whether this window passed its declared ceiling without being
 // closed. It is the state a report should name, because it means a process did not
 // finish what it started.

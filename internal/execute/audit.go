@@ -254,9 +254,25 @@ func authorityOf(a approve.Authority) audit.Authority {
 }
 
 // changeOf reads what was actually sent off the report.
+//
+// Sent comes from the attempt COUNT and not from whether an outcome came back, and the
+// difference is the whole meaning of the field. [audit.Change.Sent]'s contract is "at
+// least one mutating request left the process; false for every abort that happened
+// before the write path was reached" — and a request the API server rejected on a
+// precondition, or failed with a 404, left the process. Deriving it from `rep.Outcome !=
+// nil` recorded those as having sent nothing, which is a claim about MaKlaude's
+// behaviour, not about the cluster's answer: it says MaKlaude never asked.
+//
+// [Report.Attempts] is already the faithful count — it is deliberately corrected back to
+// zero for the one abort that resolves a revision by a read and composes no patch, so
+// "0 for every abort" is true of it — which is why the fix is to read it rather than to
+// add a field. Found by the correctness scorer in [score], whose permission bars all key
+// on whether a forbidden request was sent: keyed on a flag that is false whenever the
+// server said no, the scorer would grade a system that repeatedly attempted forbidden
+// writes as sound so long as the writes kept being rejected.
 func changeOf(rep Report) audit.Change {
 	c := audit.Change{
-		Sent:            rep.Outcome != nil,
+		Sent:            rep.Attempts > 0,
 		Applied:         rep.Executed,
 		DryRun:          rep.DryRun,
 		Mode:            rep.Mode.String(),
@@ -272,10 +288,11 @@ func changeOf(rep Report) audit.Change {
 	return c
 }
 
-// rollbackChangeOf is the [RollbackReport] counterpart of [changeOf].
+// rollbackChangeOf is the [RollbackReport] counterpart of [changeOf], and reads Sent the
+// same way and for the same reason: a rejected inverse is still an inverse MaKlaude sent.
 func rollbackChangeOf(rb RollbackReport) audit.Change {
 	c := audit.Change{
-		Sent:       rb.Outcome != nil,
+		Sent:       rb.Attempts > 0,
 		Applied:    rb.Performed,
 		Attempts:   rb.Attempts,
 		StartedAt:  rb.StartedAt,
