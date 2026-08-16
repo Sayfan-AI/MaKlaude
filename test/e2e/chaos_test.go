@@ -14,6 +14,14 @@
 // controller, and reported by MaKlaude as injected — so a run measures behaviour under
 // a fault that never happened. Only a real CRD and a real admission webhook close it.
 //
+// Two things this job has already caught that no stub could, both worth keeping in mind
+// when reading an assertion here and wondering whether it is worth the minutes:
+// Chaos Mesh's permission webhook reviews the SELECTOR's namespaces rather than the
+// CR's, which is why the per-target-namespace grant exists at all; and a real API
+// server returns a generated `metadata.uid` for a dryRun=All create while storing
+// nothing, so "a preview creates nothing" needed enforcing in Inject rather than
+// inheriting from the server's response.
+//
 // # What is asserted hard, and what is corroboration
 //
 // Hard, because they are claims about MaKlaude and about Chaos Mesh's contract with it:

@@ -401,6 +401,19 @@ func TestInject_DryRunPreviews(t *testing.T) {
 	if !strings.HasSuffix(got.Scope, "(dry-run only)") {
 		t.Errorf("recorded scope should say it was preview-only, got %q", got.Scope)
 	}
+
+	// The stub answers this POST with `uid-1` and `resourceVersion: 42` — exactly as a
+	// real API server answers a dryRun=All create, which returns the object as it would
+	// have been persisted with a freshly generated UID. Neither may reach the record: a
+	// UID is what Remove conditions a teardown on and what the reaper checks ownership
+	// with, so a preview carrying one is a phantom identity for an object that does not
+	// exist. This assertion is the one the e2e had to discover was missing.
+	if got.UID != "" {
+		t.Errorf("a preview must carry no UID, got %q — the object was never stored, and Remove/Reap treat a UID as proof it was", got.UID)
+	}
+	if got.ResourceVersion != "" {
+		t.Errorf("a preview must carry no resourceVersion, got %q", got.ResourceVersion)
+	}
 }
 
 // TestInject_RefusesAnInvalidExperimentWithoutSending proves validation happens

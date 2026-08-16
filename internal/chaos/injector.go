@@ -46,11 +46,14 @@ type Injected struct {
 	Name      string
 
 	// UID is the created object's unique identity, and the precondition
-	// [Injector.Remove] tears down against. Empty under a dry run, where nothing
-	// was created.
+	// [Injector.Remove] tears down against. A non-empty value means an object exists:
+	// it is empty under a dry run, which [Injector.Inject] has to enforce rather than
+	// inherit, because a real API server returns a generated UID for a dryRun=All
+	// create even though it stores nothing.
 	UID string
 
-	// ResourceVersion is the created object's version as the API server returned it.
+	// ResourceVersion is the created object's version as the API server returned it,
+	// and empty under a dry run for the same reason as UID.
 	ResourceVersion string
 
 	// Scope is the rendered [kube.WriteScope] the create ran under — the exact
@@ -254,6 +257,30 @@ func (i *Injector) Inject(ctx context.Context, e Experiment) (*Injected, error) 
 			ErrInject, kind, e.Namespace+"/"+name, i.Name(), err)
 	}
 
+	// A preview creates nothing, so its record must carry nothing that identifies a
+	// stored object — and the API server does NOT make that automatic. A dryRun=All
+	// create returns the object as it *would* have been persisted, and a real cluster
+	// fills in a freshly generated `metadata.uid`, because a UID is assigned in the
+	// create path before storage is ever reached. (Observed against kind: uid
+	// populated, resourceVersion empty. Which generated fields a preview happens to
+	// carry is an implementation detail, so both are dropped rather than the one that
+	// showed up.)
+	//
+	// Left in place, that UID is a phantom identity: [Injector.Remove] conditions a
+	// teardown on exactly this field, the [Reaper] uses it to prove ownership before
+	// deleting, and an audit record would name an object nobody can look up. The
+	// invariant worth having is "a non-empty UID means an object exists", so it is
+	// established here, at the one place a UID enters the package.
+	//
+	// This is also a reminder about proxies for real behaviour: the stub in
+	// injector_test.go answers a create with a uid regardless of dryRun, and the
+	// doc comment on [Injected.UID] has claimed "empty under a dry run" since T2 —
+	// nothing compared the two until a real API server did.
+	uid, resourceVersion := string(created.GetUID()), created.GetResourceVersion()
+	if i.dryRun() {
+		uid, resourceVersion = "", ""
+	}
+
 	return &Injected{
 		Cluster:         i.Name(),
 		Acknowledgement: i.target.Acknowledgement(),
@@ -261,8 +288,8 @@ func (i *Injector) Inject(ctx context.Context, e Experiment) (*Injected, error) 
 		Kind:            kind,
 		Namespace:       e.Namespace,
 		Name:            name,
-		UID:             string(created.GetUID()),
-		ResourceVersion: created.GetResourceVersion(),
+		UID:             uid,
+		ResourceVersion: resourceVersion,
 		Scope:           scope.String(),
 		DryRun:          i.dryRun(),
 	}, nil
