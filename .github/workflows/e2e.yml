@@ -900,15 +900,38 @@ jobs:
           echo "=== every PodChaos on the cluster ==="
           kubectl get podchaos -A -o wide || true
 
-          leaked=$(kubectl get podchaos -A \
-            -l app.kubernetes.io/managed-by=maklaude,app.kubernetes.io/component=chaos \
-            -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' \
-            | grep -E '/maklaude-[a-z0-9]+-[0-9a-f]{12}$' || true)
-          if [ -n "$leaked" ]; then
-            echo "::error::MaKlaude experiments outlived the run:"
+          # Bounded poll rather than one instant read, because a correct system fails an
+          # instant read. Chaos Mesh holds a finalizer on every experiment and clears it
+          # only after its controller has recovered the fault, so an object whose delete
+          # was accepted seconds ago is legitimately still listed, in Terminating. The
+          # leak this step exists to catch is residue that does NOT go away, so the
+          # question is asked for 90 seconds before it is answered — and the
+          # deletionTimestamp is printed on failure, since "stuck mid-recovery" and
+          # "never deleted at all" need different fixes and look identical in a name list.
+          list_leaked() {
+            kubectl get podchaos -A \
+              -l app.kubernetes.io/managed-by=maklaude,app.kubernetes.io/component=chaos \
+              -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' \
+              | grep -E '/maklaude-[a-z0-9]+-[0-9a-f]{12}$' || true
+          }
+
+          deadline=$(( $(date +%s) + 90 ))
+          while :; do
+            leaked=$(list_leaked)
+            [ -z "$leaked" ] && break
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::MaKlaude experiments outlived the run:"
+              echo "$leaked"
+              echo "=== with deletion timestamps (empty means never deleted, set means recovery is stuck) ==="
+              kubectl get podchaos -A \
+                -l app.kubernetes.io/managed-by=maklaude,app.kubernetes.io/component=chaos \
+                -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,DELETED:.metadata.deletionTimestamp,FINALIZERS:.metadata.finalizers' || true
+              exit 1
+            fi
+            echo "still terminating, waiting for Chaos Mesh to finish recovery:"
             echo "$leaked"
-            exit 1
-          fi
+            sleep 5
+          done
           echo "No MaKlaude-derived experiment objects remain."
 
           # The other half: the sweep must not have taken the operator's with it.

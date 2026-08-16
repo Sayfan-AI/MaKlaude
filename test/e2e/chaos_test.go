@@ -239,15 +239,17 @@ func TestE2E_ChaosLifecycle(t *testing.T) {
 	// Teardown is idempotent, and says so rather than smoothing it over: "torn down" and
 	// "was never there" are different facts about a cluster, and a reaper racing an
 	// explicit teardown produces the second one routinely.
-	again, err := injector.Remove(ctx, *injected)
-	if err != nil {
-		t.Fatalf("a second teardown must succeed: %v", err)
-	}
-	if !again.AlreadyAbsent {
-		t.Errorf("the second teardown must report AlreadyAbsent, got %+v", again)
-	}
+	//
+	// It is asserted as "eventually" rather than "immediately", and that is a fact about
+	// Kubernetes rather than a tolerance for flakiness. Chaos Mesh holds a finalizer on
+	// every experiment and clears it only after its controller has recovered the fault,
+	// so an accepted DELETE leaves the object in Terminating — the stub cannot show this
+	// because a stub has no finalizers. The window is where the milestone's guarantee
+	// actually lives: recovery is Chaos Mesh's, running independently of MaKlaude, and
+	// the object's disappearance is the receipt that it finished.
+	awaitAbsent(t, injector, *injected)
 
-	// And with the object gone, the same experiment can be injected again — which is the
+	// And with the object really gone, the same experiment can be injected again — the
 	// other half of the derived name being a precondition rather than a lock.
 	reinjected, err := injector.Inject(ctx, experiment)
 	if err != nil {
@@ -255,6 +257,44 @@ func TestE2E_ChaosLifecycle(t *testing.T) {
 	}
 	if _, err := injector.Remove(ctx, *reinjected); err != nil {
 		t.Fatalf("tearing down the re-injected experiment: %v", err)
+	}
+}
+
+// awaitAbsent polls teardown until it reports the object is gone, and fails the test if
+// it never does.
+//
+// Polling with Remove rather than a read is deliberate: `delete` is a verb the chaos
+// identity holds in this namespace, and asking the question the same way production
+// would means the answer is the one production gets. Each call is a real
+// UID-conditioned DELETE, which is also idempotency asserted repeatedly rather than
+// once.
+//
+// The failure message names the finalizer, because a test that simply timed out here
+// would send a reader hunting for a MaKlaude bug when the likely cause is Chaos Mesh
+// still recovering a fault — or a recovery that is genuinely stuck, which is worth
+// distinguishing in the same breath.
+func awaitAbsent(t *testing.T, injector *chaos.Injector, injected chaos.Injected) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for attempt := 1; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		removal, err := injector.Remove(ctx, injected)
+		cancel()
+		if err != nil {
+			t.Fatalf("a repeated teardown must succeed (attempt %d): %v", attempt, err)
+		}
+		if removal.AlreadyAbsent {
+			t.Logf("object gone after %d teardown(s); Chaos Mesh finished recovery and cleared its finalizer", attempt)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s %s/%s was still on the cluster 2 minutes after its deletion was accepted (%d attempts). "+
+				"Chaos Mesh holds a finalizer until its controller recovers the fault, so either that recovery is stuck "+
+				"or something re-created the object: %+v",
+				injected.Kind, injected.Namespace, injected.Name, attempt, removal)
+		}
+		time.Sleep(3 * time.Second)
 	}
 }
 

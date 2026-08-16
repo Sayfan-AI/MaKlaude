@@ -202,6 +202,18 @@ UID-conditioned `Injector.Remove` as a deliberate teardown.
 That means: **the fault is over within 10 minutes no matter what happens to MaKlaude,
 and the record of it is gone on the next sweep.**
 
+**A teardown that succeeds has been *accepted*, not completed**, and the difference is
+load-bearing rather than pedantic. Chaos Mesh holds a finalizer on every experiment and
+clears it only once its controller has recovered the fault, so the object sits in
+`Terminating` in between: a second `Remove` in that window reports success with
+`AlreadyAbsent` **false** (the object really is still there), and re-injecting the same
+experiment fails with `ErrExperimentExists` until the name is free. `AlreadyAbsent` is
+therefore the receipt for *recovery finished*, not merely for *object deleted*. MaKlaude
+never forces the object away — `--force`-style deletion would drop the record while
+leaving the pods broken. The upside is the guarantee itself: because recovery belongs to
+Chaos Mesh, a MaKlaude that is `SIGKILL`ed one instant after the delete is accepted still
+leaves a cluster that un-breaks itself.
+
 `internal/chaos` proves the first half by killing a real process. A child process
 injects a persisting fault, gets `SIGKILL`ed the instant the create lands, and the test
 then asserts that no teardown request ever reached the API server and that the object

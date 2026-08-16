@@ -349,6 +349,21 @@ func (i *Injector) assertAbsent(ctx context.Context, e Experiment) error {
 // The delete overrides neither propagation policy nor grace period, so Chaos Mesh's
 // finalizer runs and a persisting fault is reverted before the object disappears.
 // Forcing the object away would remove the record while leaving the fault.
+//
+// So a successful Remove means the deletion was ACCEPTED, not that the object is
+// gone: Chaos Mesh holds a finalizer (`chaos-mesh/records`) and clears it only after
+// its controller has recovered the fault, which leaves the object in Terminating for
+// as long as that takes. Two consequences a caller has to expect. A second Remove in
+// that window reports success with [Removal.AlreadyAbsent] FALSE, because the object
+// is genuinely still there — `AlreadyAbsent` is the receipt for "gone", so it is also
+// the receipt for "recovery finished". And [Injector.Inject] of the same experiment
+// fails with [ErrExperimentExists] until then, since the derived name is still taken;
+// that is the create-shaped precondition working, not a stale read.
+//
+// The upside is worth naming, because it is the guarantee this milestone is about:
+// the finalizer makes recovery independent of MaKlaude. Once the delete is accepted,
+// a MaKlaude that is SIGKILLed one instant later still leaves a cluster that
+// un-breaks itself.
 func (i *Injector) Remove(ctx context.Context, in Injected) (*Removal, error) {
 	if err := validateName("namespace", in.Namespace); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidExperiment, err)
