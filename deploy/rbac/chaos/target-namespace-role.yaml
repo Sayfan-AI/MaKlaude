@@ -1,0 +1,81 @@
+# The per-target-namespace capability: "MaKlaude may aim chaos at THIS namespace."
+#
+# It is applied once per namespace an operator is willing to have broken, and it
+# carries no `metadata.namespace` on purpose — the namespace comes from the apply, so
+# choosing one is an explicit act rather than a default someone inherits:
+#
+#   kubectl apply -f deploy/rbac/chaos/target-namespace-role.yaml        -n <target-ns>
+#   kubectl apply -f deploy/rbac/chaos/target-namespace-rolebinding.yaml -n <target-ns>
+#
+# It is deliberately NOT in this directory's kustomization.yaml. `kubectl apply -k
+# deploy/rbac/chaos` gives MaKlaude an identity that can write experiment objects into
+# its own namespace and break nothing; the ability to break a particular workload is a
+# second, separate, per-namespace decision. Revoke it the same way, one namespace at a
+# time: `kubectl delete -f ... -n <target-ns>`.
+#
+# WHY THIS EXISTS — it is Chaos Mesh's contract, not MaKlaude's preference.
+#
+# Chaos Mesh installs with permission validation on by default: its `vauth.kb.io`
+# validating webhook authorizes a create by asking the API server whether the
+# REQUESTER may create this chaos kind in every namespace the experiment's SELECTOR
+# names. One SubjectAccessReview per target namespace, with exactly these attributes:
+#
+#   verb: create   group: chaos-mesh.org   resource: podchaos   namespace: <target>
+#
+# (See pkg/webhook/validate_auth.go in chaos-mesh v2.8.3 — the version
+# scripts/install-chaos-mesh.sh pins. `enabled` comes from the controller's
+# SECURITY_MODE env, which the chart sets from `dashboard.securityMode`, default true.
+# The name is misleading: turning the dashboard OFF does not turn this check off.)
+#
+# Without this Role, MaKlaude's create is denied — "system:serviceaccount:maklaude:
+# maklaude-chaos is forbidden on namespace <target>" — even though its own Role in
+# maklaude-chaos permits the write. That denial is the correct behaviour of a correct
+# system, and it makes the set of namespaces MaKlaude can reach an allowlist a person
+# writes, one namespace at a time.
+#
+# THE ONE VERB, AND WHY IT IS NOT MORE:
+#
+#   create podchaos.chaos-mesh.org : precisely the check above, and nothing else.
+#
+# This grant is not used to write anything into this namespace. Experiment objects
+# always live in maklaude-chaos, which internal/chaos enforces — an experiment whose CR
+# namespace appears in its own selector is refused before any request is composed (see
+# Experiment.placementProblems). The two mechanisms are meant to be read together:
+# RBAC bounds where a create COULD land to {maklaude-chaos} ∪ {target namespaces}, and
+# the validator removes the target namespaces from that set. What remains is the one
+# namespace the reaper sweeps.
+#
+# WHAT IS DELIBERATELY ABSENT:
+#
+#   - get / list / delete       : NOT granted here, only in maklaude-chaos. A sweep
+#     podchaos                    that could enumerate this namespace would suggest
+#                                 MaKlaude's objects legitimately live here; they do
+#                                 not, and a namespace it cannot list is a namespace
+#                                 it cannot delete from either.
+#   - pods, deployments, nodes  : NOT granted, in any verb. This is the grant that
+#                                 lets MaKlaude break workloads here, and it confers
+#                                 no ability to read or touch one. Chaos Mesh's
+#                                 controller does the breaking, with its own
+#                                 privileges; that boundary is why a third identity
+#                                 exists at all.
+#   - other chaos-mesh.org      : one kind, matching internal/chaos's closed catalog.
+#     kinds                       Adding a kind means adding it here and in
+#                                 deploy/rbac/chaos/role.yaml in the same change.
+#
+# A CLUSTER-SCOPED EXPERIMENT IS IMPOSSIBLE, and this is where that falls out: when a
+# selector names no namespaces, the same webhook demands cluster-wide `create
+# podchaos` instead of per-namespace, which no Role can confer. internal/chaos also
+# refuses to compose such a selector (Selector.problems). Two independent layers, same
+# answer.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: maklaude-chaos-target
+  labels:
+    app.kubernetes.io/name: maklaude
+    app.kubernetes.io/component: chaos
+rules:
+  - apiGroups: ["chaos-mesh.org"]
+    resources:
+      - podchaos
+    verbs: ["create"]

@@ -63,6 +63,13 @@ const (
 	// foreignExperiment is the operator's own experiment, seeded by the CI job. The
 	// reaper must leave it alone. See manifests/chaos-foreign.yaml.
 	foreignExperiment = "operator-own-experiment"
+
+	// unauthorizedTargetNamespace is a namespace nobody granted chaos in, used as the
+	// allowlist's negative control. `default` is chosen precisely because it always
+	// exists and MaKlaude must still be refused there — a namespace that had to be
+	// created for the test could be mistaken for a fixture whose absence explains the
+	// denial.
+	unauthorizedTargetNamespace = "default"
 )
 
 // chaosTargetSelector matches the victim deployment's pods and nothing else.
@@ -346,6 +353,72 @@ func TestE2E_ChaosReaperSweepsOnlyItsOwn(t *testing.T) {
 	if len(second.Reaped) != 0 {
 		t.Errorf("the second sweep should have nothing of MaKlaude's left to remove, got %+v", second.Reaped)
 	}
+}
+
+// TestE2E_ChaosTargetRoleIsTheAllowlist is the negative control that earns the claim
+// the two lifecycle tests above depend on: the set of namespaces MaKlaude can break is
+// an allowlist a person writes, one `kubectl apply -n <ns>` at a time.
+//
+// Without this test the RBAC evidence is one-sided. The lifecycle tests prove a grant
+// that EXISTS admits an experiment, and a missing-grant denial is the only thing that
+// proves the grant is what did it — otherwise Chaos Mesh could be admitting everything
+// and both tests would pass identically. This is the same shape as the reaper's foreign
+// experiment: the interesting assertion is the refusal.
+//
+// Chaos Mesh's `vauth.kb.io` webhook reviews `create podchaos.chaos-mesh.org` in every
+// namespace the SELECTOR names, so pointing an otherwise-valid experiment at a
+// namespace with no target Role must be refused BY THE SERVER. Two details make this
+// safe to run and hard to pass for the wrong reason:
+//
+//   - it runs in DRY-RUN mode. Admission webhooks run on a dryRun=All create — which
+//     the lifecycle test above proves independently — so the denial is real while no
+//     fault can possibly be injected even if every layer below were broken.
+//   - it is not satisfied by "some error happened". MaKlaude has several local refusals
+//     that would produce an error without ever reaching the cluster (an invalid
+//     experiment, the scope door, a name collision), and an error is only evidence for
+//     THIS property if it came from admission. So the test rejects the local sentinels
+//     explicitly and requires the webhook's own wording.
+func TestE2E_ChaosTargetRoleIsTheAllowlist(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	experiment := podFailureExperiment(2 * time.Minute)
+	experiment.Selector.Namespaces = []string{unauthorizedTargetNamespace}
+
+	// Locally well-formed: MaKlaude has no objection to make, so whatever happens next
+	// is the cluster's answer and not MaKlaude's.
+	if err := experiment.Validate(); err != nil {
+		t.Fatalf("this test needs an experiment MaKlaude itself accepts, so that the refusal can only come from admission: %v", err)
+	}
+
+	preview, err := buildChaosInjector(t, kube.ExecuteDryRun).Inject(ctx, experiment)
+	if err == nil {
+		t.Fatalf("an experiment aimed at %s was ADMITTED (%+v); either that namespace carries a target-namespace grant nobody applied, "+
+			"or Chaos Mesh's permission validation is off (dashboard.securityMode) — in which case the reachable-namespace allowlist does not exist",
+			unauthorizedTargetNamespace, preview)
+	}
+
+	// A local refusal would mean the request never reached the API server, so it says
+	// nothing about the allowlist.
+	for _, local := range []error{chaos.ErrInvalidExperiment, chaos.ErrExperimentExists} {
+		if errors.Is(err, local) {
+			t.Fatalf("the refusal came from MaKlaude (%v), not from admission, so it is no evidence about the target-namespace grant", err)
+		}
+	}
+
+	// The webhook's own wording, from chaos-mesh v2.8.3's validate_auth.go:
+	// "<user> is forbidden on namespace <ns>". Pinned chart version, so this is a
+	// contract rather than a guess — if it changes, this test should be the thing that
+	// notices, since the whole bound rests on that denial happening.
+	got := err.Error()
+	for _, want := range []string{"forbidden on namespace", unauthorizedTargetNamespace} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("the create was refused, but not recognisably by Chaos Mesh's permission webhook (no %q in the error).\n"+
+				"Full error: %v\nIf Chaos Mesh changed its denial message, update this assertion; if the refusal came from somewhere "+
+				"else entirely, the allowlist is not what stopped it.", want, err)
+		}
+	}
+	t.Logf("correctly refused, by admission rather than by MaKlaude: %v", err)
 }
 
 // observeChaosEffect waits for the victim deployment to stop being fully available, and

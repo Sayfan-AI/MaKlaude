@@ -281,7 +281,9 @@ type Experiment struct {
 
 	// Namespace is where the CR OBJECT lives — MaKlaude's own chaos namespace, the
 	// one its Role is scoped to. It is not where the fault lands; that is
-	// Selector.Namespaces.
+	// Selector.Namespaces, and it must not be one of them — see
+	// [Experiment.placementProblems], which is half of a bound RBAC cannot express
+	// alone.
 	Namespace string
 
 	// Selector names the objects the fault may affect.
@@ -370,6 +372,7 @@ func (e Experiment) Validate() error {
 	}
 
 	problems = append(problems, e.Selector.problems()...)
+	problems = append(problems, e.placementProblems()...)
 	problems = append(problems, e.modeProblems()...)
 
 	if known {
@@ -378,6 +381,42 @@ func (e Experiment) Validate() error {
 
 	if len(problems) > 0 {
 		return fmt.Errorf("%w: %s", ErrInvalidExperiment, strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// placementProblems reports an experiment whose CR object would be created in a
+// namespace the experiment itself breaks.
+//
+// This is not tidiness, and it is one half of a bound RBAC cannot express on its
+// own. Chaos Mesh's permission validation (the `vauth.kb.io` webhook, ON by default)
+// authorizes a create by asking the API server whether the REQUESTER may create this
+// chaos kind in every namespace the SELECTOR names — verb `create`, group
+// `chaos-mesh.org`, resource `podchaos`, one SubjectAccessReview per target
+// namespace. So aiming a fault at a namespace requires `create podchaos` there,
+// which is what deploy/rbac/chaos/target-namespace-role.yaml grants, once per
+// namespace an operator is willing to have broken.
+//
+// That grant unavoidably also permits creating an experiment OBJECT in the target
+// namespace: the webhook checks the same verb a write uses, so RBAC cannot tell "may
+// aim here" apart from "may write here". An object outside MaKlaude's own chaos
+// namespace is unreachable by every teardown path that exists — [Reaper.Reap] sweeps
+// one namespace, and the chaos Role grants `list` and `delete` in that one alone, so
+// a stray object could be neither found nor removed. It would be exactly the
+// outlives-the-process leak this milestone is about.
+//
+// So the namespaces a create can land in are bounded twice, by two mechanisms that
+// have to agree: RBAC narrows the set to {the chaos namespace} ∪ {the target
+// namespaces}, and this rule removes the target namespaces from it. What is left is
+// the swept namespace, alone.
+func (e Experiment) placementProblems() []string {
+	for _, ns := range e.Selector.Namespaces {
+		if ns != e.Namespace {
+			continue
+		}
+		return []string{fmt.Sprintf(
+			"namespace %q is also a target in selector.namespaces: an experiment object must not live in a namespace the experiment breaks, "+
+				"because the reaper sweeps only MaKlaude's own chaos namespace and an object anywhere else can never be collected", e.Namespace)}
 	}
 	return nil
 }

@@ -29,6 +29,19 @@
 # pull and scheduling time on every CI run. None of them is on the path an experiment
 # takes.
 #
+# WHAT IS PINNED ON, AND WHY IT LOOKS UNRELATED
+#
+# `dashboard.securityMode=true` is set explicitly even though the dashboard itself is
+# disabled, because that value does not only configure the dashboard: the chart feeds
+# it to the CONTROLLER as SECURITY_MODE, and the controller uses it to enable
+# `vauth.kb.io` — the webhook that authorizes an experiment against the namespaces its
+# selector names (chaos-mesh v2.8.3, cmd/chaos-controller-manager/main.go). It defaults
+# to true, so this changes nothing today; it is pinned so that MaKlaude's RBAC keeps
+# being tested under the posture it was designed for, rather than silently losing a
+# blast-radius bound to an upstream default flip. Under that posture MaKlaude needs a
+# per-target-namespace grant — deploy/rbac/chaos/target-namespace-role.yaml — and
+# without it every experiment is denied by admission. That denial is the bound working.
+#
 # Usage:
 #   scripts/install-chaos-mesh.sh [--namespace NS] [--timeout DURATION] [--uninstall]
 #
@@ -110,6 +123,7 @@ echo "install-chaos-mesh: installing chart $CHAOS_MESH_VERSION into namespace $N
   --set controllerManager.replicaCount=1 \
   --set dashboard.create=false \
   --set dnsServer.create=false \
+  --set dashboard.securityMode=true \
   --wait \
   --timeout "$TIMEOUT"
 

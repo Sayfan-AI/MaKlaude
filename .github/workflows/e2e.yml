@@ -727,6 +727,13 @@ jobs:
           assert_no  list             podchaos.chaos-mesh.org --as="$CHAOS" -n default
           assert_no  create           networkchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos
 
+          # The "before" of a before/after pair, and the reason this line sits in THIS
+          # step rather than the later one: nothing has granted chaos in the target
+          # namespace yet, so the identical assertion passing as `assert_yes` two steps
+          # from now is caused by the apply in between and by nothing else. Without this
+          # reading, an unconditionally-permissive cluster would satisfy the later check.
+          assert_no  create           podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos-target
+
           # The chaos identity still cannot touch a workload itself: Chaos Mesh
           # does the killing, with its own privileges, and that boundary is the
           # reason for a third identity.
@@ -748,6 +755,91 @@ jobs:
           kubectl apply -f test/e2e/manifests/chaos-target.yaml
           kubectl -n maklaude-chaos-target rollout status deployment/victim --timeout=180s
           kubectl -n maklaude-chaos-target get pods -o wide
+
+      # The fourth gate, and the one that has to be opened per namespace rather than
+      # once: Chaos Mesh's permission validation (`vauth.kb.io`, on by default and
+      # pinned on by the install script) authorizes a create by reviewing `create
+      # podchaos.chaos-mesh.org` in every namespace the experiment's SELECTOR names.
+      # The chaos Role covers maklaude-chaos, where the OBJECT goes; it says nothing
+      # about the namespace the fault lands in, so without this apply every experiment
+      # below is denied by admission.
+      #
+      # Applied with `-n` rather than carrying a namespace, which is the whole design
+      # of these two files: which namespaces may be broken is an explicit act by a
+      # person, and `default` deliberately gets no grant so the negative control in
+      # test/e2e/chaos_test.go has something to be refused by.
+      - name: Grant chaos in the target namespace (the per-namespace capability)
+        run: |
+          set -euo pipefail
+          kubectl apply -f deploy/rbac/chaos/target-namespace-role.yaml        -n maklaude-chaos-target
+          kubectl apply -f deploy/rbac/chaos/target-namespace-rolebinding.yaml -n maklaude-chaos-target
+          kubectl -n maklaude-chaos-target get role,rolebinding maklaude-chaos-target
+
+      # What the grant did and — mostly — what it did not do. The denials matter more
+      # than the one permission: this Role is held in a namespace full of somebody's
+      # real workloads, so "may break this namespace" must confer no ability to read
+      # one, touch one, or leave an experiment object behind where no sweep can reach
+      # it.
+      - name: Verify the target-namespace capability is exactly that
+        run: |
+          set -euo pipefail
+          CHAOS=system:serviceaccount:maklaude:maklaude-chaos
+          SA=system:serviceaccount:maklaude:maklaude
+          echo "Grants for $CHAOS in maklaude-chaos-target:"
+          kubectl auth can-i --list --as="$CHAOS" -n maklaude-chaos-target || true
+
+          fail=0
+          assert_yes() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" != "yes" ]; then
+              echo "::error::expected ALLOWED but denied: $*"; fail=1
+            fi
+          }
+          assert_no() {
+            if [ "$(kubectl auth can-i "$@" 2>/dev/null)" = "yes" ]; then
+              echo "::error::expected DENIED but allowed: $*"; fail=1
+            fi
+          }
+
+          # The one verb, which is precisely the SubjectAccessReview the webhook runs.
+          assert_yes create podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos-target
+
+          # And nothing else on the experiment kind here. `list` and `delete` are the
+          # dangerous-looking absences: the reaper sweeps maklaude-chaos alone, so a
+          # target namespace MaKlaude could enumerate would be one where an object could
+          # be created and never collected.
+          for verb in get list delete deletecollection update patch watch; do
+            assert_no "$verb" podchaos.chaos-mesh.org --as="$CHAOS" -n maklaude-chaos-target
+          done
+
+          # The workload it is now allowed to break stays unreadable and untouchable.
+          # Chaos Mesh does the breaking, with its own privileges.
+          for verb in get list delete patch; do
+            assert_no "$verb" pods --as="$CHAOS" -n maklaude-chaos-target
+          done
+          # `--subresource=exec` rather than `pods/exec`: can-i reads a slash as
+          # TYPE/NAME, so `pods/exec` would ask about a pod NAMED exec and pass
+          # vacuously for the wrong reason.
+          assert_no create pods --subresource=exec --as="$CHAOS" -n maklaude-chaos-target
+          assert_no get    secrets --as="$CHAOS" -n maklaude-chaos-target
+          assert_no patch  deployments.apps --as="$CHAOS" -n maklaude-chaos-target
+
+          # The allowlist is a list: one namespace was granted, so every other namespace
+          # must still refuse. `default` is the one the Go negative control aims at.
+          assert_no create podchaos.chaos-mesh.org --as="$CHAOS" -n default
+          assert_no create podchaos.chaos-mesh.org --as="$CHAOS" -n kube-system
+
+          # A cluster-scoped experiment — a selector naming no namespace at all — needs
+          # cluster-wide create, which no namespaced Role can confer. internal/chaos
+          # refuses to compose such a selector too; this is the other layer saying no.
+          assert_no create podchaos.chaos-mesh.org --as="$CHAOS" --all-namespaces
+
+          # And granting a namespace to the chaos identity granted nothing to the
+          # identity every read uses.
+          assert_no create podchaos.chaos-mesh.org --as="$SA" -n maklaude-chaos-target
+          assert_no create podchaos.chaos-mesh.org --as="$SA" -n maklaude-chaos
+
+          [ "$fail" -eq 0 ] || { echo "the target-namespace grant is not the one check it is meant to be"; exit 1; }
+          echo "maklaude-chaos may aim chaos at maklaude-chaos-target, and may do nothing else there."
 
       # The reaper's negative control: an experiment MaKlaude did not create,
       # wearing MaKlaude's own ownership labels. If a sweep ever deletes it, the

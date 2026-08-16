@@ -317,16 +317,88 @@ scope can only pin the collection path, since that's where a `POST` goes), so a
 caller-supplied object would be a way to name an object the scope never approved.
 Building the body is part of the guard, not a convenience.
 
-## What the RBAC does *not* bound
+## Which namespaces MaKlaude can break, and how that is decided
 
-Read this before assuming the Role is the safety net.
+The `maklaude-chaos` Role in
+[`deploy/rbac/chaos/role.yaml`](../deploy/rbac/chaos/role.yaml) covers the namespace
+experiment **objects** live in. It says nothing about where a fault lands, and read
+alone it invites the conclusion that nothing does: MaKlaude writes a CR, Chaos Mesh's
+controller does the killing with its own substantial privileges, and none of
+MaKlaude's permissions are consulted for the killing itself.
 
-**It does not bound the blast radius of an experiment.** MaKlaude writes a CR;
-Chaos Mesh's own controller does the killing, with its own substantial privileges. A
-`PodChaos` created in `maklaude-chaos` whose selector names `kube-system` affects
-`kube-system`, and no permission of MaKlaude's is consulted for that.
+Something does, and it is the file most likely to be missed because it is
+deliberately *not* in the bundle:
+[`target-namespace-role.yaml`](../deploy/rbac/chaos/target-namespace-role.yaml),
+applied once per namespace you are willing to have broken.
 
-What bounds the damage is:
+```bash
+kubectl apply -f deploy/rbac/chaos/target-namespace-role.yaml        -n <target-ns>
+kubectl apply -f deploy/rbac/chaos/target-namespace-rolebinding.yaml -n <target-ns>
+```
+
+### Why that file exists — Chaos Mesh's contract, measured
+
+Chaos Mesh installs with permission validation **on by default**. Its `vauth.kb.io`
+validating webhook authorizes a create by asking the API server, once per namespace
+the experiment's **selector** names, whether the *requester* may create this chaos
+kind there:
+
+```yaml
+# One SubjectAccessReview per target namespace, with exactly these attributes.
+verb: create
+group: chaos-mesh.org
+resource: podchaos      # strings.ToLower(kind)
+namespace: <each namespace in the selector>
+```
+
+That's read out of
+[`pkg/webhook/validate_auth.go`](https://github.com/chaos-mesh/chaos-mesh/blob/v2.8.3/pkg/webhook/validate_auth.go)
+at the chart version [`scripts/install-chaos-mesh.sh`](../scripts/install-chaos-mesh.sh)
+pins, not inferred from behaviour. Three consequences, all load-bearing:
+
+- **It checks `chaos-mesh.org` permissions, not pod permissions.** An earlier version
+  of this document called that a genuine tension — the injector must not touch pods,
+  and permission validation appeared to require that it could. It doesn't, and the
+  resolution costs the chaos identity **no** grant on any workload. `create podchaos`
+  in the target namespace is the entire requirement.
+- **So the reachable namespaces are an allowlist a person writes.** A `PodChaos` in
+  `maklaude-chaos` whose selector names `kube-system` is *denied* unless somebody ran
+  the apply above for `kube-system`. The denial reads
+  `system:serviceaccount:maklaude:maklaude-chaos is forbidden on namespace kube-system`,
+  and it is the bound working rather than a bug.
+- **A cluster-scoped experiment is impossible.** A selector naming no namespace makes
+  the same webhook demand cluster-wide `create podchaos`, which no `Role` can confer.
+  `internal/chaos` also refuses to compose such a selector. Two independent layers,
+  the same answer.
+
+The toggle is `dashboard.securityMode` (default `true`) — misleadingly named, since
+the chart feeds it to the *controller* as `SECURITY_MODE` and disabling the dashboard
+does not disable the check. The install script sets it explicitly so this bound keeps
+existing if the upstream default ever flips.
+
+### What the target grant is, and what it deliberately is not
+
+One verb — `create podchaos.chaos-mesh.org` — which is exactly the review above.
+It confers no read of the namespace, no access to a pod, and no `list`/`delete` on
+experiments there. That last absence needs its reason stated, because the verb it
+*does* grant unavoidably also permits writing an experiment **object** into the
+target namespace: the webhook checks the same verb a write uses, so RBAC cannot tell
+"may aim here" from "may write here".
+
+An object outside `maklaude-chaos` is unreachable by every teardown path that exists
+— `Reaper.Reap` sweeps one namespace, and the chaos Role grants `list` and `delete`
+in that one alone — so it would be precisely the outlives-the-process leak this
+milestone is about. `internal/chaos` therefore refuses any experiment whose CR
+namespace appears in its own selector (`Experiment.placementProblems`). The two
+mechanisms are meant to be read together:
+
+| Mechanism | Namespaces a create could land in |
+|---|---|
+| RBAC alone | `maklaude-chaos` ∪ the granted target namespaces |
+| The validator subtracts | the granted target namespaces |
+| What remains | `maklaude-chaos` — the one namespace the reaper sweeps |
+
+### The other bounds, which this is not a substitute for
 
 - the selector MaKlaude writes, validated in `internal/chaos` and always naming its
   target namespaces explicitly;
@@ -334,22 +406,10 @@ What bounds the damage is:
 - M5's blast-radius budget, cooldown and circuit breaker, once chaos proposals run
   through the decision path (T4).
 
-The Role is what stops MaKlaude reaching *past* Chaos Mesh. It is not what stops
-Chaos Mesh reaching far.
-
-### An open deployment question
-
-Chaos Mesh can be installed with permission validation, where its admission webhook
-checks whether the *requester* may act on the objects a selector matches. Under that
-posture the `maklaude-chaos` identity will be **refused**, because it deliberately
-holds no permissions on pods.
-
-That's a genuine tension, not an oversight: MaKlaude's design says the injector must
-not be able to touch pods directly, and that feature says the injector must be able
-to. Resolving it means granting the target-namespace pod permissions Chaos Mesh
-checks, which widens this identity — an operator's decision, not a default. Which
-posture the `kind` job runs under is pinned by
-[T8](https://github.com/Sayfan-AI/MaKlaude/issues/197).
+The chaos Role is what stops MaKlaude reaching *past* Chaos Mesh. The target-namespace
+Role is what stops it pointing Chaos Mesh wherever it likes. Neither survives an
+operator turning permission validation off, which is why the posture is pinned rather
+than inherited.
 
 MaKlaude also does not install Chaos Mesh. It writes the custom resources;
 installing the controller and choosing its scope is yours.
@@ -373,6 +433,13 @@ go test ./internal/chaos/ ./internal/kube/
 task chaos:install
 kubectl apply -f test/e2e/manifests/chaos-target.yaml
 kubectl apply -f test/e2e/manifests/chaos-foreign.yaml
+
+# The per-namespace capability. Skip it and every experiment below is denied by
+# admission — "forbidden on namespace maklaude-chaos-target" — which is the bound
+# described above doing its job, not a broken test.
+kubectl apply -f deploy/rbac/chaos/target-namespace-role.yaml        -n maklaude-chaos-target
+kubectl apply -f deploy/rbac/chaos/target-namespace-rolebinding.yaml -n maklaude-chaos-target
+
 task e2e:chaos   # see the target's desc for the kubeconfig env vars it needs
 ```
 
@@ -417,6 +484,17 @@ with `kubectl auth can-i` against the real CRD — the complementary question, s
 `can-i` resolves the resource name through discovery — and then runs the lifecycle. Both
 cover every workload denial, the other-namespace denials, the neighbouring chaos kinds,
 and a re-check that the observation and executor identities gained nothing.
+
+The target-namespace capability is checked as a **before/after pair**, and the ordering
+is the point. `chaos on kind` asserts `create podchaos` in `maklaude-chaos-target` is
+DENIED before the grant is applied and ALLOWED after, so the permission is demonstrably
+caused by that apply rather than by a cluster that permits everything. It then asserts
+the grant conferred nothing else there — no read of the namespace, no verb on a pod, no
+`list`/`delete` on experiments — and that `default` and `kube-system` still refuse,
+which is what makes it an allowlist rather than a switch. `TestE2E_ChaosTargetRoleIsTheAllowlist`
+closes the loop from MaKlaude's side: a real experiment aimed at `default`, in dry-run,
+must be refused *by admission* — the test rejects MaKlaude's own local refusals
+explicitly, since an error from the wrong layer is no evidence about the allowlist.
 
 `chaos on kind` also asserts, on the way out and with `always()` so a *failed* run is
 covered too, that no MaKlaude-derived experiment object outlived the job and that the

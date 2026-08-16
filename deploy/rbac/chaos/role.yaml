@@ -68,15 +68,28 @@
 #
 # WHAT THIS ROLE DOES NOT BOUND — read this before assuming it is the safety net:
 #
-# It does not bound the blast radius of an experiment. MaKlaude writes a CR; Chaos
-# Mesh's own controller does the killing, with its own (substantial) privileges. A
-# PodChaos created in maklaude-chaos whose selector names `kube-system` affects
-# kube-system, and no permission of MaKlaude's is consulted for that. What bounds
-# the damage is the selector MaKlaude writes (validated in internal/chaos, always
-# naming its target namespaces explicitly), Chaos Mesh's own installation scope,
-# and M5's blast-radius budget, cooldown and circuit breaker once chaos runs
-# through the decision path (T4). This role is what stops MaKlaude reaching PAST
-# Chaos Mesh; it is not what stops Chaos Mesh reaching far.
+# This file does not bound WHERE a fault lands. MaKlaude writes a CR; Chaos Mesh's
+# own controller does the killing, with its own (substantial) privileges, and
+# nothing in this Role is consulted for that.
+#
+# A SIBLING FILE DOES, and it is easy to miss because it is not in the
+# kustomization: target-namespace-role.yaml, applied once per namespace an operator
+# is willing to have broken. Chaos Mesh installs with permission validation ON by
+# default, and its `vauth.kb.io` webhook authorizes a create by asking whether the
+# REQUESTER may `create podchaos.chaos-mesh.org` in every namespace the SELECTOR
+# names. So a PodChaos created in maklaude-chaos whose selector names `kube-system`
+# is DENIED unless a person granted MaKlaude chaos in kube-system — and a selector
+# that names no namespace at all needs cluster-wide `create`, which no Role here
+# confers. That makes the reachable namespaces an allowlist rather than a hope.
+#
+# It is not the only bound, and it is not the last one. The rest are the selector
+# MaKlaude writes (validated in internal/chaos, always naming its target namespaces
+# explicitly), Chaos Mesh's own installation scope, and M5's blast-radius budget,
+# cooldown and circuit breaker once chaos runs through the decision path (T4). Nor
+# does it survive an operator disabling the check (`dashboard.securityMode=false`,
+# despite the name — see docs/chaos.md), which is why MaKlaude's install script pins
+# it on. This Role is what stops MaKlaude reaching PAST Chaos Mesh; the target-
+# namespace Role is what stops it pointing Chaos Mesh anywhere it likes.
 #
 # DRY RUN NEEDS THE SAME VERBS, for the same reason the executor's role does:
 # Kubernetes authorizes a dryRun=All request with the identical verb it would use

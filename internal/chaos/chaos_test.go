@@ -85,6 +85,24 @@ func TestExperiment_Validate_Refusals(t *testing.T) {
 			mutate: func(e *Experiment) { e.Selector.Namespaces = []string{"demo", "demo"} },
 			want:   `selector.namespaces repeats "demo"`,
 		},
+		// The CR namespace appearing among the targets is the one refusal here that is
+		// about RBAC rather than about a malformed value, and it is worth reading with
+		// deploy/rbac/chaos/target-namespace-role.yaml open. Chaos Mesh's permission
+		// webhook makes MaKlaude hold `create podchaos` in every namespace it aims at,
+		// which is also — unavoidably, since it is the same verb — permission to write
+		// an experiment OBJECT there. An object outside maklaude-chaos can never be
+		// swept, because that is the only namespace the chaos Role can list or delete
+		// in. So RBAC bounds the landing set to {maklaude-chaos} ∪ {targets} and this
+		// rule subtracts the targets: the two together leave exactly the swept
+		// namespace. See Experiment.placementProblems.
+		"CR namespace is also a target": {
+			mutate: func(e *Experiment) { e.Selector.Namespaces = []string{"other", e.Namespace} },
+			want:   "is also a target in selector.namespaces",
+		},
+		"CR namespace is the only target": {
+			mutate: func(e *Experiment) { e.Selector.Namespaces = []string{e.Namespace} },
+			want:   "an experiment object must not live in a namespace the experiment breaks",
+		},
 		"malformed label key": {
 			mutate: func(e *Experiment) { e.Selector.LabelSelectors = map[string]string{"not a key": "web"} },
 			want:   "is not a valid label key",
