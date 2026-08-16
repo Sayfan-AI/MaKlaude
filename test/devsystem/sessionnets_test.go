@@ -19,7 +19,6 @@
 package devsystem
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -205,32 +204,13 @@ func TestSessionNetsNudgesOnceAcrossTwoRuns(t *testing.T) {
 }
 
 // sessionStartCommands returns the SessionStart hook commands from
-// .claude/settings.json in declaration order.
+// .claude/settings.json in declaration order. The parsing lives in
+// hookCommands (hostguard_test.go), which does the same job for PreToolUse:
+// two functions parsing one file drift, and the symptom would be one hook event
+// silently unparsed while its test reports "not wired yet".
 func sessionStartCommands(t *testing.T) (path string, commands []string) {
 	t.Helper()
-	path = filepath.Join("..", "..", ".claude", "settings.json")
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-
-	var cfg struct {
-		Hooks map[string][]struct {
-			Hooks []struct {
-				Type    string `json:"type"`
-				Command string `json:"command"`
-			} `json:"hooks"`
-		} `json:"hooks"`
-	}
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		t.Fatalf("parse %s: %v", path, err)
-	}
-	for _, matcher := range cfg.Hooks["SessionStart"] {
-		for _, h := range matcher.Hooks {
-			commands = append(commands, h.Command)
-		}
-	}
-	return path, commands
+	return hookCommands(t, "SessionStart")
 }
 
 // TestSessionStartHookRunsSessionNets ties the script to its trigger, the same
