@@ -707,25 +707,112 @@ json.dump(filtered, sys.stdout)
         ;;
 
     label)
-        ID="" ADD="" REMOVE=""
+        # Repeated flags ACCUMULATE. They used to overwrite two scalars, so
+        # `label --id 199 --remove in-progress --remove needs:human` printed the
+        # issue URL, exited 0, and removed only the last one. The caller had no
+        # way to tell a full removal from a partial one, and the label the loop
+        # relies on to say "someone is working this" was the one silently left
+        # behind.
+        # Counters rather than ${#ARRAY[@]}: this runs under `set -u` on bash 3.2
+        # (macOS ships it), where expanding an EMPTY array is an unbound-variable
+        # error. The first version of this fix used ${#ADD[@]} and broke exactly
+        # the remove-only call the bug was reported for. Same for the loops below,
+        # which use the ${ARRAY[@]+...} guard for the same reason.
+        ID="" ADD=() REMOVE=() N_ADD=0 N_REMOVE=0
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --id) ID="$2"; shift 2 ;;
-                --add) ADD="$2"; shift 2 ;;
-                --remove) REMOVE="$2"; shift 2 ;;
+                --add) ADD+=("$2"); N_ADD=$((N_ADD + 1)); shift 2 ;;
+                --remove) REMOVE+=("$2"); N_REMOVE=$((N_REMOVE + 1)); shift 2 ;;
                 *) shift ;;
             esac
         done
         if [ -z "$ID" ]; then
-            echo "Usage: issues.sh label --id ID --add LABEL | --remove LABEL" >&2
+            echo "Usage: issues.sh label --id ID [--add LABEL]... [--remove LABEL]..." >&2
             exit 1
         fi
-        # Plain `[ -n ... ] && cmd` here would make a successful add-only call
-        # exit 1: the trailing `[ -n "$REMOVE" ]` fails when --remove is unset,
-        # and the case arm's status is the script's. Callers treat non-zero as
-        # "the label was not applied", which is exactly wrong.
-        if [ -n "$ADD" ]; then gh issue edit "$ID" --add-label "$ADD"; fi
-        if [ -n "$REMOVE" ]; then gh issue edit "$ID" --remove-label "$REMOVE"; fi
+        if [ "$N_ADD" -eq 0 ] && [ "$N_REMOVE" -eq 0 ]; then
+            echo "issues.sh label: nothing to do, pass --add and/or --remove" >&2
+            exit 1
+        fi
+        # One gh call per label rather than a comma-joined list: a single bad
+        # label in a joined list fails the whole edit, and a partial failure that
+        # reports success is the bug this rewrite exists to remove.
+        rc=0
+        for l in ${ADD[@]+"${ADD[@]}"};       do gh issue edit "$ID" --add-label    "$l" || rc=1; done
+        for l in ${REMOVE[@]+"${REMOVE[@]}"}; do gh issue edit "$ID" --remove-label "$l" || rc=1; done
+        exit $rc
+        ;;
+
+    claim)
+        # Mark an issue as being worked, and PROVE it stuck.
+        #
+        # "The agent should label it in-progress" is a rule a model follows most of
+        # the time, and most of the time is not a state machine. The label is what
+        # the loop, the human, and `summary` all read to answer "is someone on
+        # this", so a silently missing label makes the whole board lie. This does
+        # the write and then reads it back, so a failure is loud and the caller can
+        # tell success from a no-op.
+        ID=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --id) ID="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        if [ -z "$ID" ]; then
+            echo "Usage: issues.sh claim --id ID" >&2
+            exit 1
+        fi
+        gh issue edit "$ID" --add-label in-progress >/dev/null || {
+            echo "issues.sh claim: could not add in-progress to #$ID" >&2
+            exit 1
+        }
+        if ! gh issue view "$ID" --json labels --jq '[.labels[].name]|index("in-progress")' \
+             | grep -qv '^null$'; then
+            echo "issues.sh claim: in-progress did not stick on #$ID; refusing to report success" >&2
+            exit 1
+        fi
+        echo "claimed #$ID"
+        ;;
+
+    next)
+        # Deterministically choose this run's unit of work and claim it.
+        #
+        # Selection is a query, not a judgment: the newest unblocked, unclaimed,
+        # open issue on the active milestone, oldest first so nothing starves. The
+        # orchestrator calling this cannot forget to mark what it picked, because
+        # picking and marking are the same call.
+        #
+        # Prints the issue number on stdout and nothing else, so callers can do
+        # ISSUE=$(issues.sh next --milestone 6). Exits 3 with no output when there
+        # is nothing to work, which is a distinct outcome from an error.
+        MILESTONE=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --milestone) MILESTONE="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        if [ -z "$MILESTONE" ]; then
+            echo "Usage: issues.sh next --milestone N" >&2
+            exit 1
+        fi
+        CANDIDATE="$(gh issue list --state open --label "milestone:$MILESTONE" \
+            --json number,createdAt,labels --limit 100 \
+            --jq '[.[] | select(([.labels[].name] | index("blocked")) == null)
+                       | select(([.labels[].name] | index("in-progress")) == null)
+                       | select(([.labels[].name] | index("needs:human")) == null)]
+                  | sort_by(.createdAt) | .[0].number // empty')"
+        if [ -z "$CANDIDATE" ]; then
+            exit 3
+        fi
+        # Claim it through the same verified path rather than a bare label call.
+        # `bash "$0"` rather than `"$0"`: callers invoke this as
+        # `bash .genesis/scripts/issues.sh`, so relying on the exec bit would make
+        # `next` fail in exactly the environments where `claim` still works.
+        bash "$0" claim --id "$CANDIDATE" >/dev/null || exit 1
+        echo "$CANDIDATE"
         ;;
 
     comment)
