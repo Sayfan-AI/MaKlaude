@@ -43,6 +43,78 @@ command = ((ctx.get("tool_input") or {}).get("command")) or ""
 if not isinstance(command, str) or not command:
     sys.exit(0)
 
+# A heredoc body that is being written as TEXT is prose, and prose that merely
+# names a credential path is not a read of one. Refusing it is a false positive,
+# and this guard's own documentation is the most common victim: any doc, pull
+# request body or escalation that says what the guard blocks has to name the
+# paths it blocks.
+#
+# The discriminator is NOT "is it a heredoc." It is *what consumes the body*. A
+# body going to a file is text; a body going to `bash` is a program, and
+# exempting heredocs wholesale would hand back a trivial evasion:
+#
+#     bash <<'EOF'
+#     cat ~/.ssh/id_rsa
+#     EOF
+#
+# So this exempts a body only when its opener is a single, simple command whose
+# name is a known text sink. Everything else keeps its body in scope. The two
+# ways to be wrong here do not cost the same: a missing entry in the sink list is
+# another false positive, while a missing entry in a list of interpreters is a
+# hole. So this allowlists the safe shape rather than denylisting the unsafe one,
+# and anything it cannot confidently classify stays in scope.
+TEXT_SINKS = {"cat", "tee", "gh", "printf"}
+
+# Any of these on the opener line means the body's destination is not decidable
+# from one command: a pipe or substitution can feed it to an interpreter, and a
+# chain can write it to a file and then run that file.
+UNDECIDABLE = ("|", ";", "&&", "||", "`", "$(", "\n")
+
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def strip_text_heredocs(cmd):
+    """Remove heredoc bodies that are unambiguously being written as text."""
+    lines = cmd.split("\n")
+    keep = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        keep.append(line)
+        match = _HEREDOC.search(line)
+        i += 1
+        if not match:
+            continue
+
+        marker = match.group(2)
+        dashed = line[match.start():match.start() + 3].startswith("<<-")
+
+        # Locate the terminator first. Without one this is not a well-formed
+        # heredoc and nothing is stripped.
+        end = None
+        for j in range(i, len(lines)):
+            candidate = lines[j].strip() if dashed else lines[j]
+            if candidate == marker:
+                end = j
+                break
+        if end is None:
+            continue
+
+        opener = line[:match.start()]
+        first = opener.strip().split()[0] if opener.strip().split() else ""
+        simple = not any(tok in line for tok in UNDECIDABLE)
+        if first in TEXT_SINKS and simple:
+            keep.append(lines[end])  # keep the terminator, drop the body
+            i = end + 1
+
+    return "\n".join(keep)
+
+
+try:
+    scanned = strip_text_heredocs(command)
+except Exception:
+    scanned = command  # classification failed: scan everything, block more not less
+
 home = os.path.expanduser("~")
 # Paths that hold credentials and have no business in a dev-system session. The
 # repo's own kubeconfigs are referenced by explicit path from cluster config, so
@@ -59,7 +131,7 @@ SENSITIVE = [
     r"/etc/(shadow|sudoers)",
 ]
 for pattern in SENSITIVE:
-    if re.search(pattern, command):
+    if re.search(pattern, scanned):
         sys.stderr.write(
             "blocked by .genesis/scripts/host-guard.sh: this command reaches "
             "outside the repository for a path that holds operator credentials "
