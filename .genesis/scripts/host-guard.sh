@@ -65,12 +65,40 @@ if not isinstance(command, str) or not command:
 # and anything it cannot confidently classify stays in scope.
 TEXT_SINKS = {"cat", "tee", "gh", "printf"}
 
-# Any of these on the opener line means the body's destination is not decidable
-# from one command: a pipe or substitution can feed it to an interpreter, and a
-# chain can write it to a file and then run that file.
-UNDECIDABLE = ("|", ";", "&&", "||", "`", "$(", "\n")
+# What separates one command from the next. Scanning back from `<<` to the
+# nearest of these finds the command that actually OWNS the heredoc, which is not
+# the same as the first word of the line. The common shape for writing a pull
+# request body is
+#
+#     gh pr create --body "$(cat <<'EOF' ... EOF)"
+#
+# where the line starts with `gh` but the body is consumed by `cat` inside a
+# substitution. Taking the first word would classify that as `gh`, and treating
+# the `$(` as disqualifying would refuse the single most common way an agent
+# writes prose about this guard.
+_OWNER_DELIMS = ("$(", "`", "|", ";", "&&", "||", "(", "\n")
+
+# After the marker, anything that can hand the body to another command means the
+# destination is no longer decidable: a pipe feeds it onward, and a chain can
+# write it to a file and then execute that file. A substitution *after* the marker
+# is fine, because it never receives the body.
+_POST_MARKER_DISQUALIFIERS = ("|", ";", "&&", "||", "`")
 
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def owning_command(line, at):
+    """The command consuming the heredoc opened at index `at` on this line."""
+    cut = 0
+    for delim in _OWNER_DELIMS:
+        found = line.rfind(delim, 0, at)
+        if found != -1:
+            cut = max(cut, found + len(delim))
+    segment = line[cut:at].strip()
+    if segment.startswith(('"', "'")):
+        segment = segment[1:].strip()
+    words = segment.split()
+    return words[0] if words else ""
 
 
 def strip_text_heredocs(cmd):
@@ -100,10 +128,10 @@ def strip_text_heredocs(cmd):
         if end is None:
             continue
 
-        opener = line[:match.start()]
-        first = opener.strip().split()[0] if opener.strip().split() else ""
-        simple = not any(tok in line for tok in UNDECIDABLE)
-        if first in TEXT_SINKS and simple:
+        owner = owning_command(line, match.start())
+        tail = line[match.end():]
+        onward = any(tok in tail for tok in _POST_MARKER_DISQUALIFIERS)
+        if owner in TEXT_SINKS and not onward:
             keep.append(lines[end])  # keep the terminator, drop the body
             i = end + 1
 

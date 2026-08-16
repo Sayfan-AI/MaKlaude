@@ -443,6 +443,14 @@ func TestHostGuardAllowsProseThatNamesCredentialPaths(t *testing.T) {
 			"tee /tmp/x.md <<'EOF'\nwe block ~/.ssh here\nEOF",
 		},
 		{
+			// The single most common way an agent writes prose about the guard:
+			// the line starts with `gh`, but `cat` inside the substitution is
+			// what consumes the body. Classifying by the line's first word gets
+			// this wrong.
+			"heredoc owned by cat inside a substitution",
+			"gh pr create --body \"$(cat <<'EOF'\nrefuses reads of ~/.ssh and ~/.aws\nEOF\n)\"",
+		},
+		{
 			// <<- strips leading tabs, so the terminator matches after stripping.
 			"indented terminator",
 			"cat <<-'EOF'\n\tmentions ~/.ssh in prose\n\tEOF",
@@ -474,9 +482,17 @@ func TestHostGuardExemptionIsNotABypass(t *testing.T) {
 			"written to a file and then run",
 			"cat > /tmp/x.sh <<'EOF' ; bash /tmp/x.sh\ncat ~/.ssh/id_rsa\nEOF",
 		},
+		// Once a substitution is allowed to own a heredoc (the shape below in
+		// TestHostGuardAllowsProse...), the command inside it has to be checked
+		// as carefully as one at the start of a line, or the fix for the prose
+		// false positive hands the same bypass back through a different door.
 		{
-			"substitution in the opener",
-			"cat > $(echo /tmp/x.sh) <<'EOF'\ncat ~/.ssh/id_rsa\nEOF",
+			"interpreter owning a heredoc inside a substitution",
+			"gh pr create --body \"$(bash <<'EOF'\ncat ~/.ssh/id_rsa\nEOF\n)\"",
+		},
+		{
+			"python3 inside a substitution",
+			"echo \"$(python3 <<'EOF'\ncat ~/.ssh/id_rsa\nEOF\n)\"",
 		},
 		{
 			// Not a well-formed heredoc, so there is no body to classify. Three
