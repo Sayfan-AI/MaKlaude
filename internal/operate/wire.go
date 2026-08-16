@@ -92,6 +92,23 @@ const AutonomyRulesEnv = "MAKLAUDE_AUTONOMY_RULES"
 // history is rebuilt, which is the cheapest revocation there is.
 const TrustLedgerEnv = "MAKLAUDE_TRUST_LEDGER"
 
+// ChaosWindowSuffix names the quarantine-window log by appending to the trust ledger's
+// own path.
+//
+// It is derived rather than given its own environment variable, and that is a decision
+// about failure modes rather than about ergonomics. The window log is the explanation for
+// every gap in the ledger beside it, so the two files belong together on disk and
+// unsetting one while setting the other is not a configuration anybody wants. A separate
+// knob would allow exactly that: a ledger with no window log, which silently means a
+// deliberate fault demotes real shapes. Deriving it means an operator who configured a
+// ledger has configured this.
+//
+// A [Cycle] reports the resolved path ([Cycle.QuarantinePath]) rather than making anybody
+// re-derive it, for the same reason `checkpoint.sh --path` exists: two places computing
+// one path drift, and the symptom is a report pointing at a file that is not the one being
+// written.
+const ChaosWindowSuffix = ".chaos-windows"
+
 // New builds the production cycle from the environment.
 //
 // Under [kube.ExecuteDisabled] — the default — it builds NO approval gate and leaves
@@ -232,6 +249,16 @@ func (c *Cycle) autonomyFromEnv(getenv func(string) string) error {
 		return fmt.Errorf("%s: %w", TrustLedgerEnv, err)
 	}
 
+	windowsPath := ledgerPath + ChaosWindowSuffix
+	windows, err := trust.OpenWindows(windowsPath)
+	if err != nil {
+		return fmt.Errorf("%s: %w", TrustLedgerEnv, err)
+	}
+	recorder, err := trust.NewQuarantine(ledger, windows)
+	if err != nil {
+		return fmt.Errorf("%s: %w", TrustLedgerEnv, err)
+	}
+
 	trail, live := disclose.TrailFromEnv()
 	switch {
 	case trail == nil:
@@ -244,8 +271,13 @@ func (c *Cycle) autonomyFromEnv(getenv func(string) string) error {
 		return nil
 	}
 
-	c.UseAutonomy(rs, ledger, trail, ledger)
+	// The ledger is the oracle and the QUARANTINE is the recorder. The asymmetry is the
+	// point: the quarantine only ever withholds evidence from the history, so reading
+	// trust through the bare ledger is correct and reading through the quarantine would
+	// add nothing. See [trust.Quarantine].
+	c.UseAutonomy(rs, ledger, trail, recorder)
 	c.ledgerPath = ledgerPath
+	c.windowsPath = windowsPath
 	c.rulesPath = rulesPath
 	return nil
 }

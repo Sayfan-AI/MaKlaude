@@ -232,6 +232,26 @@ const (
 	// ReasonEarnedTrust — a rule permits the action and the shape earned it. The one
 	// and only reason that produces [DecisionAutoApply].
 	ReasonEarnedTrust
+
+	// ReasonChaosNeverPromotes — the proposal is a deliberate fault ([ClassChaos]), so
+	// it gates no matter what the ruleset and the ledger say.
+	//
+	// This is a normal outcome an operator should read as the design working, not as a
+	// misconfiguration: an experiment's value is that its outcome is unknown, so a
+	// history of clean injections is not evidence the next one is safe. See
+	// [ClassChaos]. It is decided before any rule is read, which is why it carries no
+	// rule name.
+	ReasonChaosNeverPromotes
+
+	// ReasonProposalClassUnknown — the request's class is unset or is a value this
+	// build does not recognize, so what the proposal even IS cannot be established.
+	//
+	// It gates rather than refusing, because the fault is in the caller rather than in
+	// the action: an unclassified request is a wiring bug, and the human gate is the
+	// posture that keeps the action reviewable while somebody fixes it. Unlike every
+	// other reason here it should never appear in a healthy system, and its presence
+	// in a report means a [Request] was built without its class.
+	ReasonProposalClassUnknown
 )
 
 // String renders the reason as a stable lowercase token, for audit records, logs,
@@ -270,6 +290,10 @@ func (r Reason) String() string {
 		return "trust-evidence-missing"
 	case ReasonEarnedTrust:
 		return "earned-trust"
+	case ReasonChaosNeverPromotes:
+		return "chaos-never-promotes"
+	case ReasonProposalClassUnknown:
+		return "proposal-class-unknown"
 	default:
 		return "reason(" + strconv.Itoa(int(r)) + ")"
 	}

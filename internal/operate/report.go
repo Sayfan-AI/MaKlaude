@@ -11,6 +11,7 @@ import (
 	"github.com/Sayfan-AI/MaKlaude/internal/budget"
 	"github.com/Sayfan-AI/MaKlaude/internal/execute"
 	"github.com/Sayfan-AI/MaKlaude/internal/remediate"
+	"github.com/Sayfan-AI/MaKlaude/internal/trust"
 )
 
 // Report is the structured result of one [Cycle.Run]: per cluster, what MaKlaude
@@ -82,6 +83,27 @@ type AutonomyReport struct {
 	// and deleting it is the broadest revocation available.
 	LedgerPath string `json:"ledgerPath,omitempty"`
 
+	// QuarantinePath names the log of every period during which a deliberate fault kept
+	// outcomes out of the ledger. It is reported beside LedgerPath because the two only
+	// make sense together: this file is the explanation for every gap in that one, and an
+	// operator asking "why did this shape never promote?" needs to be able to find it
+	// without knowing that chaos exists.
+	QuarantinePath string `json:"quarantinePath,omitempty"`
+
+	// Quarantined is the windows in force right now, rendered. Empty is the ordinary
+	// state and prints nothing: an unconditional "no quarantine" line would appear in
+	// every report of every deployment that never runs chaos.
+	Quarantined []string `json:"quarantined,omitempty"`
+
+	// QuarantineDrops is the outcomes a window held back during this process's lifetime.
+	//
+	// It is reported because the alternative is the silent version of a correct
+	// behaviour: the shapes on a cluster under chaos simply stop moving, which reads
+	// exactly like shapes that never earned anything. Saying "three outcomes were not
+	// admitted, and here is the window that explains them" is the difference between a
+	// gap and a hidden one.
+	QuarantineDrops []string `json:"quarantineDrops,omitempty"`
+
 	// Configured reports whether a blast-radius budget is wired at all. When false
 	// nothing can be auto-applied, because the ceiling that would bound it does not
 	// exist — so this is a posture statement, not the absence of one.
@@ -129,6 +151,7 @@ func autonomyReport(b *budget.Budget, p posture) AutonomyReport {
 	r := AutonomyReport{Breakers: []budget.Breaker{}, Suppressed: []budget.Suppression{}}
 	r.Autonomous, r.Off = p.autonomous, p.off
 	r.Rules, r.RulesPath, r.LedgerPath = p.rules, p.rulesPath, p.ledgerPath
+	r.QuarantinePath, r.Quarantined, r.QuarantineDrops = p.quarantinePath, p.quarantined, p.quarantineDrops
 	if b == nil {
 		return r
 	}
@@ -150,6 +173,10 @@ type posture struct {
 	rules      int
 	rulesPath  string
 	ledgerPath string
+
+	quarantinePath  string
+	quarantined     []string
+	quarantineDrops []string
 }
 
 // posture reports whether this cycle can act unattended, and why not when it cannot.
@@ -169,6 +196,7 @@ func (c *Cycle) posture() posture {
 	if reporter, ok := c.ledger.(interface{ Path() string }); ok && p.ledgerPath == "" {
 		p.ledgerPath = reporter.Path()
 	}
+	c.readQuarantine(&p)
 	if p.autonomous {
 		p.off = ""
 		return p
@@ -177,6 +205,35 @@ func (c *Cycle) posture() posture {
 		p.off = c.missingForAutonomy()
 	}
 	return p
+}
+
+// readQuarantine fills in what the trust ledger's quarantine has been doing, when the
+// recorder is one.
+//
+// A cycle whose recorder is a bare ledger fills in nothing, which is correct: with no
+// quarantine there is no window log to point at and no outcome could have been held back.
+// The active windows are read against the report's own instant so a window that expired
+// during the pass is not reported as still in force — a quarantine nobody closed is a
+// distinct and less comfortable fact than one that is running, and reporting the second
+// when the first is true would hide it.
+func (c *Cycle) readQuarantine(p *posture) {
+	q, ok := c.ledger.(*trust.Quarantine)
+	if !ok {
+		return
+	}
+	p.quarantinePath = c.windowsPath
+	if p.quarantinePath == "" {
+		p.quarantinePath = q.Windows().Path()
+	}
+	now := c.clock()
+	for _, w := range q.Windows().All() {
+		if w.Active(now) {
+			p.quarantined = append(p.quarantined, w.String())
+		}
+	}
+	for _, d := range q.Dropped() {
+		p.quarantineDrops = append(p.quarantineDrops, d.String())
+	}
 }
 
 // missingForAutonomy names the first thing [Cycle.autonomyWired] is missing.
@@ -735,11 +792,36 @@ func (a AutonomyReport) writeText(b *strings.Builder) {
 
 	if len(a.Suppressed) == 0 {
 		b.WriteString("  suppressed auto-applies: none\n")
+	} else {
+		fmt.Fprintf(b, "  suppressed auto-applies (%d) — eligible actions a bound held back:\n", len(a.Suppressed))
+		for _, s := range a.Suppressed {
+			fmt.Fprintf(b, "    - %s %s: %s (%s)\n", s.Cluster, s.Target, s.Reason, orUnknown(s.Detail))
+		}
+	}
+	a.writeQuarantine(b)
+}
+
+// writeQuarantine renders the trust ledger's chaos quarantine, and prints nothing at all
+// when no window is in force and nothing was held back.
+//
+// Silence in the ordinary case is deliberate. Every deployment that never runs chaos
+// would otherwise carry two lines saying nothing happened, and a report that pads itself
+// with all-clear notices is one an operator stops reading — which is the same argument
+// the deterministic dev-system nets make for empty sections meaning all-clear.
+func (a AutonomyReport) writeQuarantine(b *strings.Builder) {
+	if len(a.Quarantined) == 0 && len(a.QuarantineDrops) == 0 {
 		return
 	}
-	fmt.Fprintf(b, "  suppressed auto-applies (%d) — eligible actions a bound held back:\n", len(a.Suppressed))
-	for _, s := range a.Suppressed {
-		fmt.Fprintf(b, "    - %s %s: %s (%s)\n", s.Cluster, s.Target, s.Reason, orUnknown(s.Detail))
+	fmt.Fprintf(b, "  trust ledger QUARANTINED — outcomes on these clusters are not admissible as trust evidence")
+	if a.QuarantinePath != "" {
+		fmt.Fprintf(b, " (window log %s)", a.QuarantinePath)
+	}
+	b.WriteString(":\n")
+	for _, w := range a.Quarantined {
+		fmt.Fprintf(b, "    - %s\n", w)
+	}
+	for _, d := range a.QuarantineDrops {
+		fmt.Fprintf(b, "    ~ %s\n", d)
 	}
 }
 
