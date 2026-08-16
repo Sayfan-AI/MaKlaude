@@ -14,9 +14,18 @@ import (
 // is byte-stable.
 var previewAt = time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
 
-// newPreviewer returns a mutator in dry-run mode over a fresh cluster model.
+// newPreviewer returns a mutator in dry-run mode over a cluster model holding every
+// object the non-rollback fixtures target.
+//
+// The model has to be populated, not empty. A server-side dry run runs the full
+// admission and precondition path and differs from a real request only in not
+// persisting, so previewing an object that is not there returns 404 exactly as the
+// real write would — which is faithful, and which an empty model would hide.
 func newPreviewer() *fakeMutator {
-	m := newFakeMutator(newClusterModel())
+	m := newFakeMutator(newClusterModel().
+		withNode("node-a").
+		withDeployment("shop", "web", 3, 5).
+		withFailedPod("shop", "web-dead", "web-7d9"))
 	m.mode = kube.ExecuteDryRun
 	return m
 }

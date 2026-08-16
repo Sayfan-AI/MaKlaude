@@ -140,7 +140,12 @@ Three refusals sit on top of it, all in
   caller, so there is no unconditional call to reach for under time pressure. A
   target that moved since the proposal fails with `ErrPreconditionConflict` —
   the expected, healthy outcome of a stale approval, and distinct from a real
-  failure so a caller can re-propose rather than escalate.
+  failure so a caller can re-propose rather than escalate. Note the boundary: only
+  a 409 becomes that sentinel. A target that *vanished* rather than moved returns
+  404 and is classified `execute-failed`, which is the wrong verdict for a delete
+  whose goal state has thereby been reached — see
+  [issue #214](https://github.com/Sayfan-AI/MaKlaude/issues/214) and the window-2
+  table in [`chaos.md`](chaos.md#when-a-fault-lands-during-a-remediation).
 - **A patch cannot retarget itself.** A body that sets `metadata.name`,
   `metadata.namespace`, or `metadata.uid` is refused, as is one naming a
   different `resourceVersion`. Refused rather than silently corrected, because
@@ -164,6 +169,10 @@ Three refusals sit on top of it, all in
   and MaKlaude taking one unbidden — because it did not like what it saw in the
   observation window — would be exactly the unapproved autonomy this milestone
   exists to prevent.
+
+All three are asserted under a fault that lands *while the action is in flight*,
+rather than only against a still cluster:
+[When a fault lands during a remediation](chaos.md#when-a-fault-lands-during-a-remediation).
 
 ## Undoing an action
 
