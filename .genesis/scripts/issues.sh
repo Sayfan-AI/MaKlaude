@@ -30,6 +30,52 @@ DEFAULT_STALE_DAYS="${GENESIS_GATE_STALE_DAYS:-3}"
 # the noise that gets the whole report skipped.
 DEFAULT_COMMENT_WINDOW_DAYS="${GENESIS_COMMENT_WINDOW_DAYS:-7}"
 
+# The labels that make an open issue unselectable — ONE definition, read by both
+# halves of the system that have an opinion about the word (#216).
+#
+# `next` refuses an issue carrying any of these; `format_unselectable_work`
+# reports one that has been carrying it long enough to be stale. Before this was
+# shared, the two disagreed: the selector filtered on three labels and the net
+# knew about none of them, so an issue labelled `milestone:6` plus `blocked` was
+# selectable by the net's model, refused by the selector, and reported nowhere.
+# Three hit that in one night — T5 #194, T6 #195 and T8 #197 each kept a
+# `blocked` label after its blocker closed, and a human removed all three by
+# hand. A parallel reimplementation cannot be kept in step by remembering; a
+# fourth label added below now reaches both readers by construction.
+SELECTION_EXCLUSIONS=(blocked in-progress "$GATE_LABEL")
+
+# How long an issue may sit untouched under a selection-blocking label before
+# the label is treated as stale rather than as work in flight.
+#
+# Not zero, because these labels are legitimate while something is happening:
+# `blocked` is applied deliberately by an agent that understood a dependency,
+# and a fresh `in-progress` claim is a run doing its job. Reporting either
+# immediately would print the whole in-flight board every tick, and a backstop
+# that cries wolf is one the orchestrator learns to skip (#112).
+#
+# Not large either, because the damage is invisibility: nothing removes
+# `in-progress` when the run that claimed it dies, and `error_max_turns` deaths
+# are routine here, so a claimed-and-dead issue is skipped by every later run as
+# "someone is on this" with no net contradicting it. A run that is genuinely
+# working an issue touches it within minutes (a comment, a linked PR).
+#
+# 2h rather than a rounder guess, because there is one measured instance to
+# derive it from. T6 #195 was claimed at 02:18:40Z by a session that went quiet
+# at 03:17:38 and was terminated at 03:33:28 on `Session timeout (3600s total)`,
+# leaving the label behind with a clean tree, no branch and no PR; the human
+# removed it by hand ~75 minutes after the claim. Two properties follow. The
+# floor is the control plane's own session cap: a claim younger than 3600s can
+# still belong to a live session, so anything at or below one hour would race
+# one. The ceiling is that instance: a window a person beats by hand is a window
+# that reports nothing anybody needed. 2h is the first value above the cap, and
+# it is a knob because a repo whose sessions are capped higher must raise it.
+#
+# Note this is a REPORT, not an expiry — it names a claim, it does not release
+# one, so being wrong costs a line of output rather than handing a live worker's
+# issue to a second one. Releasing needs session liveness, not age, and belongs
+# where the control plane decides a chain will not be resumed (#218).
+DEFAULT_CLAIM_STALE_HOURS="${GENESIS_CLAIM_STALE_HOURS:-2}"
+
 format_issues() {
     python3 -c "
 import sys, json
@@ -448,11 +494,27 @@ PY
 # future milestone's issues are reachable-later rather than unreachable and are
 # not reported. Every unknown resolves toward silence for the same reason.
 #
+# The second half of the check is the mirror image, and it is why the exclusion
+# set is shared rather than restated (#216): a milestone label is necessary for
+# selection but not sufficient, because `next` also refuses `blocked`,
+# `in-progress` and `needs:human`. So an issue can carry a live milestone and
+# still be unreachable. This reads SELECTION_EXCLUSIONS — the selector's own list
+# — and reports an issue that has been quiet under one of those labels for longer
+# than the stale window, which is the case nothing owns: `blocked` outlives the
+# blocker's close, and `in-progress` outlives the run that claimed it.
+# `needs:human` is filtered out of that half by EXEMPT below, because Human Gates
+# already prints it — and a fifth label added to the selector is spoken for here
+# without editing this function.
+#
+# Args: GATE_LABEL   the human-gate label (exempt, printed under Human Gates)
+#       STALE_HOURS  how long a selection-blocking label may sit quiet first
+#       EXCLUSION... the selector's exclusion labels, from SELECTION_EXCLUSIONS
+#
 # Prints nothing when there is nothing to report. If the issue list cannot be
 # read it says so rather than printing nothing, because silence here means
 # "all clear".
 format_unselectable_work() {
-    python3 - "$1" <<'PY'
+    python3 - "$@" <<'PY'
 import json
 import re
 import subprocess
@@ -460,6 +522,8 @@ import sys
 from datetime import datetime, timezone
 
 gate_label = sys.argv[1]
+stale_hours = float(sys.argv[2])
+exclusions = sys.argv[3:]
 
 MILESTONE = re.compile(r'^milestone:(\d+)$')
 # The completion gate's title, as the orchestrator's hard rules mandate it:
@@ -469,11 +533,16 @@ SIGNED_OFF = re.compile(r'^milestone\s+(\d+)\s+complete\b', re.IGNORECASE)
 
 EXEMPT = {gate_label, 'genesis:onboarding', 'wontfix', 'duplicate', 'invalid'}
 
+# The selection-blocking labels this net has to speak for: every exclusion the
+# selector applies, minus the ones another unconditional section already prints.
+# Derived, not restated, so the two definitions of "selectable" cannot drift.
+HIDING = [l for l in exclusions if l not in EXEMPT]
+
 
 def gh_issues(state, limit):
     proc = subprocess.run(
         ['gh', 'issue', 'list', '--state', state, '--limit', str(limit),
-         '--json', 'number,title,state,labels,createdAt'],
+         '--json', 'number,title,state,labels,createdAt,updatedAt'],
         capture_output=True, text=True)
     if proc.returncode != 0:
         return None
@@ -500,6 +569,23 @@ for i in closed_issues:
 
 now = datetime.now(timezone.utc)
 
+
+def quiet_hours(issue):
+    """Hours since anything happened on the issue at all.
+
+    A run that is genuinely working an issue leaves marks on it — a comment, a
+    linked PR, a label change — so silence is the signal that the label has
+    outlived whatever applied it. `updatedAt` is what makes this a measurement
+    rather than a guess about whether a session is still alive.
+    """
+    updated = datetime.fromisoformat(issue['updatedAt'].replace('Z', '+00:00'))
+    return (now - updated).total_seconds() / 3600.0
+
+
+def ago(hours):
+    return '%dh' % round(hours) if hours < 48 else '%dd' % round(hours / 24)
+
+
 rows = []
 for i in open_issues:
     labels = [l['name'] for l in i.get('labels') or []]
@@ -507,16 +593,26 @@ for i in open_issues:
         continue
 
     milestones = sorted({m.group(1) for m in (MILESTONE.match(l) for l in labels) if m})
+    held = [l for l in labels if l in HIDING]
     if not milestones:
         reason = 'no milestone:N label, so no run can select it'
     else:
         gates = [(n, signed_off.get(n)) for n in milestones]
-        # One active milestone is enough to make it selectable.
+        # One active milestone is enough to make it selectable — as far as the
+        # milestone goes. A selection-blocking label overrides that, which is
+        # why this is checked second rather than being an early `continue`.
         if any(gate is None for _, gate in gates):
-            continue
-        reason = '%s already signed off (%s), so nothing will come back for it' % (
-            ', '.join('milestone:%s' % n for n, _ in gates),
-            ', '.join('#%d' % gate for _, gate in gates))
+            quiet = quiet_hours(i)
+            if not held or quiet < stale_hours:
+                continue
+            reason = ('labelled %s and untouched for %s — `issues.sh next` '
+                      'refuses it and nothing expires that label, so no run '
+                      'will pick it up until someone removes it' % (
+                          ', '.join('`%s`' % l for l in held), ago(quiet)))
+        else:
+            reason = '%s already signed off (%s), so nothing will come back for it' % (
+                ', '.join('milestone:%s' % n for n, _ in gates),
+                ', '.join('#%d' % gate for _, gate in gates))
 
     created = datetime.fromisoformat(i['createdAt'].replace('Z', '+00:00'))
     rows.append(((now - created).days, i, reason, labels))
@@ -738,10 +834,18 @@ json.dump(filtered, sys.stdout)
 
     unselectable-work)
         # Open issues the loop's own selection rules can never choose — no
-        # milestone:N label, or a milestone already signed off (empty = every
-        # open issue is reachable). Not a distress state: these look healthy
-        # under Open Issues, which is exactly why they get abandoned.
-        format_unselectable_work "$GATE_LABEL"
+        # milestone:N label, a milestone already signed off, or a stale
+        # selection-blocking label (empty = every open issue is reachable). Not a
+        # distress state: these look healthy under Open Issues, which is exactly
+        # why they get abandoned.
+        STALE_HOURS="$DEFAULT_CLAIM_STALE_HOURS"
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --stale-hours) STALE_HOURS="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        format_unselectable_work "$GATE_LABEL" "$STALE_HOURS" "${SELECTION_EXCLUSIONS[@]}"
         ;;
 
     blocked)
@@ -813,7 +917,8 @@ json.dump(filtered, sys.stdout)
         # is how #167, #186 and #202 were each filed and then abandoned (#204).
         # Empty here means every open issue is reachable.
         echo "=== Unselectable Work (open but no run can pick it up) ==="
-        format_unselectable_work "$GATE_LABEL"
+        format_unselectable_work "$GATE_LABEL" "$DEFAULT_CLAIM_STALE_HOURS" \
+            "${SELECTION_EXCLUSIONS[@]}"
         echo ""
         echo "=== Blocked ==="
         gh issue list --state open --label "blocked" --json "$FIELDS" --limit 100 | format_issues
@@ -955,12 +1060,16 @@ json.dump(filtered, sys.stdout)
             echo "Usage: issues.sh next --milestone N" >&2
             exit 1
         fi
+        # The filter is BUILT from SELECTION_EXCLUSIONS rather than spelled out,
+        # so the selector and the unselectable-work net cannot hold two
+        # definitions of "selectable" (#216). Adding a label there changes both.
+        SELECT_JQ='[.[]'
+        for L in "${SELECTION_EXCLUSIONS[@]}"; do
+            SELECT_JQ="$SELECT_JQ | select(([.labels[].name] | index(\"$L\")) == null)"
+        done
+        SELECT_JQ="$SELECT_JQ] | sort_by(.createdAt) | .[0].number // empty"
         CANDIDATE="$(gh issue list --state open --label "milestone:$MILESTONE" \
-            --json number,createdAt,labels --limit 100 \
-            --jq '[.[] | select(([.labels[].name] | index("blocked")) == null)
-                       | select(([.labels[].name] | index("in-progress")) == null)
-                       | select(([.labels[].name] | index("needs:human")) == null)]
-                  | sort_by(.createdAt) | .[0].number // empty')"
+            --json number,createdAt,labels --limit 100 --jq "$SELECT_JQ")"
         if [ -z "$CANDIDATE" ]; then
             exit 3
         fi
@@ -1019,9 +1128,10 @@ Commands:
               List open automation:failure escalations with repeat counts,
               longest streak first (empty = no failure escalation open)
   unselectable-work
-              List open issues no run can select — no milestone:N label, or a
-              milestone already signed off — stalest first (empty = every open
-              issue is reachable)
+              List open issues no run can select — no milestone:N label, a
+              milestone already signed off, or a stale selection-blocking label
+              (blocked/in-progress) — stalest first (empty = every open issue is
+              reachable)
   blocked   List all blocked issues
   recent    List recently updated issues (default: last 24h)
   summary   Overview of project state
@@ -1048,6 +1158,11 @@ Gate filters (gates / stale-gates):
 Comment filters (unanswered-comments):
   --window-days N      How far back a trailing human comment still counts as
                        unanswered (default 7, or GENESIS_COMMENT_WINDOW_DAYS)
+
+Selection filters (unselectable-work):
+  --stale-hours N      How long an issue may sit untouched under a
+                       selection-blocking label before the label counts as
+                       stale (default 2, or GENESIS_CLAIM_STALE_HOURS)
 EOF
         exit 1
         ;;
