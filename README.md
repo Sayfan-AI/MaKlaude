@@ -20,6 +20,8 @@ Full operator and architecture docs live in [`docs/`](docs/index.md). Start with
 
 **Safety posture, stated accurately.** MaKlaude's observation path never mutates a cluster — that part is unconditional and proven four ways ([no-writes guarantee](docs/no-writes.md)). MaKlaude as a *whole* is not read-only: since Milestone 4 there is a separate, opt-in write path for remediation a human approved. It is reachable from exactly one command (`maklaude remediate`) and only once an operator sets `MAKLAUDE_EXECUTE_MODE`; with that unset, no write-capable client is ever constructed, and `maklaude scan` cannot reach it under any argument. Enabled, it stays gated on a separately-installed RBAC bundle, an in-process kill switch, an attributable approval, and preconditions re-checked against a fresh read. Every *mutating* action needs an explicit, attributable human approval **by default**, and there are exactly two supported ways out of *that* gate, which are not the same thing: `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE=1`, a blanket switch that waives consent and nothing else and records every action it waives as unreviewed in the artifact, the chat notice, the process log, and the audit trail; and **earned autonomy**, a per-shape rule an operator writes that fires only once a recorded history of human approvals of that exact shape says it may, is bounded by a per-pass cap, a cooldown and a circuit breaker, and discloses every action it takes on its own GitHub issue before running it. Both are off by default and neither is a default anything reaches by accident. See [Gated remediation](#gated-remediation), [Approval gate & autonomous mode](#approval-gate--autonomous-mode), [Earned autonomy](#earned-autonomy-narrow-off-by-default), [`docs/remediation.md`](docs/remediation.md), [`docs/autonomous-mode.md`](docs/autonomous-mode.md), and [`docs/unattended-actions.md`](docs/unattended-actions.md).
 
+Since Milestone 6 there is a *second* write path, and it is not remediation: MaKlaude can deliberately break a cluster by creating and deleting Chaos Mesh custom resources, on clusters carrying a human-written eligibility marker and on no others. So the accurate whole-system claim narrowed, and it is worth writing out rather than leaving the older sentence to look true: **no mutating verb, except Chaos Mesh custom resources, on chaos-eligible clusters.** The observation identity's guarantee is untouched by that and still proven four ways. [`docs/no-writes.md`](docs/no-writes.md#the-milestone-6-exception-and-what-holds-it-in-place) carries both claims side by side — what enforces the narrowed one, and the four things it does not promise, including that no Kubernetes Role can be made unbindable by anyone. See also [`docs/chaos.md`](docs/chaos.md).
+
 
 ## Architecture posture — deterministic product, AI dev system
 
@@ -495,6 +497,14 @@ marked eligible — needs a third identity, in a third separate bundle
 custom resources in one namespace and holds no verb on any workload. See
 [`docs/chaos.md`](docs/chaos.md).
 
+No two of the three identities can be collapsed into one by anything MaKlaude does:
+it holds no mutating verb on `rbac.authorization.k8s.io` and may not `impersonate`, so it
+cannot widen its own access model at runtime, and nothing in the three bundles binds
+two identities to one mutating role. What that does **not** mean is that Kubernetes
+can make a Role unbindable — it cannot, and a cluster-admin can always write the
+binding by hand. See
+[`docs/rbac.md`](docs/rbac.md#unbindable--what-the-manifests-forbid-and-what-they-cannot).
+
 ### Task runner
 
 This project uses [**Task**](https://taskfile.dev) as its task runner via
@@ -535,7 +545,7 @@ runs the pipeline **as MaKlaude's least-privilege ServiceAccount** and asserts:
 
 1. **Findings** — a critical `pod.crashloop` and a warning `pod.pending` are detected.
 2. **Escalation** — the findings correlate into incidents and a diagnostic issue is opened per incident (in-memory dry-run, no external writes).
-3. **Zero writes** — proven four ways, belt-and-suspenders:
+3. **Zero writes by the observation identity** — proven four ways, belt-and-suspenders:
    - RBAC: the SA has only `get`/`list`/`watch` (verified with `kubectl auth can-i`);
    - state invariance: the seeded objects' `resourceVersion`/`generation`/`managedFields` are unchanged across the scan;
    - active refusal: a deliberate write through the same guarded transport every client uses is refused with `kube.ErrWriteForbidden`;
@@ -544,6 +554,13 @@ runs the pipeline **as MaKlaude's least-privilege ServiceAccount** and asserts:
    The no-writes assertions are part of the test and **fail the build** if violated.
    See [`docs/no-writes.md`](docs/no-writes.md) for the full belt-and-suspenders
    guarantee and the exact code/tests that back each layer.
+
+   Note the scope: all four are about `system:serviceaccount:maklaude:maklaude`, and
+   they are unchanged since before Milestone 6. The chaos identity's write path is a
+   *separate* claim with separate proofs — that a chaos write cannot reach a cluster
+   nobody marked — and those run in the fast unit suite rather than here; the separate
+   `chaos on kind` job mounts no audit log, deliberately, because that cluster exists
+   to produce the very writes it is asserting happen.
 4. **Gated remediation** — the wedged Deployment is driven all the way through:
    the pipeline proposes a rollback, a dry run of that exact request is previewed
    against the API server, an explicit human approval is simulated on the

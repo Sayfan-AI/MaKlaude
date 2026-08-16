@@ -718,14 +718,15 @@ failed partway through, which is the case a passing-run-only check would never s
 
 ## What isn't built yet
 
-This is T6 of nine. The write path, its teardown guarantee, the proposal class, the
-timing scenarios and their scoring exist, and nothing is reachable from any config
-surface — the same posture `kube.ExecuteMode` shipped in at M4, which is the strongest
-form of "off" there is.
+This is T7 of nine. The write path, its teardown guarantee, the proposal class, the
+timing scenarios and their scoring exist, the narrowed guarantee is now encoded in
+tests as precisely as in prose (see
+[`no-writes.md`](no-writes.md#the-milestone-6-exception-and-what-holds-it-in-place)),
+and nothing is reachable from any config surface — the same posture `kube.ExecuteMode`
+shipped in at M4, which is the strongest form of "off" there is.
 
 | Task | What it adds |
 | ---- | ------------ |
-| [T7](https://github.com/Sayfan-AI/MaKlaude/issues/196) | The narrowed no-writes guarantee, encoded in tests as precisely as in prose |
 | [T8](https://github.com/Sayfan-AI/MaKlaude/issues/197) | The end-to-end chaos scenario on `kind` in CI |
 
 Chaos proposals will never promote to unattended execution, and that's settled

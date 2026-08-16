@@ -57,6 +57,23 @@ Milestone 5 added a sixth condition on top of those five and removed none of the
 - **The decision is deterministic and has no model in it.** Identical inputs produce an identical verdict, including the reason token and the rule name. A decision to mutate a cluster with nobody watching is exactly the wrong place for a probabilistic component, so there is no LLM anywhere in this path.
 - **Trust is derived, never declared.** There is no config key that asserts a shape is trustworthy — the honest version of that is `MAKLAUDE_DANGEROUSLY_AUTO_APPROVE`, which says so in its name. So on day one nothing is trusted and everything gates. See [unattended-actions.md](unattended-actions.md).
 
+## The deliberate-break seam
+
+Milestone 6 added the ability to *break a cluster on purpose*. It is the project's first write path that is not remediation, and it is a seam in the same sense as the two above: its own package, its own ServiceAccount, its own eligibility gate. What it deliberately is **not** is a second decision-maker — it reuses the gated seam's scope guard and kill switch, and it asks the unattended seam for permission rather than judging for itself.
+
+| Stage | Package | What it does | Model in the path? | Can it change a cluster? |
+| ----- | ------- | ------------ | ------------------ | ------------------------ |
+| Mark | `internal/cluster` | Turns a human-written per-cluster eligibility marker into a `ChaosTarget` capability token. An unmarked cluster mints none, and a token cannot be forged or copied onto another cluster | No | No |
+| Ask | `internal/chaos` (`proposal.go`) | Turns a requested fault into a `Proposal` that answers exactly what `autonomy.DecideRequest` and `budget.Admit` ask | No | No |
+| Aim | `internal/kube` (`chaosscope.go`) | Builds the write-capable config from a token, admitting exactly one request shape and refusing every mutating scope outside `chaos-mesh.org` | No | No |
+| Inject | `internal/chaos` (`injector.go`) | Creates and deletes the Chaos Mesh custom resource, conditioned on a name it derives since a create has no `resourceVersion` | No | Yes |
+| Reap | `internal/chaos` (`reaper.go`) | Sweeps experiment objects a killed run left behind, one at a time, each conditioned on its UID | No | Yes |
+
+Two properties carry the safety here, and both are the same shape as the gated seam's:
+
+- **Eligibility is a capability, not a check.** A `ChaosTarget` is the only `internal/cluster` type that `internal/chaos`'s exported signatures admit, so there is no way to express "inject into this cluster handle" — the compiler rejects the sentence. That is what makes "a chaos write cannot reach an unmarked cluster" a property of the package rather than of a conditional somebody has to remember to write.
+- **The narrowing is stated, not disguised.** MaKlaude as a whole no longer promises "no mutating verb"; it promises "no mutating verb except chaos CRDs, on chaos-eligible clusters." The observation identity's guarantee is untouched and separately proven. [no-writes.md](no-writes.md#the-milestone-6-exception-and-what-holds-it-in-place) has both claims side by side, with what enforces each and the four things neither promises. See [chaos.md](chaos.md).
+
 ## The one optional AI seam
 
 There is exactly one place a model can run at runtime: `internal/aidiagnose` (Milestone 3, T5). It can call a model to *refine* a diagnosis - sharpen a low-confidence hypothesis, or propose a cause the rules cannot express - for the cases the deterministic rules handle poorly. It is a strict, isolated safety boundary:
