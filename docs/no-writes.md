@@ -25,18 +25,18 @@ namespaced RBAC granting no verb on any workload; it reuses this write path's sc
 guard and kill switch rather than adding a second one.
 [`chaos.md`](chaos.md) is that story. Stated as narrowly as it deserves: the
 whole-system claim is now **"no mutating verb except chaos CRDs, on chaos-eligible
-clusters"**, and the old sentence is not reworded here to keep looking true.
-Encoding that narrowing in tests as precisely as in prose — including proving the
-exception cannot leak to a non-eligible cluster — is
-[issue #196](https://github.com/Sayfan-AI/MaKlaude/issues/196); what exists today is
-the in-process door (`kube.ChaosRestConfig`, which refuses any mutating scope
-outside the `chaos-mesh.org` group even on an eligible cluster) with its own unit
-tests.
+clusters"**, and the old sentence is not reworded here to keep looking true. That
+narrowing is enforced by tests, not by this paragraph —
+[The Milestone 6 exception](#the-milestone-6-exception-and-what-holds-it-in-place)
+below names each one, and says which parts of it no test can hold.
 
 So the accurate one-line posture is **"reads are guaranteed, writes are gated"**,
 not "nothing is ever touched". The distinction is the entire subject of this
-document: everything below is about the **observation identity**, and every layer
-of it still holds exactly as it did before either write path existed.
+document. The **four layers** below are about the **observation identity**, and
+every one of them still holds exactly as it did before either write path existed;
+[the section after them](#the-milestone-6-exception-and-what-holds-it-in-place) is
+about the narrowed whole-system claim, which is a different claim with different
+proofs and its own list of things it does not cover.
 
 This document explains how that promise is enforced and, crucially, **cites the
 exact code and tests that back each layer** so the guarantee stays verifiable
@@ -160,6 +160,17 @@ enables it) and fails the build if **any** mutating verb (`create`, `update`,
 corroboration: it is the cluster's own independent record, not MaKlaude's. When
 the log is unavailable the check skips with a warning — layers 1–3 still hold.
 
+Milestone 6 did not touch this assertion; `assertNoMutatingAudit` is unchanged
+since before the milestone opened, and so are its five verbs, its `t.Fatalf`, and
+both of its call sites. Where it does **not** run is worth stating rather than
+leaving to be discovered: the separate `chaos on kind` CI job mounts no audit
+policy, deliberately, because that cluster exists to produce mutating requests
+from the chaos identity and the same log there would be a list of the writes that
+job asserts *happen*. On that cluster the observation identity's zero-mutation
+rests on layers 1 and 2 — the transport that admits only `GET`/`HEAD`/`OPTIONS`,
+and a `maklaude-readonly` role proven to grant no mutating verb — which is why
+those two are the layers that need no live cluster to check.
+
 > **The gated-remediation e2e does not weaken this promise, and reading its audit
 > log will show you a `patch`.** Since Milestone 4 MaKlaude has a *second*
 > identity, `system:serviceaccount:maklaude:maklaude-executor`, which exists only
@@ -189,6 +200,65 @@ the log is unavailable the check skips with a warning — layers 1–3 still hol
 
 ---
 
+## The Milestone 6 exception, and what holds it in place
+
+The four layers above are the observation identity's guarantee, and they are
+unchanged. This section is the *other* claim — the one about MaKlaude as a whole —
+and it is narrower than it used to be:
+
+> **No mutating verb, except Chaos Mesh custom resources, on clusters a human
+> marked chaos-eligible.**
+
+That sentence is weaker than "MaKlaude never writes", and it is deliberately not
+phrased to disguise the difference. What follows is what makes it true, and then
+what it still does not promise.
+
+### What enforces it
+
+Each link is checked on its own, and the composition is checked separately —
+because every link can be individually correct while a new call site routes around
+all of them.
+
+| What is enforced | Where it lives | What proves it |
+| ---------------- | -------------- | -------------- |
+| A cluster with no eligibility marker mints no chaos capability token | [`internal/cluster/chaos.go`](../internal/cluster/chaos.go) | [`chaos_test.go`](../internal/cluster/chaos_test.go) — `TestChaosTarget_IneligibleClusterCannotMintAToken`, and `…_MalformedAndPartialFailClosed` / `…_AbsentIsSilentlyIneligible` for the fail-closed shapes |
+| A token cannot be forged or copied onto another cluster | [`internal/cluster/chaos.go`](../internal/cluster/chaos.go) | `TestChaosTarget_IsSealedAgainstForgery`, `TestChaosEligibility_CopyPasteDoesNotCarryOver` |
+| Even on an eligible cluster, the transport refuses any mutating scope outside `chaos-mesh.org` | [`internal/kube/chaosscope.go`](../internal/kube/chaosscope.go) | [`chaosscope_test.go`](../internal/kube/chaosscope_test.go) — `TestChaosRestConfig_RefusesNonChaosMutations`, `…_ZeroScopeGrantsNoMutation`, `…_AdmitsExactlyTheChaosRequest` |
+| **No route into the write path reaches an unmarked cluster** — the composition, not the links | [`internal/chaos`](../internal/chaos) | [`leak_test.go`](../internal/chaos/leak_test.go) — `TestChaosWriteCannotReachAnIneligibleCluster` drives every existing route against an ineligible cluster in a registry that also holds an eligible one, both wired to live recording stubs through one kubeconfig, so a misresolved handle lands on the wrong stub and is *recorded* rather than failing to connect |
+| **No future route can be added without being one of those** | [`internal/chaos`](../internal/chaos) | `TestChaosPackageOffersNoDoorButTheCapabilityToken` — the only `internal/cluster` type admitted in `internal/chaos`'s exported signatures is `ChaosTarget`, so a `NewInjectorForHandle` fails the build whatever it is named. The wire test can only try the doors that exist today; this is why there are two halves |
+| MaKlaude cannot widen its own access model at runtime | the access model itself | [`test/rbac/unbindable_test.go`](../test/rbac/unbindable_test.go) — `TestNoIdentityCanAuthorABinding`: no identity holds a mutating verb on `rbac.authorization.k8s.io` (over the whole API group, not a list of triples) and none may `impersonate` |
+| Nothing shipped binds two identities to one mutating role | [`deploy/rbac/`](../deploy/rbac/) | `TestEveryMutatingRoleHasExactlyOnePermittedHolder` — in **both** directions, over **every** subject kind, so a `Group` subject naming a whole namespace's service accounts fails too. A mutating role absent from the permitted-holder map fails the build |
+| The chaos grant is namespaced, minimal, and separately opt-in | [`deploy/rbac/chaos/`](../deploy/rbac/chaos/) | [`test/rbac/rbac_test.go`](../test/rbac/rbac_test.go) — `TestChaosRoleGrantsExactlyTheInjectorCatalog`, `TestChaosRoleIsNamespacedNotClusterWide`, `TestChaosRoleExcludesTheWorkloadItBreaks`, `TestBaseBundleDoesNotIncludeTheWriteDelta` |
+
+Everything in that table runs in the fast unit suite (`task test`) with no cluster.
+The live-cluster counterparts — `kubectl auth can-i` against a real Chaos Mesh CRD
+— run in the `chaos on kind` CI job; see [`rbac.md`](rbac.md#the-optional-chaos-bundle).
+
+### What it does not promise
+
+Four things, stated here because a reader who assumes them will be wrong, and
+because none of them is fixable by a test in this repository.
+
+1. **A Kubernetes Role cannot be made unbindable.** Anyone holding `create` on
+   `rolebindings` in `maklaude-chaos` can bind the chaos Role to any subject, and a
+   cluster-admin always can. "Unbindable" above means the two routes MaKlaude
+   controls are closed — it cannot author a binding at runtime, and nothing it
+   ships is one. A person doing it by hand is outside what any manifest or test can
+   reach.
+2. **Neither chaos Role bounds Chaos Mesh itself.** MaKlaude writes a custom
+   resource; Chaos Mesh's controller does the killing, with its own privileges. The
+   blast radius of an admitted experiment is Chaos Mesh's to enforce, and the
+   per-target-namespace grant is what bounds *where* MaKlaude may aim one.
+3. **Layer 4 does not run on the chaos cluster.** The `chaos on kind` job mounts no
+   audit policy, for the reason given under Layer 4. Zero-mutation for the
+   observation identity there rests on layers 1 and 2, not on the apiserver's record.
+4. **Eligibility is a human's assertion, not a discovered fact.** MaKlaude does not
+   decide a cluster is safe to break; it refuses every cluster where a person has
+   not written the marker. Marking production is possible, and nothing here
+   prevents it — see [`chaos.md`](chaos.md).
+
+---
+
 ## How to re-verify the guarantee yourself
 
 ```bash
@@ -202,6 +272,10 @@ task e2e           # see README "End-to-end test (kind)"; CI runs this on every 
 SA=system:serviceaccount:maklaude:maklaude
 kubectl auth can-i --list --as="$SA"      # only get/list/watch on the documented resources
 kubectl auth can-i delete pods --as="$SA" # MUST print "no"
+
+# The Milestone 6 exception — the leak and unbindability proofs, no cluster needed:
+go test ./internal/chaos/ -run 'TestChaosWriteCannotReachAnIneligibleCluster|TestChaosPackageOffersNoDoorButTheCapabilityToken'
+go test ./test/rbac/     -run 'TestNoIdentityCanAuthorABinding|TestEveryMutatingRoleHasExactlyOnePermittedHolder'
 ```
 
 See [`docs/rbac.md`](rbac.md) for the complete `auth can-i` verification matrix.

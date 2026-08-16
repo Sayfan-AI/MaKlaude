@@ -379,6 +379,51 @@ its own privileges. [`chaos.md`](chaos.md) is the whole story, including the exa
 `SubjectAccessReview`, the misleadingly-named toggle that disables it, and the
 `auth can-i` matrix (via `SubjectAccessReview`, since the CRDs may not be installed).
 
+### "Unbindable" — what the manifests forbid, and what they cannot
+
+The separation between the three identities is only worth anything if no two of them
+can be collapsed into one, and the plainest way to say that is the way it is written
+in [`test/rbac/unbindable_test.go`](../test/rbac/unbindable_test.go):
+
+**Kubernetes has no mechanism that makes a Role unbindable.** Anybody holding
+`create` on `rolebindings` in the `maklaude-chaos` namespace can bind the chaos Role
+to whatever subject they like, and a cluster-admin always can. Nothing in this
+directory prevents that, and a document claiming otherwise would be describing a
+Kubernetes that does not exist.
+
+What *is* provable, and is enforced on every PR, is that both routes MaKlaude itself
+could take are closed:
+
+1. **MaKlaude cannot author a binding at runtime.** No identity it authenticates as
+   holds any *mutating* verb on the `rbac.authorization.k8s.io` API group — the
+   assertion is over the whole group rather than over the two hand-picked triples
+   (`escalate` on
+   `clusterroles`, `bind` on `clusterrolebindings`) that an exclusion list would
+   name, so `create rolebindings` and `patch roles` are covered without anyone
+   thinking of them. None may `impersonate` either, which is its own route and needs
+   no binding at all: an identity that can impersonate another performs writes under
+   that other's authority, and the audit-log attribution in the table above — the
+   entire reason three identities exist — becomes a fabrication.
+2. **Nothing shipped binds two identities to one mutating role.** Every RoleBinding
+   and ClusterRoleBinding in all three bundles is checked in both directions and over
+   every subject kind, so a `Group` subject such as
+   `system:serviceaccounts:maklaude` — which would confer a role on all three
+   identities at once, and is an ordinary way for an operator to write this — fails
+   the build rather than passing a ServiceAccount-only inspection. Each mutating role
+   declares exactly one permitted holder, and a mutating role that declares none
+   fails too, so a fourth one is a decision somebody writes down in the change that
+   ships it.
+
+The property is framed over *mutating* authority on purpose. `maklaude-readonly` is
+bound to both the observation and the executor identity deliberately (the executor
+re-reads its target for a `resourceVersion`, and reusing the role beats a second copy
+that can drift). Sharing a role that cannot change anything is not a separation
+failure; sharing one that can is the only kind there is.
+
+What remains after both is a person writing a binding by hand against a live cluster.
+The mitigation for that is not in this repository — it is the same
+`kubectl auth can-i --as=…` matrix below, run against the cluster you actually have.
+
 ## Validation status
 
 All three bundles assemble cleanly under `kubectl kustomize`, and their contents are
@@ -391,7 +436,12 @@ Chaos Mesh's webhook reviews and carries no namespace of its own (so the apply c
 it), no binding hands a mutating or chaos role to another identity, and the base
 kustomization pulls in neither delta (nor does either delta pull in the other, nor does
 the chaos kustomization pull in the target grant — while every *other* manifest in that
-directory must be in it, so a file can't go quietly unapplied either).
+directory must be in it, so a file can't go quietly unapplied either). On top of those,
+[`unbindable_test.go`](../test/rbac/unbindable_test.go) asserts the two class-level
+properties described [above](#unbindable--what-the-manifests-forbid-and-what-they-cannot):
+no identity holds a mutating verb on `rbac.authorization.k8s.io` or may `impersonate`,
+and every mutating role has exactly one permitted holder across both directions and
+every subject kind.
 
 Against a live API server, the `e2e` CI job applies all three bundles to a `kind`
 cluster and runs every assertion above — including the re-check that the earlier
