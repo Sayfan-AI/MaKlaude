@@ -47,6 +47,8 @@ package e2e
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -93,7 +95,7 @@ type recordedRequest struct {
 
 func (r recordedRequest) String() string { return r.Method + " " + r.Path }
 
-// recordingProxy is a plain-HTTP reverse proxy in front of the real API server that
+// recordingProxy is an HTTPS reverse proxy in front of the real API server that
 // records every request before forwarding it.
 //
 // Forwarding rather than answering is the point: a proxy that replied on its own would
@@ -101,9 +103,31 @@ func (r recordedRequest) String() string { return r.Method + " " + r.Path }
 // upstream response is the real cluster's, so a request that reaches here reaches the
 // API server too — which is what makes the marked route's create a genuine admitted
 // create and the unmarked route's probe genuine evidence that the route is open.
+//
+// # Why the proxy terminates TLS instead of serving plain HTTP
+//
+// Because a kubeconfig naming an `http://` server carries no credential.
+// clientcmd reads a context's auth info only when the transport is TLS
+// (`client_config.go`: "only try to read the auth information if we are secure",
+// gated on `rest.IsConfigTransportTLS`), so a plain-HTTP proxy URL silently drops the
+// bearer token and MaKlaude arrives at the API server as `system:anonymous`. That is
+// not a hypothetical: the first run of this test failed exactly that way, and it
+// failed on the *positive* control — the marked cluster's create was refused for want
+// of an identity — which is what that control is for. The negative assertion would
+// have been vacuous, since an anonymous client is also a silent one.
+//
+// So each proxy is an `httptest.NewTLSServer` and the kubeconfig pins its certificate.
+// Pinned rather than `insecure-skip-tls-verify`, because a test about a credential
+// reaching the right cluster should not be the one place that stops checking who it is
+// talking to.
 type recordingProxy struct {
-	// URL is the http:// address to put in a kubeconfig.
+	// URL is the https:// address to put in a kubeconfig.
 	URL string
+	// caPEM is this proxy's self-signed certificate, for that kubeconfig's
+	// certificate-authority-data.
+	caPEM []byte
+	// client trusts caPEM, for probes issued directly rather than through client-go.
+	client *http.Client
 
 	mu   sync.Mutex
 	seen []recordedRequest
@@ -123,7 +147,7 @@ func newRecordingProxy(t *testing.T, upstream *url.URL, tls *http.Transport) *re
 		w.WriteHeader(http.StatusBadGateway)
 	}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
 		p.seen = append(p.seen, recordedRequest{Method: r.Method, Path: r.URL.Path})
 		p.mu.Unlock()
@@ -132,6 +156,11 @@ func newRecordingProxy(t *testing.T, upstream *url.URL, tls *http.Transport) *re
 	t.Cleanup(srv.Close)
 
 	p.URL = srv.URL
+	p.client = srv.Client()
+	p.caPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if len(p.caPEM) == 0 {
+		t.Fatalf("could not PEM-encode the recording proxy's certificate")
+	}
 	return p
 }
 
@@ -199,7 +228,11 @@ func bearerTokenFor(t *testing.T, kubeconfig, contextName string) string {
 // outcome instead of an impossible one. current-context points at the UNMARKED proxy,
 // so a code path that ignores the handle's selected context and falls back to the
 // default lands on the route this test is watching rather than passing quietly.
-func writeProxiedKubeconfig(t *testing.T, markedURL, unmarkedURL, token string) string {
+//
+// Each cluster entry pins its own proxy's certificate. Both halves are load-bearing:
+// https is what makes clientcmd read the token at all (see [recordingProxy]), and the
+// pin is what keeps the client verifying the far end while it does.
+func writeProxiedKubeconfig(t *testing.T, marked, unmarked *recordingProxy, token string) string {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "proxied.kubeconfig")
@@ -210,9 +243,11 @@ clusters:
   - name: marked-cluster
     cluster:
       server: %s
+      certificate-authority-data: %s
   - name: unmarked-cluster
     cluster:
       server: %s
+      certificate-authority-data: %s
 contexts:
   - name: marked
     context:
@@ -226,7 +261,10 @@ users:
   - name: maklaude-chaos
     user:
       token: %s
-`, markedURL, unmarkedURL, token)
+`,
+		marked.URL, base64.StdEncoding.EncodeToString(marked.caPEM),
+		unmarked.URL, base64.StdEncoding.EncodeToString(unmarked.caPEM),
+		token)
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatalf("writing the proxied kubeconfig: %v", err)
 	}
@@ -255,7 +293,7 @@ func TestE2E_ChaosSkipsTheClusterNobodyMarked(t *testing.T) {
 	token := bearerTokenFor(t, kubeconfig, contextName)
 	assertRouteIsLive(t, unmarked, token)
 
-	proxied := writeProxiedKubeconfig(t, marked.URL, unmarked.URL, token)
+	proxied := writeProxiedKubeconfig(t, marked, unmarked, token)
 
 	reg, err := cluster.NewRegistry(&cluster.Config{Clusters: []cluster.Spec{
 		{
@@ -384,7 +422,10 @@ func assertRouteIsLive(t *testing.T, p *recordingProxy, token string) {
 	// a default kind cluster, but then the probe would prove a route open to nobody in
 	// particular, while the silence below is about this identity on this route.
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	// The proxy's own client, which trusts the proxy's certificate and nothing else.
+	// http.DefaultClient would fail verification here, and skipping verification would
+	// make a probe that no longer checks it is talking to the proxy under test.
+	resp, err := p.client.Do(req)
 	if err != nil {
 		t.Fatalf("probing the unmarked route: %v; its silence below would not be evidence about eligibility", err)
 	}
