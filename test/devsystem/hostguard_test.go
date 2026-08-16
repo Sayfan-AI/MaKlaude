@@ -398,3 +398,121 @@ func TestHostGuardIsExecutable(t *testing.T) {
 			".genesis/scripts/", info.Mode().Perm())
 	}
 }
+
+// The tests below cover issue #211: the guard matched its credential-path
+// patterns against the whole command string, so a heredoc writing *documentation
+// about the guard* was refused as though it had read a credential file. Fixed
+// upstream in genesis 2116c16 and backported here.
+//
+// Why the false positive is worth a fix rather than a shrug: the set of things
+// this dev system legitimately writes that name these paths is not small, and it
+// grows with the guard's own success. Every design doc, pull request body and
+// escalation describing what the guard blocks has to name what it blocks, T7's
+// documentation task included. Each refusal costs a retry and a moment of the
+// agent deciding whether working around the guard is legitimate, and that last
+// part is the real cost: a guard that cries wolf teaches the thing it guards to
+// route around it.
+//
+// The discriminator is NOT "is it a heredoc." It is what consumes the body. The
+// TestHostGuardExemptionIsNotABypass cases are the reason, and they must stay
+// blocked: exempting heredoc bodies wholesale would turn a nuisance fix into a
+// one-line evasion.
+
+// TestHostGuardAllowsProseThatNamesCredentialPaths is the reported false
+// positive. Naming a path is not reading it.
+func TestHostGuardAllowsProseThatNamesCredentialPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command string
+	}{
+		{
+			"documentation written to a file",
+			"cat > /tmp/pr.md <<'EOF'\n" +
+				"The guard refuses commands reaching for ~/.ssh, ~/.aws or ~/.netrc.\n" +
+				"EOF",
+		},
+		{
+			// How this loop actually posts a comment about the guard.
+			"issue comment body on stdin",
+			"gh issue comment 211 --body-file - <<'EOF'\n" +
+				"This blocks reads of ~/.aws/credentials.\n" +
+				"EOF",
+		},
+		{
+			"tee to a file",
+			"tee /tmp/x.md <<'EOF'\nwe block ~/.ssh here\nEOF",
+		},
+		{
+			// The single most common way an agent writes prose about the guard:
+			// the line starts with `gh`, but `cat` inside the substitution is
+			// what consumes the body. Classifying by the line's first word gets
+			// this wrong.
+			"heredoc owned by cat inside a substitution",
+			"gh pr create --body \"$(cat <<'EOF'\nrefuses reads of ~/.ssh and ~/.aws\nEOF\n)\"",
+		},
+		{
+			// <<- strips leading tabs, so the terminator matches after stripping.
+			"indented terminator",
+			"cat <<-'EOF'\n\tmentions ~/.ssh in prose\n\tEOF",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, stderr, code := runGuard(t, bashPayload(t, tc.command), nil)
+			if code != 0 {
+				t.Errorf("prose refused (exit %d): %s", code, stderr)
+			}
+		})
+	}
+}
+
+// TestHostGuardExemptionIsNotABypass pins the direction a wrong answer must not
+// fail in. A missing entry in the text-sink allowlist is another false positive;
+// a body that reaches an interpreter unexamined is a hole.
+func TestHostGuardExemptionIsNotABypass(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command string
+	}{
+		{"fed straight to bash", "bash <<'EOF'\ncat ~/.ssh/id_rsa\nEOF"},
+		{"fed to python3", "python3 <<'EOF'\ncat ~/.ssh/id_rsa\nEOF"},
+		// The sink name here is `cat`, which IS allowlisted. The pipe is what
+		// disqualifies it, which is why the check is on the whole opener.
+		{"allowlisted sink piped to bash", "cat <<'EOF' | bash\ncat ~/.ssh/id_rsa\nEOF"},
+		{
+			"written to a file and then run",
+			"cat > /tmp/x.sh <<'EOF' ; bash /tmp/x.sh\ncat ~/.ssh/id_rsa\nEOF",
+		},
+		// Once a substitution is allowed to own a heredoc (the shape below in
+		// TestHostGuardAllowsProse...), the command inside it has to be checked
+		// as carefully as one at the start of a line, or the fix for the prose
+		// false positive hands the same bypass back through a different door.
+		{
+			"interpreter owning a heredoc inside a substitution",
+			"gh pr create --body \"$(bash <<'EOF'\ncat ~/.ssh/id_rsa\nEOF\n)\"",
+		},
+		{
+			"python3 inside a substitution",
+			"echo \"$(python3 <<'EOF'\ncat ~/.ssh/id_rsa\nEOF\n)\"",
+		},
+		{
+			// Not a well-formed heredoc, so there is no body to classify. Three
+			// lines rather than two on purpose: with two, the read is the last
+			// line and an implementation that guessed the terminator as
+			// end-of-input would keep it and still block, hiding a real hole.
+			"unterminated heredoc",
+			"cat > /tmp/x.md <<'EOF'\ncat ~/.ssh/id_rsa\ntrailing line",
+		},
+		{
+			// Stripping a body must not blind the guard to the rest of the command.
+			"read outside the heredoc",
+			"cat ~/.ssh/id_rsa; cat > /tmp/x.md <<'EOF'\nharmless prose\nEOF",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, code := runGuard(t, bashPayload(t, tc.command), nil)
+			if code != 2 {
+				t.Errorf("BYPASS: exit %d, want 2 (blocked)", code)
+			}
+		})
+	}
+}
