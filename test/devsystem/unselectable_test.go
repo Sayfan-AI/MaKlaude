@@ -38,6 +38,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -62,7 +63,7 @@ for i, a in enumerate(argv):
         state = argv[i + 1]
     if a == "--json" and i + 1 < len(argv):
         fields = argv[i + 1]
-for required in ("number", "title", "labels", "createdAt"):
+for required in ("number", "title", "labels", "createdAt", "updatedAt"):
     if required not in fields:
         sys.stderr.write("stub gh: --json is missing %s: %r\n" % (required, fields))
         sys.exit(64)
@@ -85,21 +86,34 @@ type unselStubIssue struct {
 	State     string      `json:"state"`
 	Labels    []stubLabel `json:"labels"`
 	CreatedAt string      `json:"createdAt"`
+	UpdatedAt string      `json:"updatedAt"`
 }
 
-// unselIssue builds an open issue aged ageDays with the given labels. Every case
-// below is this same issue with one label added or removed, so a failing test
-// names the single predicate at fault.
+// unselIssue builds an open issue aged ageDays with the given labels, untouched
+// since it was filed. Every case below is this same issue with one label added or
+// removed, so a failing test names the single predicate at fault.
 func unselIssue(number int, title string, ageDays int, labels ...string) unselStubIssue {
+	filed := time.Now().UTC().AddDate(0, 0, -ageDays).Format(time.RFC3339)
 	i := unselStubIssue{
 		Number:    number,
 		Title:     title,
 		State:     "OPEN",
-		CreatedAt: time.Now().UTC().AddDate(0, 0, -ageDays).Format(time.RFC3339),
+		CreatedAt: filed,
+		UpdatedAt: filed,
 	}
 	for _, l := range labels {
 		i.Labels = append(i.Labels, stubLabel{Name: l})
 	}
+	return i
+}
+
+// touched marks an issue as having had activity hoursAgo — a comment, a linked
+// PR, a label change. This is what separates a claim a live run just made from
+// one that outlived the run that made it, and it is the only thing standing
+// between the stale-label half of the detector and reporting the whole in-flight
+// board on every tick.
+func touched(i unselStubIssue, hoursAgo int) unselStubIssue {
+	i.UpdatedAt = time.Now().UTC().Add(-time.Duration(hoursAgo) * time.Hour).Format(time.RFC3339)
 	return i
 }
 
@@ -122,6 +136,18 @@ func runUnselectable(t *testing.T, open, closed []unselStubIssue) string {
 }
 
 func runUnselectableEnv(t *testing.T, open, closed []unselStubIssue, extraEnv []string) string {
+	t.Helper()
+	return runUnselectableScript(t,
+		filepath.Join("..", "..", ".genesis", "scripts", "issues.sh"), open, closed, extraEnv)
+}
+
+// runUnselectableScript is the same harness against a named copy of the script,
+// so TestSelectionExclusionsHaveOneDefinition can patch the exclusion list and
+// observe both readers. It never touches the repo's own copy: `genesis serve`
+// runs against this working tree, and a run that called issues.sh during the
+// mutation window would silently mislabel the board (same reasoning as ISSUES_SH
+// in issueselect_test.go).
+func runUnselectableScript(t *testing.T, script string, open, closed []unselStubIssue, extraEnv []string) string {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -151,7 +177,7 @@ func runUnselectableEnv(t *testing.T, open, closed []unselStubIssue, extraEnv []
 		return p
 	}
 
-	cmd := exec.Command("bash", filepath.Join("..", "..", ".genesis", "scripts", "issues.sh"), "unselectable-work")
+	cmd := exec.Command("bash", script, "unselectable-work")
 	cmd.Env = append(os.Environ(),
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"STUB_OPEN="+write("open.json", open),
@@ -211,6 +237,154 @@ func TestUnselectableIgnoresAnActiveMilestone(t *testing.T) {
 
 	if strings.TrimSpace(out) != "" {
 		t.Errorf("an issue on the ACTIVE milestone was reported as unselectable:\n%s", out)
+	}
+}
+
+// TestUnselectableDetectsAStaleBlockedLabel is the first half of #216. A
+// milestone label is necessary for selection and not sufficient: `next` also
+// refuses `blocked`, so an issue carrying `milestone:6` plus `blocked` is
+// selectable by the milestone test and refused by the selector. Nothing removes
+// the label when the blocker closes, and three issues hit that in one night — T5
+// #194, T6 #195 and T8 #197 all kept a `blocked` label past their blockers and a
+// human removed each by hand. The reason must name the label, because "remove
+// this label" is the whole action.
+func TestUnselectableDetectsAStaleBlockedLabel(t *testing.T) {
+	out := runUnselectable(t,
+		[]unselStubIssue{unselIssue(197, "T8 — End-to-end chaos scenario on kind in CI", 2, "enhancement", "blocked", "milestone:6")},
+		nil)
+
+	for _, want := range []string{"#197", "`blocked`", "untouched for", "next"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a stale `blocked` label on an ACTIVE milestone was not reported with %q — the selector refuses it and no section printed it:\n%s", want, out)
+		}
+	}
+}
+
+// TestUnselectableDetectsAStaleClaim is the variant with no human applier to
+// notice, and the one that was live when #216 was filed: `in-progress` is written
+// by `claim` at pickup and NOTHING removes it if the run that claimed the issue
+// dies. Sessions ending at error_max_turns are routine here (see the turn-budget
+// bullets in CLAUDE.md), so every later run then skips the issue as "someone is
+// on this" while no net contradicts it. T6 #195 sat exactly this way: claimed,
+// zero comments, no branch, no PR.
+func TestUnselectableDetectsAStaleClaim(t *testing.T) {
+	out := runUnselectable(t,
+		[]unselStubIssue{unselIssue(195, "T6 — Correctness scoring", 1, "enhancement", "in-progress", "milestone:6")},
+		[]unselStubIssue{completionGate(182, "5")})
+
+	for _, want := range []string{"#195", "`in-progress`", "untouched for"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a claim that outlived the run holding it was not reported with %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestUnselectableIgnoresWorkInFlight is the negative control the stale-label
+// half needs, and it carries as much weight as the detections (#112): these
+// labels are LEGITIMATE while something is happening. A run working an issue
+// touches it within minutes — a comment, a linked PR — and a `blocked` label
+// applied an hour ago is an agent recording a dependency it just found. Reporting
+// either would print the in-flight board on every tick, and an over-broad net is
+// skipped just as fast as an empty one.
+func TestUnselectableIgnoresWorkInFlight(t *testing.T) {
+	for _, label := range []string{"blocked", "in-progress"} {
+		t.Run(label, func(t *testing.T) {
+			out := runUnselectable(t,
+				[]unselStubIssue{touched(unselIssue(216, "A task a live run is working", 3, "bug", label, "milestone:6"), 1)},
+				nil)
+			if strings.TrimSpace(out) != "" {
+				t.Errorf("an issue touched an hour ago under %q was reported as unselectable:\n%s", label, out)
+			}
+		})
+	}
+}
+
+// TestUnselectableStaleWindowIsConfigurable pins the threshold as a knob rather
+// than a constant baked into the reasoning, in the shape of --stale-days on gates
+// and --window-days on unanswered-comments. A repo whose sessions are capped
+// higher than this one's 3600s needs a wider window, and the floor below is why
+// that matters rather than being a preference.
+func TestUnselectableStaleWindowIsConfigurable(t *testing.T) {
+	claimed := []unselStubIssue{touched(unselIssue(195, "T6 — Correctness scoring", 3, "enhancement", "in-progress", "milestone:6"), 1)}
+
+	if out := runUnselectable(t, claimed, nil); strings.TrimSpace(out) != "" {
+		t.Errorf("a 1h-old claim was reported under the default window:\n%s", out)
+	}
+	out := runUnselectableEnv(t, claimed, nil, []string{"GENESIS_CLAIM_STALE_HOURS=0.5"})
+	if !strings.Contains(out, "#195") {
+		t.Errorf("a 1h-old claim was NOT reported with GENESIS_CLAIM_STALE_HOURS=0.5:\n%s", out)
+	}
+}
+
+// TestUnselectableDefaultWindowClearsTheSessionCap is the floor the default has
+// to respect, and it is the half of #216 the human's live instance sharpened. A
+// claim younger than the control plane's session cap can still belong to a
+// running session — T6 #195's holder was terminated on `Session timeout (3600s
+// total)` — so a window at or below one hour reports live work as abandoned. The
+// ceiling comes from the same instance in the other direction: the human removed
+// that label by hand about 75 minutes after the claim, so a window they beat
+// reports nothing anybody needed. This asserts the floor, since that is the side
+// where being wrong is a false accusation rather than a missed report.
+func TestUnselectableDefaultWindowClearsTheSessionCap(t *testing.T) {
+	const sessionCapHours = 1 // `Session timeout (3600s total)` — see DEFAULT_CLAIM_STALE_HOURS
+
+	out := runUnselectable(t,
+		[]unselStubIssue{touched(unselIssue(195, "T6 — Correctness scoring", 3, "enhancement", "in-progress", "milestone:6"), sessionCapHours)},
+		nil)
+	if strings.TrimSpace(out) != "" {
+		t.Errorf("a claim exactly as old as the %dh session cap was reported as stale — the default window does not clear the cap, so a live session's issue is named as abandoned:\n%s", sessionCapHours, out)
+	}
+}
+
+// TestSelectionExclusionsHaveOneDefinition is the property the rest of this file
+// cannot express by adding cases, and it is the actual defect #216 reported: the
+// selector and the net each decided what "selectable" means, and they decided it
+// differently. Adding `blocked` and `in-progress` to the net's reason list would
+// have fixed the symptom and left one system holding two definitions of one word,
+// so the NEXT label added to the selector diverges again, silently, with the net
+// still green.
+//
+// So the test is drift, not content: patch a fourth label into the single
+// SELECTION_EXCLUSIONS list and require BOTH readers to honor it — the selector
+// must refuse an issue carrying it (exit 3, nothing to work) and the net must
+// report that issue. A reimplementation in either half fails this without anyone
+// having to remember the other half exists.
+func TestSelectionExclusionsHaveOneDefinition(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", ".genesis", "scripts", "issues.sh"))
+	if err != nil {
+		t.Fatalf("read issues.sh: %v", err)
+	}
+	src := string(b)
+
+	decl := regexp.MustCompile(`(?m)^SELECTION_EXCLUSIONS=\(([^)]*)\)$`)
+	if got := len(decl.FindAllString(src, -1)); got != 1 {
+		t.Fatalf("issues.sh has %d SELECTION_EXCLUSIONS declarations, want exactly 1 — the selector and the unselectable-work net drift apart the moment there is more than one list (#216)", got)
+	}
+	patched := decl.ReplaceAllString(src, "SELECTION_EXCLUSIONS=(needs:review ${1})")
+
+	script := filepath.Join(t.TempDir(), "issues.sh")
+	if err := os.WriteFile(script, []byte(patched), 0o755); err != nil {
+		t.Fatalf("write patched issues.sh: %v", err)
+	}
+
+	// Selector half: `next` must refuse the new label. Exit 3 is "nothing to
+	// work", which is a distinct outcome from an error.
+	t.Setenv("ISSUES_SH", script)
+	filed := time.Now().UTC().AddDate(0, 0, -2).Format(time.RFC3339)
+	r := runIssues(t, map[string]string{
+		"GH_LIST_JSON": `[{"number":900,"createdAt":"` + filed + `","labels":[{"name":"needs:review"},{"name":"milestone:6"}]}]`,
+	}, "next", "--milestone", "6")
+	if r.code != 3 {
+		t.Errorf("`next` selected an issue carrying a label that was added to SELECTION_EXCLUSIONS (exit %d, stdout %q) — the selector does not read the shared list", r.code, r.stdout)
+	}
+
+	// Net half: the same label must make the same issue visible, or work the
+	// selector refuses is reported nowhere.
+	out := runUnselectableScript(t, script,
+		[]unselStubIssue{unselIssue(900, "Work no run can select", 2, "needs:review", "milestone:6")},
+		nil, nil)
+	if !strings.Contains(out, "#900") || !strings.Contains(out, "`needs:review`") {
+		t.Errorf("unselectable-work did not report an issue carrying a label added to SELECTION_EXCLUSIONS — the net does not read the shared list:\n%s", out)
 	}
 }
 
