@@ -267,6 +267,80 @@ with the reaper and not before. It brought neither `watch` (the reaper polls on 
 schedule; nothing here reconciles) nor `deletecollection` — which is what a sweep would
 be if written the obvious way, and is precisely what a shared Chaos Mesh makes unsafe.
 
+## When a fault lands *during* a remediation
+
+This is the condition the whole milestone exists to create, and the reason the
+fixtures could never reach it: they seed a fault, let it settle, and then act. A real
+cluster keeps moving during the seconds an action takes.
+
+`execute.Runner` has three windows in which it can move, and a different mechanism
+catches each one. The outcomes below are asserted in
+[`internal/execute/faultinjection_test.go`](../internal/execute/faultinjection_test.go),
+one scenario per row, against the same cluster model the rest of that package reads.
+
+| Window | When the fault lands | What catches it | Outcome |
+| ------ | -------------------- | --------------- | ------- |
+| 1 | Before MaKlaude's precondition re-check | MaKlaude's own re-check | `ErrPreconditionDrift` / `drifted`. **Nothing is sent** — not one request in the cluster's audit log. Reads as a clean abort; the next cycle re-proposes. |
+| 2 | Between the re-check and the write | The API server's `resourceVersion` precondition | Depends on what the fault did — see below. |
+| 3 | During the bounded convergence watch | **Nothing.** The action has landed; there is no precondition left to fail. | Reported, never acted on: `timed-out`, with `Failure` still `none`. No retry, no rollback. |
+
+Window 3's non-action is the point rather than a gap. A restart that genuinely took
+effect can look incomplete because a pod-kill removed one of the replicas it just
+produced, and the two responses a helpful system would reach for — re-send the action,
+or undo it — are both wrong. `Runner.Rollback` stays a caller's decision.
+
+The window 3 verdict is also about an **instant, not an interval**. The watch returns
+the moment its predicate first holds, so a fault landing a millisecond later is
+invisible to that report. That is deliberate: watching the full window on every success
+would cost every remediation the entire observation budget and still guarantee nothing
+about the millisecond after it ends. "Did the fix *hold*?" is answered across cycles by
+the trust ledger's recurrence horizon, never by one execution's convergence verdict.
+
+### Window 2 splits, and one half is wrong today
+
+Two faults landing in the same window, on the same object, produce opposite verdicts,
+because [`kube.Executor.act`](../internal/kube/executor.go) maps exactly one API server
+response to a clean-abort sentinel:
+
+| Fault | API server | Class | Clean abort? |
+| ----- | ---------- | ----- | ------------ |
+| `pod-failure` — the pod moves | 409 Conflict | `precondition-conflict` | yes |
+| `pod-kill` — the pod is gone | 404 NotFound | `execute-failed` | **no** — escalates |
+
+For a `deletepod` remediation the second verdict is wrong twice over: a 404 on a
+precondition-carrying `DELETE` is *proof* nothing was applied, so the outcome isn't
+unknown, and the action's goal was for that pod to be gone — which it now is. MaKlaude
+escalates a remediation whose desired end state has already been reached.
+
+It is filed as [issue #214](https://github.com/Sayfan-AI/MaKlaude/issues/214) rather
+than fixed inside T5, because the fix is per-operation (a vanished *Node* mid-cordon is
+not obviously benign) and touches the write path's error taxonomy. The scenario asserts
+the behaviour that exists and carries a guard that fires if the classification changes
+without the test being updated.
+
+### Why these faults are modelled rather than injected through Chaos Mesh
+
+Window 2 is the interval between one read and one write on the same goroutine —
+microseconds to low milliseconds. Nothing can be *aimed* at it: a Chaos Mesh experiment
+travels through an admission webhook and a controller reconcile before its fault lands,
+orders of magnitude wider than the window it would have to hit, and a miss would land
+in window 1 or window 3 and pass a test written for window 2. A scenario whose timing
+is a coin flip is not a scenario.
+
+So the injection point is deterministic there, and the live-cluster half is
+[T8](https://github.com/Sayfan-AI/MaKlaude/issues/197), which covers the windows a real
+experiment can actually reach. What is *not* modelled away is the consequence: the
+faults move the same cluster model everything else reads, the write path evaluates a
+real `resourceVersion` precondition against it, and the assertions are about requests
+sent and cluster state rather than about what the report claims.
+
+One limit worth stating plainly: each modelled fault is tied to a real
+[`chaos.Action`](#the-fault-catalog), checked by the compiler. The catalog is PodChaos
+only, so the objects a real experiment can perturb are pods and, through them,
+deployments. **No catalogued action can perturb a Node**, which is why `cordonnode` —
+the most-tested operation in the execution package — appears in none of these
+scenarios. Asserting an outcome for a fault nobody can inject would be fiction.
+
 ## Installing Chaos Mesh on `kind`
 
 MaKlaude doesn't install Chaos Mesh on your clusters — see
@@ -515,15 +589,13 @@ failed partway through, which is the case a passing-run-only check would never s
 
 ## What isn't built yet
 
-This is T3 of nine. The write path and its teardown guarantee exist and are unreachable
-from any config surface, which is the same posture `kube.ExecuteMode` shipped in at M4:
-the strongest form of "off" there is. Nothing schedules a sweep yet either — `Reaper`
-has no production caller until chaos becomes a proposal class in T4.
+This is T5 of nine. The write path, its teardown guarantee, the proposal class and the
+timing scenarios exist, and nothing is reachable from any config surface — the same
+posture `kube.ExecuteMode` shipped in at M4, which is the strongest form of "off" there
+is.
 
 | Task | What it adds |
 | ---- | ------------ |
-| [T4](https://github.com/Sayfan-AI/MaKlaude/issues/193) | Chaos as a proposal class through M5's decision path: same budget, cooldown and breaker; injections **never** promote to unattended. Also where the reaper gets scheduled. |
-| [T5](https://github.com/Sayfan-AI/MaKlaude/issues/194) | Fault injection *during* remediation — the condition none of the fixtures could create |
 | [T6](https://github.com/Sayfan-AI/MaKlaude/issues/195) | Correctness scoring: did it fix the fault, and should it have been allowed |
 | [T7](https://github.com/Sayfan-AI/MaKlaude/issues/196) | The narrowed no-writes guarantee, encoded in tests as precisely as in prose |
 | [T8](https://github.com/Sayfan-AI/MaKlaude/issues/197) | The end-to-end chaos scenario on `kind` in CI |

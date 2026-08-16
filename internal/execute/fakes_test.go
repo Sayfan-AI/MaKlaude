@@ -6,9 +6,13 @@ import (
 	"io"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/approve"
 	"github.com/Sayfan-AI/MaKlaude/internal/audit"
@@ -289,6 +293,65 @@ func (c *clusterModel) removePod(namespace, name string) {
 	delete(c.pods, namespace+"/"+name)
 }
 
+// liveVersion returns the resourceVersion the model currently holds for a target,
+// in the "<kind>/<name>" / "<kind>/<namespace>/<name>" form the write path composes,
+// and whether the object exists at all.
+//
+// An unrecognized shape panics rather than reporting absence. The two are
+// indistinguishable to a caller and mean opposite things: a missing object is a
+// scenario a test may be asserting, while a target this function cannot parse is a
+// fixture bug that would otherwise surface as a mysterious 404 from a write nobody
+// expected to fail.
+func (c *clusterModel) liveVersion(target string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	parts := strings.Split(target, "/")
+	switch {
+	case len(parts) == 2 && parts[0] == "node":
+		obj, ok := c.nodes[parts[1]]
+		return obj.ResourceVersion, ok
+	case len(parts) == 3 && parts[0] == "pod":
+		obj, ok := c.pods[parts[1]+"/"+parts[2]]
+		return obj.ResourceVersion, ok
+	case len(parts) == 3 && parts[0] == "deployment":
+		obj, ok := c.deployments[parts[1]+"/"+parts[2]]
+		return obj.ResourceVersion, ok
+	}
+	panic("fake cluster model: unrecognized write target " + target)
+}
+
+// admit is the API server's answer to a mutating request: does the object still
+// exist, and is it still at the resourceVersion the request is conditioned on?
+//
+// This is modelled rather than waved away because it is the entire mechanism by
+// which a fault that lands AFTER MaKlaude's own precondition re-check is caught.
+// Without it the fake would apply a write conditioned on a version the object no
+// longer carries — the one thing [kube.Executor] exists to make impossible — and
+// every timing scenario in faultinjection_test.go would assert an outcome the real
+// write path does not produce.
+//
+// The two rejections are deliberately different sentinels, matching
+// [kube.Executor.act]: only a 409 becomes [kube.ErrPreconditionConflict]; everything
+// else, a 404 included, becomes [kube.ErrExecute]. That asymmetry is not incidental
+// to these tests — see TestFaultBetweenRecheckAndWrite_DestroyingTheTargetIsNotA-
+// CleanAbort, which asserts its consequence rather than its shape.
+func (c *clusterModel) admit(target, resourceVersion string) error {
+	live, present := c.liveVersion(target)
+	if !present {
+		kind, _, _ := strings.Cut(target, "/")
+		return fmt.Errorf("%w: %q on cluster %q: %w", kube.ErrExecute, target, c.name,
+			apierrors.NewNotFound(schema.GroupResource{Resource: kind + "s"}, target))
+	}
+	if live != resourceVersion {
+		return fmt.Errorf("%w: %q on cluster %q (expected resourceVersion %s, live %s): %w",
+			kube.ErrPreconditionConflict, target, c.name, resourceVersion, live,
+			apierrors.NewConflict(schema.GroupResource{Resource: target}, target,
+				fmt.Errorf("the object has been modified; please apply your changes to the latest version and try again")))
+	}
+	return nil
+}
+
 // snapshot renders the model as a [health.Snapshot], with every slice sorted the way
 // a real collector sorts it.
 func (c *clusterModel) snapshot() health.Snapshot {
@@ -425,6 +488,13 @@ type fakeMutator struct {
 	// so it is the only one with a window between the runner's snapshot and its own
 	// lookup — the window in which Kubernetes can prune the revision history.
 	beforeRollback func()
+
+	// beforeWrite runs once the request has been recorded as sent and before the model
+	// evaluates its precondition — which is exactly the window between MaKlaude's own
+	// re-check and the API server's verdict. It is the seam the second timing scenario
+	// needs, and unlike beforeRollback it fires for every verb, because a fault can land
+	// in that window whatever the action happens to be.
+	beforeWrite func()
 }
 
 func newFakeMutator(model *clusterModel) *fakeMutator {
@@ -451,15 +521,31 @@ func (m *fakeMutator) lastCall(t *testing.T) call {
 
 // record registers a call and decides whether it fails, returning the outcome the
 // write path would produce.
+//
+// The order of the three gates is the order the real path has them in. A programmed
+// transport failure (m.err) comes first because it stands for a response that never
+// reached object storage at all. Then beforeWrite fires: the request is on the wire,
+// so a fault landing now lands after MaKlaude has stopped looking. Only then is the
+// precondition evaluated, by the model, against whatever the world became.
 func (m *fakeMutator) record(c call, target string, apply func()) (*kube.Outcome, error) {
 	m.mu.Lock()
 	m.calls = append(m.calls, c)
 	failing := m.err != nil && (m.failFirst == 0 || len(m.calls) <= m.failFirst)
 	err := m.err
 	mode := m.mode
+	before := m.beforeWrite
 	m.mu.Unlock()
 
 	if failing {
+		return nil, err
+	}
+	if before != nil {
+		before()
+	}
+	// Evaluated in dry-run too: a server-side dry run runs the full admission and
+	// precondition path and differs only in not persisting, so a preview conditioned on
+	// a stale version must fail exactly as the real request would.
+	if err := m.model.admit(target, c.ResourceVersion); err != nil {
 		return nil, err
 	}
 	if apply != nil && mode != kube.ExecuteDryRun {
