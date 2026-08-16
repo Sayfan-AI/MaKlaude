@@ -122,6 +122,37 @@ const (
 // in identities, logs, and human-facing renderings.
 func (o Operation) String() string { return string(o) }
 
+// Catalog returns every operation this package can plan, in the order the constants
+// are declared. The returned slice is a fresh copy, so a caller cannot edit the
+// catalog by editing what it was handed.
+//
+// It exists because "is this operation one MaKlaude is built to perform at all" is a
+// question asked outside this package — by a scorer reading an audit record after the
+// fact, which has only the recorded token and no proposal to consult. Answering it
+// from a private switch somewhere else would mean a second list to keep in step with
+// this one.
+//
+// Note what this is NOT: it is not the set of operations that may run unattended.
+// [autonomy] keeps its own deliberately separate switch for that, so growing this
+// catalog does not silently widen what an operator's rules can name — see the comment
+// on `autonomy.catalogOperation`. The two lists answer different questions and should
+// not be unified.
+func Catalog() []Operation {
+	return []Operation{OpRolloutRestart, OpRollbackRevision, OpDeletePod, OpCordonNode}
+}
+
+// InCatalog reports whether op is one of this package's catalog operations. An empty
+// or unrecognized token is not, which is the fail-closed direction: a consumer that
+// gates on catalog membership should treat an operation it cannot place as outside it.
+func InCatalog(op Operation) bool {
+	for _, candidate := range Catalog() {
+		if candidate == op {
+			return true
+		}
+	}
+	return false
+}
+
 // Reversibility classifies what it would take to undo a [Proposal]'s effect. It
 // is the field a human approver should read first, and the primary sort key for
 // proposals, so the levels are ordered by increasing risk: the zero value is the
