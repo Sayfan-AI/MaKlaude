@@ -177,6 +177,11 @@ type Cycle struct {
 	rulesPath  string
 	ledgerPath string
 
+	// windowsPath names the quarantine-window log — the record of every period during
+	// which a deliberate fault kept outcomes out of the ledger. It sits beside the ledger
+	// file; see [ChaosWindowSuffix].
+	windowsPath string
+
 	// live reports whether the approval gate is backed by a real comms system rather
 	// than the in-memory dry-run sink. Surfaced in the report because "nobody can
 	// approve anything" is a materially different posture from "waiting on a human".
@@ -184,6 +189,23 @@ type Cycle struct {
 
 	// now stamps the report and the actions; injectable so tests are reproducible.
 	now func() time.Time
+}
+
+// clock reads the cycle's instant, falling back to the wall clock when no clock was
+// injected.
+//
+// The fallback is for the REPORTING path only, and exists because a [Cycle] assembled
+// field-by-field — which tests do, and which the reporting layer must tolerate — has a nil
+// clock. Everything that acts on a cluster goes through [New] or [NewForTest] and calls
+// c.now directly, deliberately: an action stamped with a clock nobody injected would be an
+// action whose record cannot be reproduced, and that should fail loudly rather than
+// default. A report that panicked because nobody set a clock, on the other hand, would be
+// the observing layer taking down the run it only observes.
+func (c *Cycle) clock() time.Time {
+	if c.now == nil {
+		return time.Now().UTC()
+	}
+	return c.now().UTC()
 }
 
 // Run executes one gated remediation pass over every cluster in the registry and

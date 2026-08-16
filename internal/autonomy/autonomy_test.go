@@ -26,14 +26,23 @@ var allReasons = []Reason{
 	ReasonUntrustedShape,
 	ReasonTrustEvidenceMissing,
 	ReasonEarnedTrust,
+	ReasonChaosNeverPromotes,
+	ReasonProposalClassUnknown,
 }
+
+// lastReason is the final constant in the iota block, and the only thing this file
+// has to update when a reason is added. It is named rather than written inline so the
+// exhaustiveness check below reads as "the list covers the block" instead of pinning
+// one particular reason as the last one forever — [ReasonEarnedTrust] held that spot
+// until chaos needed two more, and the check silently measured against it.
+const lastReason = ReasonProposalClassUnknown
 
 // TestReasons_AreExhaustivelyListed fails when a reason is declared without being
 // added to allReasons, which is what keeps the invariants below honest. It works
 // because the constants are a contiguous iota block: the count is the last value
 // plus one.
 func TestReasons_AreExhaustivelyListed(t *testing.T) {
-	if want := int(ReasonEarnedTrust) + 1; len(allReasons) != want {
+	if want := int(lastReason) + 1; len(allReasons) != want {
 		t.Fatalf("allReasons has %d entries, want %d — a Reason was added without being listed here, "+
 			"so the decision-mapping and token invariants below silently skipped it", len(allReasons), want)
 	}
