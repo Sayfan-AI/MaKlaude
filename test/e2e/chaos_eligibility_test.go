@@ -91,9 +91,22 @@ const eligibilityProbeDuration = 3 * time.Minute
 type recordedRequest struct {
 	Method string
 	Path   string
+
+	// Query is the raw query string, carried because it is the only place a
+	// server-side dry run is visible on the wire for a patch: client-go serializes
+	// PatchOptions into the URL, so `dryRun=All` distinguishes a preview from a real
+	// write on an otherwise identical request. chaos_remediation_test.go relies on
+	// that distinction; the eligibility assertions below ignore it, because a request
+	// to a cluster nobody marked is a violation whether or not it was a preview.
+	Query string
 }
 
-func (r recordedRequest) String() string { return r.Method + " " + r.Path }
+func (r recordedRequest) String() string {
+	if r.Query == "" {
+		return r.Method + " " + r.Path
+	}
+	return r.Method + " " + r.Path + "?" + r.Query
+}
 
 // recordingProxy is an HTTPS reverse proxy in front of the real API server that
 // records every request before forwarding it.
@@ -149,7 +162,7 @@ func newRecordingProxy(t *testing.T, upstream *url.URL, tls *http.Transport) *re
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
-		p.seen = append(p.seen, recordedRequest{Method: r.Method, Path: r.URL.Path})
+		p.seen = append(p.seen, recordedRequest{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery})
 		p.mu.Unlock()
 		reverse.ServeHTTP(w, r)
 	}))
