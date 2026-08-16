@@ -149,21 +149,75 @@ const (
 	ActionPodFailure Action = "pod-failure"
 )
 
-// actionKinds maps each supported action to the kind that owns it, and records
-// whether the action's effect is bounded by spec.duration.
+// SelfLimit is how an action's fault ends WITHOUT MaKlaude doing anything.
 //
-// The duration flag is not cosmetic. Chaos Mesh ignores spec.duration for a
-// one-shot action, so a CR that carries "duration: 30s" beside "action: pod-kill"
-// says something the controller will not do — and a human reading that CR while
-// triaging an incident would reasonably believe the fault self-reverts in 30
-// seconds. So a duration is REQUIRED where it is honoured and REFUSED where it is
-// ignored, rather than passed through and quietly dropped.
+// This is the type that carries Milestone 6's load-bearing property — nothing
+// survives the process — and it exists as a declared field rather than as prose
+// because the property has to hold for actions nobody has written yet. The
+// dangerous shape is an action whose fault PERSISTS and whose expiry depends on
+// MaKlaude coming back to end it: teardown is a request, and a request needs a
+// process, and a process can be SIGKILLed between the create and the defer. An
+// action in that shape must not be addable by filling in a kind and an action
+// string, which is what [TestEveryActionDeclaresASelfLimit] makes true — the zero
+// value belongs to no action, so a new catalog entry fails the build until its
+// author says how its fault ends on its own.
+//
+// Note what this is NOT: it is not the CR object's lifetime. Every action leaves
+// the custom resource behind after its fault is over — one-shot actions
+// immediately, duration-bounded ones on expiry — and that residue is what the
+// [Reaper] sweeps. A fault that self-limits and an object that self-deletes are
+// different guarantees, and Chaos Mesh only provides the first.
+type SelfLimit int
+
+const (
+	// selfLimitUnset is the zero value. No action may carry it, which is the point:
+	// a catalog entry added without stating how its fault ends gets this by default
+	// and fails the set guard rather than shipping an unbounded fault.
+	selfLimitUnset SelfLimit = iota
+
+	// SelfLimitServerDuration means Chaos Mesh's own controller reverts the fault
+	// when spec.duration elapses. This is the mechanism that survives MaKlaude's
+	// death, because the enforcing party is on the cluster: if the process is killed
+	// the instant after the create, the fault still ends on schedule. Actions in this
+	// class REQUIRE a positive duration no greater than [maxDuration].
+	SelfLimitServerDuration
+
+	// SelfLimitInstant means the fault is a single event with no persisting state, so
+	// there is nothing to revert and nothing to expire. A pod is killed once and its
+	// controller recreates it; by the time MaKlaude could die, the fault is already
+	// over. Actions in this class REFUSE a duration, because Chaos Mesh ignores
+	// spec.duration for them and a CR carrying one would tell a human triaging an
+	// incident that the fault self-reverts in 30 seconds when the controller will do
+	// no such thing.
+	SelfLimitInstant
+)
+
+// String renders the mechanism for an error message or a proposal.
+func (s SelfLimit) String() string {
+	switch s {
+	case SelfLimitServerDuration:
+		return "server-side duration"
+	case SelfLimitInstant:
+		return "instantaneous"
+	default:
+		return "undeclared"
+	}
+}
+
+// actionKinds maps each supported action to the kind that owns it and to how its
+// fault ends on its own.
+//
+// Whether the action honours spec.duration is DERIVED from the self-limit rather
+// than stored beside it. It was a second field once, and two fields that must
+// agree are two fields that can disagree — the failure being a CR that says
+// "duration: 30s" next to an action the controller applies once, or an action
+// whose fault persists with no duration to end it. One field, one answer.
 var actionKinds = map[Action]struct {
-	kind         Kind
-	usesDuration bool
+	kind      Kind
+	selfLimit SelfLimit
 }{
-	ActionPodKill:    {kind: KindPodChaos, usesDuration: false},
-	ActionPodFailure: {kind: KindPodChaos, usesDuration: true},
+	ActionPodKill:    {kind: KindPodChaos, selfLimit: SelfLimitInstant},
+	ActionPodFailure: {kind: KindPodChaos, selfLimit: SelfLimitServerDuration},
 }
 
 // Mode selects how many of the objects matching a selector an experiment affects.
@@ -227,7 +281,9 @@ type Experiment struct {
 
 	// Namespace is where the CR OBJECT lives — MaKlaude's own chaos namespace, the
 	// one its Role is scoped to. It is not where the fault lands; that is
-	// Selector.Namespaces.
+	// Selector.Namespaces, and it must not be one of them — see
+	// [Experiment.placementProblems], which is half of a bound RBAC cannot express
+	// alone.
 	Namespace string
 
 	// Selector names the objects the fault may affect.
@@ -253,14 +309,32 @@ type Experiment struct {
 // dying: if the process is killed between injecting and tearing down, an expiring
 // fault reverts itself and a long one does not. It is not the teardown guarantee —
 // one-shot actions have no duration at all and the CR outlives the fault in every
-// case, which is what T3's reaper is for — but for the actions that honour it, it
+// case, which is what the [Reaper] is for — but for the actions that honour it, it
 // is the difference between a self-limiting experiment and an outage that waits
 // for a human.
+//
+// It has a second job that is easy to miss: it is the FLOOR of the reaper's orphan
+// grace. No fault this package asks for can still be running more than maxDuration
+// after its object was created, so an owned object older than that cannot belong to
+// a live experiment under any MaKlaude process — which is what lets the reaper
+// sweep without an exclusion list of names somebody has to remember to pass. See
+// [NewReaper]. Raising this constant therefore widens the reaper's blind window by
+// the same amount, deliberately and visibly.
 const maxDuration = 10 * time.Minute
 
 // Kind returns the Chaos Mesh kind that owns this experiment's action, or the
 // empty string if the action is not in the catalog.
 func (e Experiment) Kind() Kind { return actionKinds[e.Action].kind }
+
+// SelfLimit reports how this experiment's fault ends without MaKlaude, or
+// [selfLimitUnset] rendered as "undeclared" for an action not in the catalog.
+//
+// It is exported because a proposal renderer and an audit trail both need to say
+// it: "MaKlaude will make these pods unavailable, and Chaos Mesh will put them back
+// in 2m whether or not MaKlaude is alive" is the sentence that makes a chaos
+// proposal reviewable, and a human should not have to know the action catalog to
+// read it.
+func (e Experiment) SelfLimit() SelfLimit { return actionKinds[e.Action].selfLimit }
 
 // Validate reports whether the experiment is well-formed, returning an error
 // wrapping [ErrInvalidExperiment] describing every problem it found.
@@ -282,6 +356,15 @@ func (e Experiment) Validate() error {
 		// half-finished kind addition fails loudly here rather than composing a
 		// request path with an empty resource segment.
 		problems = append(problems, fmt.Sprintf("action %q maps to kind %q, which has no resource name", e.Action, spec.kind))
+	case spec.selfLimit == selfLimitUnset:
+		// Also unreachable while TestEveryActionDeclaresASelfLimit passes, and checked
+		// for the same reason as the case above: the set guard is a build-time
+		// assertion about the catalog, and this is the run-time refusal for the one
+		// path that could reach production if the guard were ever deleted. An action
+		// whose fault has no declared end must not be injectable, because the only
+		// thing that would then end it is MaKlaude coming back — see [SelfLimit].
+		problems = append(problems, fmt.Sprintf(
+			"action %q declares no self-limit, so nothing but MaKlaude would end its fault", e.Action))
 	}
 
 	if err := validateName("namespace", e.Namespace); err != nil {
@@ -289,14 +372,51 @@ func (e Experiment) Validate() error {
 	}
 
 	problems = append(problems, e.Selector.problems()...)
+	problems = append(problems, e.placementProblems()...)
 	problems = append(problems, e.modeProblems()...)
 
 	if known {
-		problems = append(problems, e.durationProblems(spec.usesDuration)...)
+		problems = append(problems, e.durationProblems(spec.selfLimit)...)
 	}
 
 	if len(problems) > 0 {
 		return fmt.Errorf("%w: %s", ErrInvalidExperiment, strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// placementProblems reports an experiment whose CR object would be created in a
+// namespace the experiment itself breaks.
+//
+// This is not tidiness, and it is one half of a bound RBAC cannot express on its
+// own. Chaos Mesh's permission validation (the `vauth.kb.io` webhook, ON by default)
+// authorizes a create by asking the API server whether the REQUESTER may create this
+// chaos kind in every namespace the SELECTOR names — verb `create`, group
+// `chaos-mesh.org`, resource `podchaos`, one SubjectAccessReview per target
+// namespace. So aiming a fault at a namespace requires `create podchaos` there,
+// which is what deploy/rbac/chaos/target-namespace-role.yaml grants, once per
+// namespace an operator is willing to have broken.
+//
+// That grant unavoidably also permits creating an experiment OBJECT in the target
+// namespace: the webhook checks the same verb a write uses, so RBAC cannot tell "may
+// aim here" apart from "may write here". An object outside MaKlaude's own chaos
+// namespace is unreachable by every teardown path that exists — [Reaper.Reap] sweeps
+// one namespace, and the chaos Role grants `list` and `delete` in that one alone, so
+// a stray object could be neither found nor removed. It would be exactly the
+// outlives-the-process leak this milestone is about.
+//
+// So the namespaces a create can land in are bounded twice, by two mechanisms that
+// have to agree: RBAC narrows the set to {the chaos namespace} ∪ {the target
+// namespaces}, and this rule removes the target namespaces from it. What is left is
+// the swept namespace, alone.
+func (e Experiment) placementProblems() []string {
+	for _, ns := range e.Selector.Namespaces {
+		if ns != e.Namespace {
+			continue
+		}
+		return []string{fmt.Sprintf(
+			"namespace %q is also a target in selector.namespaces: an experiment object must not live in a namespace the experiment breaks, "+
+				"because the reaper sweeps only MaKlaude's own chaos namespace and an object anywhere else can never be collected", e.Namespace)}
 	}
 	return nil
 }
@@ -321,15 +441,24 @@ func (e Experiment) modeProblems() []string {
 	return nil
 }
 
-// durationProblems reports what is wrong with the experiment's duration, given
-// whether its action honours one.
-func (e Experiment) durationProblems(usesDuration bool) []string {
+// durationProblems reports what is wrong with the experiment's duration, given how
+// its action's fault ends on its own.
+//
+// Both directions are refusals rather than corrections, and both happen HERE —
+// before any request is composed, let alone sent — so an experiment whose fault
+// would outlive its bound never reaches a cluster. There is no clamping: silently
+// shortening a 30-minute request to 10 would inject a different experiment than the
+// one the caller asked for and than the one the record would describe.
+func (e Experiment) durationProblems(selfLimit SelfLimit) []string {
 	switch {
-	case usesDuration && e.Duration <= 0:
-		return []string{fmt.Sprintf("action %q requires a positive duration", e.Action)}
-	case usesDuration && e.Duration > maxDuration:
+	case selfLimit == SelfLimitServerDuration && e.Duration <= 0:
+		return []string{fmt.Sprintf(
+			"action %q persists until Chaos Mesh reverts it, so it requires a positive duration (at most %s) — "+
+				"without one the only thing that would end the fault is MaKlaude, and MaKlaude can be killed",
+			e.Action, maxDuration)}
+	case selfLimit == SelfLimitServerDuration && e.Duration > maxDuration:
 		return []string{fmt.Sprintf("duration %s exceeds the maximum %s", e.Duration, maxDuration)}
-	case !usesDuration && e.Duration != 0:
+	case selfLimit == SelfLimitInstant && e.Duration != 0:
 		return []string{fmt.Sprintf(
 			"action %q is one-shot and Chaos Mesh ignores spec.duration for it, so a duration (%s) must not be set",
 			e.Action, e.Duration)}

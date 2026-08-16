@@ -1,0 +1,30 @@
+# Binds the per-target-namespace capability to the chaos identity, and to nothing else.
+#
+# Like the Role it references, it carries no `metadata.namespace`: the namespace is the
+# operator's per-apply choice, and both documents must land in the SAME namespace or
+# the binding refers to a Role that isn't there.
+#
+#   kubectl apply -f deploy/rbac/chaos/target-namespace-role.yaml        -n <target-ns>
+#   kubectl apply -f deploy/rbac/chaos/target-namespace-rolebinding.yaml -n <target-ns>
+#
+# The subject's namespace IS pinned, and that asymmetry is the point: `maklaude` is
+# where the three ServiceAccounts live, wherever the fault lands. The observation
+# identity (`maklaude`) and the executor (`maklaude-executor`) are absent here for the
+# same reason they are absent from every other chaos manifest — an operator who decides
+# a namespace may be broken has not thereby given the account that reads their cluster,
+# or the one that repairs it, the ability to break anything.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: maklaude-chaos-target
+  labels:
+    app.kubernetes.io/name: maklaude
+    app.kubernetes.io/component: chaos
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: maklaude-chaos-target
+subjects:
+  - kind: ServiceAccount
+    name: maklaude-chaos
+    namespace: maklaude

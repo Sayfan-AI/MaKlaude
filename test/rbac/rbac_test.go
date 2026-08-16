@@ -45,6 +45,12 @@ const (
 	// chaosNamespace is where experiment OBJECTS live, and the only namespace the
 	// chaos Role is bound in. It is not where faults land.
 	chaosNamespace = "maklaude-chaos"
+
+	// chaosTargetRole is the per-target-namespace capability: the one grant that
+	// makes a namespace breakable, applied once per namespace by a person. It ships
+	// in the same directory as the chaos Role but is excluded from the kustomization
+	// on purpose — see TestChaosTargetGrantIsNotInTheBundle.
+	chaosTargetRole = "maklaude-chaos-target"
 )
 
 // mutatingVerbs is every RBAC verb that can change cluster state, plus the three
@@ -418,26 +424,34 @@ func TestBaseBundleDoesNotIncludeTheWriteDelta(t *testing.T) {
 	}
 }
 
-// TestChaosRoleGrantsExactlyTheInjectorCatalog pins the chaos Role to the three
-// calls in internal/chaos/injector.go, in both directions. A missing grant means an
-// experiment fails at the API server with a confusing Forbidden; an extra grant
-// means the chaos identity holds authority no code path exercises, which is
-// precisely the authority a later bug finds.
+// TestChaosRoleGrantsExactlyTheInjectorCatalog pins the chaos Role to the four calls
+// in internal/chaos, in both directions. A missing grant means an experiment fails at
+// the API server with a confusing Forbidden; an extra grant means the chaos identity
+// holds authority no code path exercises, which is precisely the authority a later bug
+// finds.
 //
-// Note what is NOT here: `list`. The reaper that sweeps orphaned experiments (T3)
-// will need it and does not exist yet, and a role that grants what the code will
-// need next is a role nobody can audit against the code.
+// `list` arrived with the reaper (T3, issue #192) and not before. That timing is the
+// convention this test enforces: the grant and the call that issues it land in one
+// change, so the Role is auditable against the code at every commit rather than
+// describing a future one. Note also what `list` did NOT bring with it — `watch`,
+// because the reaper polls on a schedule rather than reconciling, and
+// `deletecollection`, which is what a sweep would be if it were written the obvious
+// way. A sweep deletes one object at a time, each conditioned on its UID, because a
+// shared Chaos Mesh holds a human's own experiments and a bulk delete cannot tell them
+// apart.
 func TestChaosRoleGrantsExactlyTheInjectorCatalog(t *testing.T) {
 	role := namespacedRole(t, loadManifests(t, chaosDir), chaosSA)
 
-	// One entry per Injector call:
+	// One entry per call in internal/chaos:
 	//   Inject's absence check -> get    podchaos.chaos-mesh.org
 	//   Inject                 -> create podchaos.chaos-mesh.org
 	//   Remove                 -> delete podchaos.chaos-mesh.org
+	//   Reaper.Reap            -> list   podchaos.chaos-mesh.org
 	want := map[grant]bool{
 		{group: "chaos-mesh.org", resource: "podchaos", verb: "get"}:    true,
 		{group: "chaos-mesh.org", resource: "podchaos", verb: "create"}: true,
 		{group: "chaos-mesh.org", resource: "podchaos", verb: "delete"}: true,
+		{group: "chaos-mesh.org", resource: "podchaos", verb: "list"}:   true,
 	}
 	got := grantsOfRules(role.Rules)
 
@@ -513,7 +527,9 @@ func TestChaosRoleExcludesTheWorkloadItBreaks(t *testing.T) {
 		{grant{"", "pods", "list"}, "same: the chaos identity re-reads only its own custom resources"},
 		{grant{"apps", "deployments", "patch"}, "that is the executor's catalog, under a different identity and a human approval"},
 		{grant{"", "nodes", "patch"}, "cordoning is remediation, not chaos"},
-		{grant{"chaos-mesh.org", "podchaos", "deletecollection"}, "one request would remove every experiment; the WriteScope pins an exact object path and cannot express it"},
+		{grant{"chaos-mesh.org", "podchaos", "deletecollection"}, "one request would remove every experiment; the WriteScope pins an exact object path and cannot express it, and a sweep deletes one object at a time so a human's own experiment cannot be caught in it"},
+		{grant{"chaos-mesh.org", "podchaos", "watch"}, "the reaper polls on a schedule; nothing here reconciles on an experiment changing, and a fault's status while it runs is Chaos Mesh's business"},
+		{grant{"chaos-mesh.org", "networkchaos", "list"}, "list arrived for the reaper over the closed one-kind catalog, not for the group"},
 		{grant{"chaos-mesh.org", "podchaos", "update"}, "an experiment is created and deleted, never edited — editing a live fault would change what MaKlaude is measuring"},
 		{grant{"chaos-mesh.org", "podchaos", "patch"}, "same as update"},
 		{grant{"chaos-mesh.org", "networkchaos", "create"}, "internal/chaos has a closed one-kind catalog; adding a kind means adding it here in the same change"},
@@ -619,6 +635,197 @@ func TestChaosGrantReachesNoOtherIdentity(t *testing.T) {
 	}
 	if !bound {
 		t.Errorf("RoleBinding %s does not bind %s/%s; the chaos bundle grants nothing", chaosSA, saNamespace, chaosSA)
+	}
+}
+
+// TestChaosTargetRoleGrantsExactlyTheWebhookCheck pins the per-target-namespace grant
+// to the one SubjectAccessReview Chaos Mesh actually performs, in both directions.
+//
+// The check it mirrors is not a guess. chaos-mesh v2.8.3's `vauth.kb.io` webhook
+// (pkg/webhook/validate_auth.go) authorizes a create by asking, for each namespace the
+// experiment's SELECTOR names, whether the requester may `create` `podchaos` in the
+// `chaos-mesh.org` group there — one namespaced SubjectAccessReview per target. So this
+// Role is that check and nothing else.
+//
+// Both directions matter, differently from the other roles. A MISSING grant is not a
+// confusing Forbidden from the API server — it is an admission denial reading
+// "system:serviceaccount:maklaude:maklaude-chaos is forbidden on namespace <target>",
+// which looks like a MaKlaude bug and is in fact the bound working. An EXTRA grant is
+// worse than usual here, because this Role is the one MaKlaude holds in a namespace
+// full of somebody's real workloads.
+func TestChaosTargetRoleGrantsExactlyTheWebhookCheck(t *testing.T) {
+	role := namespacedRole(t, loadManifests(t, chaosDir), chaosTargetRole)
+
+	want := map[grant]bool{
+		{group: "chaos-mesh.org", resource: "podchaos", verb: "create"}: true,
+	}
+	got := grantsOfRules(role.Rules)
+
+	var missing, extra []string
+	for g := range want {
+		if !got[g] {
+			missing = append(missing, g.String())
+		}
+	}
+	for g := range got {
+		if !want[g] {
+			extra = append(extra, g.String())
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(extra)
+
+	if len(missing) > 0 {
+		t.Errorf("the target-namespace Role is missing %s, which is the exact attribute set vauth.kb.io reviews; "+
+			"every experiment aimed at that namespace will be denied by admission", strings.Join(missing, ", "))
+	}
+	if len(extra) > 0 {
+		t.Errorf("the target-namespace Role grants authority beyond the admission check it exists to satisfy: %s\n"+
+			"This Role is held in a namespace of real workloads. Nothing in internal/chaos reads or writes anything there — "+
+			"experiment objects live in %s and the reaper sweeps only that namespace.",
+			strings.Join(extra, ", "), chaosNamespace)
+	}
+}
+
+// TestChaosTargetRoleExcludesTheWorkloadItBreaks names the over-grants this Role would
+// most plausibly acquire and says why each is wrong.
+//
+// It overlaps the catalog test on purpose, the same way the two chaos-Role tests
+// overlap: that one fails on any extra and says only "extra", this one explains the
+// specific danger to whoever added it. The `get`/`list`/`delete` entries are the ones
+// worth reading — they look harmless next to a `create` that is already granted, and
+// they are what would make MaKlaude's objects appear to legitimately live in a
+// namespace no sweep can reach.
+func TestChaosTargetRoleExcludesTheWorkloadItBreaks(t *testing.T) {
+	got := grantsOfRules(namespacedRole(t, loadManifests(t, chaosDir), chaosTargetRole).Rules)
+
+	forbidden := []struct {
+		g      grant
+		reason string
+	}{
+		{grant{"chaos-mesh.org", "podchaos", "get"}, "the create-shaped precondition reads the object in " + chaosNamespace + ", where the object is; a read here would only be a read of an object that must not exist"},
+		{grant{"chaos-mesh.org", "podchaos", "list"}, "list exists for the reaper, and the reaper sweeps " + chaosNamespace + " alone — a listable target namespace suggests MaKlaude's objects belong here, and they never do"},
+		{grant{"chaos-mesh.org", "podchaos", "delete"}, "nothing of MaKlaude's is ever created here to delete; granting it would make the leak silent instead of impossible"},
+		{grant{"chaos-mesh.org", "podchaos", "deletecollection"}, "one request would remove every experiment in a namespace holding a human's own work"},
+		{grant{"chaos-mesh.org", "podchaos", "update"}, "an experiment is created and deleted, never edited"},
+		{grant{"chaos-mesh.org", "podchaos", "patch"}, "same as update"},
+		{grant{"", "pods", "get"}, "this grant is what lets MaKlaude BREAK this namespace; it must confer no ability to read it — observation goes through the read-only identity"},
+		{grant{"", "pods", "list"}, "same: breaking a namespace is not permission to enumerate it"},
+		{grant{"", "pods", "delete"}, "MaKlaude asks Chaos Mesh to kill a pod; the whole reason a third identity exists is that it cannot kill one itself"},
+		{grant{"", "pods/exec", "create"}, "an exec into a workload is the most direct form of the thing this identity must never be able to do"},
+		{grant{"apps", "deployments", "patch"}, "that is the executor's catalog, under a different identity and a human approval"},
+		{grant{"", "secrets", "get"}, "the chaos path adds no read of any kind, least of all secrets in a namespace it is about to break"},
+		{grant{"", "events", "create"}, "MaKlaude records what it did in its own audit trail, not in the target namespace's event stream"},
+		{grant{"chaos-mesh.org", "networkchaos", "create"}, "internal/chaos has a closed one-kind catalog; adding a kind means adding it here AND in role.yaml in the same change"},
+		{grant{"chaos-mesh.org", "schedules", "create"}, "a Schedule outlives the run that created it, which is the leak teardown exists to prevent"},
+		{grant{"chaos-mesh.org", "*", "*"}, "a group wildcard grants every current and FUTURE Chaos Mesh kind in a namespace someone agreed to have one kind of fault in"},
+		{grant{"*", "*", "*"}, "a wildcard here is admin on somebody's production namespace"},
+	}
+
+	for _, f := range forbidden {
+		if got[f.g] {
+			t.Errorf("the target-namespace Role grants %s — %s", f.g, f.reason)
+		}
+	}
+}
+
+// TestChaosTargetGrantCarriesNoNamespaceAndBindsOnlyChaos is the shape assertion, and
+// the namespace half is load-bearing rather than stylistic.
+//
+// These two documents are applied once per namespace an operator is willing to have
+// broken: `kubectl apply -f ... -n <target-ns>`. The namespace therefore has to come
+// from the apply. A hardcoded `metadata.namespace` would be wrong in every deployment
+// but the one it was written for, and — worse — would make `kubectl apply -f` silently
+// grant chaos in a namespace the operator did not name, which is precisely the decision
+// this file exists to force someone to make explicitly.
+//
+// The binding half is the same property TestChaosGrantReachesNoOtherIdentity asserts
+// over the whole tree, checked here as a non-vacuity guard: if the RoleBinding named no
+// subject, or referenced a different Role, the files would grant nothing and only the
+// e2e's admission denial would notice.
+func TestChaosTargetGrantCarriesNoNamespaceAndBindsOnlyChaos(t *testing.T) {
+	docs := loadManifests(t, chaosDir)
+
+	role := namespacedRole(t, docs, chaosTargetRole)
+	if role.Namespace != "" {
+		t.Errorf("the target-namespace Role pins namespace %q; it must carry none, so `kubectl apply -f ... -n <ns>` is what chooses which namespace may be broken",
+			role.Namespace)
+	}
+
+	binding := namespacedRoleBinding(t, docs, chaosTargetRole)
+	if binding.Namespace != "" {
+		t.Errorf("the target-namespace RoleBinding pins namespace %q; it must carry none, and must land in the same namespace as its Role",
+			binding.Namespace)
+	}
+	if binding.RoleRef.Kind != "Role" || binding.RoleRef.Name != chaosTargetRole {
+		t.Errorf("the target-namespace RoleBinding references %s/%s, want Role/%s",
+			binding.RoleRef.Kind, binding.RoleRef.Name, chaosTargetRole)
+	}
+
+	if len(binding.Subjects) != 1 {
+		t.Fatalf("the target-namespace RoleBinding names %d subjects; the ability to break a namespace belongs to %s alone",
+			len(binding.Subjects), chaosSA)
+	}
+	subject := binding.Subjects[0]
+	if subject.Kind != "ServiceAccount" || subject.Name != chaosSA || subject.Namespace != saNamespace {
+		t.Errorf("the target-namespace RoleBinding binds %s %s/%s, want ServiceAccount %s/%s",
+			subject.Kind, subject.Namespace, subject.Name, saNamespace, chaosSA)
+	}
+}
+
+// TestChaosTargetGrantIsNotInTheBundle keeps `kubectl apply -k deploy/rbac/chaos`
+// meaning "MaKlaude can write experiment objects in its own namespace and break
+// nothing".
+//
+// Adding these two files to `resources:` would look like tidying up a directory and
+// would in fact do two things at once: kustomize would have to place two
+// namespace-less namespaced objects somewhere (the apply's namespace, whatever that
+// happens to be), and every operator applying the bundle would grant chaos in a
+// namespace nobody chose. Which namespaces may be broken is a separate, revocable,
+// per-namespace decision by a person — that is gate 4 of the four in the bundle's own
+// header.
+//
+// The check is over the SET of files in the directory rather than the two names known
+// today: any manifest here that is neither referenced by the kustomization nor part of
+// the target grant fails, so a third file added later cannot quietly become either an
+// unnoticed part of the bundle or an unnoticed exclusion from it.
+func TestChaosTargetGrantIsNotInTheBundle(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(chaosDir, "kustomization.yaml"))
+	if err != nil {
+		t.Fatalf("reading the chaos kustomization: %v", err)
+	}
+	var kustomization struct {
+		Resources []string `json:"resources"`
+	}
+	if err := yaml.Unmarshal(raw, &kustomization); err != nil {
+		t.Fatalf("parsing the chaos kustomization: %v", err)
+	}
+
+	referenced := map[string]bool{}
+	for _, resource := range kustomization.Resources {
+		referenced[resource] = true
+		if strings.HasPrefix(resource, "target-namespace-") {
+			t.Errorf("the chaos kustomization references %q; the per-target-namespace grant must stay out of the bundle, "+
+				"or `kubectl apply -k deploy/rbac/chaos` grants chaos in whatever namespace the apply happens to target", resource)
+		}
+	}
+
+	// The complementary half: every other manifest in the directory MUST be in the
+	// bundle, or applying it is quietly incomplete.
+	entries, err := os.ReadDir(chaosDir)
+	if err != nil {
+		t.Fatalf("reading %s: %v", chaosDir, err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".yaml") || name == "kustomization.yaml" {
+			continue
+		}
+		if strings.HasPrefix(name, "target-namespace-") || referenced[name] {
+			continue
+		}
+		t.Errorf("%s/%s is in neither the kustomization's resources nor the per-target-namespace grant; "+
+			"`kubectl apply -k deploy/rbac/chaos` will not apply it and nothing says why", chaosDir, name)
 	}
 }
 

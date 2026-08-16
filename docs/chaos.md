@@ -84,7 +84,10 @@ The ceiling exists because a duration is the only bound that survives MaKlaude
 dying: if the process is killed between injecting and tearing down, an expiring
 fault reverts itself and a long one doesn't. It is **not** the teardown guarantee —
 one-shot actions have no duration at all, and the CR object outlives the fault in
-every case. Guaranteed teardown is [T3](https://github.com/Sayfan-AI/MaKlaude/issues/192).
+every case. See [How a fault ends without MaKlaude](#how-a-fault-ends-without-maklaude).
+
+The ceiling has a second job that's easy to miss: it's the floor of the reaper's
+orphan grace. Raising it widens the reaper's blind window by the same amount.
 
 `mode` and `value` come straight from Chaos Mesh (`one`, `all`, `fixed`,
 `fixed-percent`, `random-max-percent`), validated as a closed set with the value
@@ -163,6 +166,138 @@ The delete overrides neither propagation policy nor grace period, so Chaos Mesh'
 finalizer runs and a persisting fault is reverted before the object disappears.
 Forcing the object away would remove the record while leaving the fault.
 
+## How a fault ends without MaKlaude
+
+A leaked chaos experiment on your cluster is the worst outcome this milestone can
+produce, and "the deferred cleanup runs" doesn't achieve the opposite. A `defer` is
+code in a process: it doesn't run on `SIGKILL`, on an OOM kill, on a panic in another
+goroutine, or on a CI runner that vanishes. Each of those leaves a CR on the cluster
+that MaKlaude is no longer around to delete.
+
+So there are **two mechanisms, and neither subsumes the other.**
+
+**1. The fault self-limits, and Chaos Mesh is what enforces it.** Every action in the
+catalog declares how its fault ends with MaKlaude absent, and that declaration is a
+field rather than a convention — the zero value belongs to no action, so a new action
+added without one fails the build (`TestEveryActionDeclaresASelfLimit`). There are two
+mechanisms today:
+
+| Action | How the fault ends | What that means if MaKlaude is killed |
+| ------ | ------------------ | ------------------------------------- |
+| `pod-failure` | Chaos Mesh's controller reverts it when `spec.duration` elapses | The fault ends on schedule. The enforcing party is on the cluster, not in this program. |
+| `pod-kill` | The fault is a single event — the pod is killed once, its controller recreates it | It's already over. There's nothing to revert, which is why a duration is *refused* here rather than required. |
+
+Refusing an out-of-bounds duration happens at validation, before a request is
+composed, so an experiment whose fault would outlive its bound never reaches a
+cluster. There's no clamping: silently shortening a 30-minute request to 10 would
+inject a different experiment than the one you asked for and than the one the record
+describes.
+
+**2. The reaper removes what's left.** Every action leaves the CR object behind after
+its fault is over — one-shot actions immediately, duration-bounded ones on expiry —
+and the object is what a next cycle collects. `chaos.Reaper` lists MaKlaude's
+experiments and deletes the ones old enough to be residue, each through the same
+UID-conditioned `Injector.Remove` as a deliberate teardown.
+
+That means: **the fault is over within 10 minutes no matter what happens to MaKlaude,
+and the record of it is gone on the next sweep.**
+
+**A teardown that succeeds has been *accepted*, not completed**, and the difference is
+load-bearing rather than pedantic. Chaos Mesh holds a finalizer on every experiment and
+clears it only once its controller has recovered the fault, so the object sits in
+`Terminating` in between: a second `Remove` in that window reports success with
+`AlreadyAbsent` **false** (the object really is still there), and re-injecting the same
+experiment fails with `ErrExperimentExists` until the name is free. `AlreadyAbsent` is
+therefore the receipt for *recovery finished*, not merely for *object deleted*. MaKlaude
+never forces the object away — `--force`-style deletion would drop the record while
+leaving the pods broken. The upside is the guarantee itself: because recovery belongs to
+Chaos Mesh, a MaKlaude that is `SIGKILL`ed one instant after the delete is accepted still
+leaves a cluster that un-breaks itself.
+
+`internal/chaos` proves the first half by killing a real process. A child process
+injects a persisting fault, gets `SIGKILL`ed the instant the create lands, and the test
+then asserts that no teardown request ever reached the API server and that the object
+left behind carries a bounded `spec.duration`. A test that faked the death by returning
+early would prove the wrong thing — a returning function still runs its defers.
+
+### What stops the reaper deleting *your* experiments
+
+A reaper is, mechanically, a bulk delete of other people's objects waiting for a bug.
+Chaos Mesh is a shared installation: your own experiment sits in the same namespace and
+looks broadly like MaKlaude's. Deleting one of those is worse than the leak the reaper
+prevents.
+
+Ownership needs **three independent signals, all of them**:
+
+1. **The labels** `app.kubernetes.io/managed-by=maklaude` and
+   `app.kubernetes.io/component=chaos` — re-checked in-process, not merely passed to
+   the server as a label selector. A selector is a filter, and a filter that's ignored
+   (by a proxy, a server-side bug, a caller that changes it) returns *more* than was
+   asked for; code that trusts it deletes whatever came back.
+2. **The `chaos.maklaude.dev/cluster` annotation**, which must name this cluster.
+   Labels get copied when someone clones a manifest to try it themselves; the
+   annotation names the cluster the experiment was authorised for.
+3. **The name shape.** MaKlaude's object names are derived — `maklaude-<kind>-<digest>`
+   — so no hand-written or server-generated name can match. This is the signal you
+   can't reproduce by copying metadata, which is what makes it worth having alongside
+   the other two.
+
+And an **age grace**, which is the part that replaces a knob with an argument. The
+obvious design for "don't sweep what's in use" is a list of live experiment names
+passed in by the caller — a convention that works until one call site forgets, and
+which could never know about a *concurrently running* MaKlaude's experiments anyway.
+Instead: no fault MaKlaude asks for can outlive the 10-minute ceiling, so an owned
+object older than that can't belong to a live experiment under any MaKlaude, anywhere.
+A grace at or above that ceiling is therefore structurally unable to reach a running
+fault. `NewReaper` **refuses** a shorter one rather than clamping it, which is also
+what rejects the value that matters most: `0` is what a forgotten field gets, and "reap
+everything owned, however young" is both plausible-looking and destructive.
+
+Two more properties worth knowing:
+
+- **One failed delete doesn't abort a sweep.** Five leaked experiments where the first
+  delete is denied is exactly when the other four matter most. Failures are collected
+  on the returned `Sweep`, which is non-nil even alongside an error — a partial sweep's
+  record of what it *did* remove is what you need when part of it failed.
+- **A sweep that can't enumerate the cluster is an error, not an all-clear.**
+  `ErrReapFailed` exists so "I couldn't look" never reads as "nothing leaked".
+
+The RBAC follows the code rather than anticipating it: `list` on `podchaos` arrived
+with the reaper and not before. It brought neither `watch` (the reaper polls on a
+schedule; nothing here reconciles) nor `deletecollection` — which is what a sweep would
+be if written the obvious way, and is precisely what a shared Chaos Mesh makes unsafe.
+
+## Installing Chaos Mesh on `kind`
+
+MaKlaude doesn't install Chaos Mesh on your clusters — see
+[What the RBAC does *not* bound](#what-the-rbac-does-not-bound). For a local `kind`
+cluster used for development and testing, one script does it reproducibly:
+
+```bash
+task chaos:install     # pinned chart, kind's containerd socket, waits until serving
+task chaos:uninstall   # removes the release; deliberately leaves the CRDs
+```
+
+The CI `chaos on kind` job calls the same `scripts/install-chaos-mesh.sh`, so a failure
+you reproduce locally runs the code CI ran, and the pinned version has exactly one home
+in the repo. Three details it handles that are easy to get wrong by hand:
+
+- **The container runtime.** The chart defaults to Docker's socket. A `kind` node runs
+  containerd, and pointing `chaos-daemon` at the wrong socket doesn't fail loudly — the
+  daemon comes up, the controller accepts a `PodChaos`, and the fault never lands. An
+  experiment that reports injected while nothing broke is the exact failure the closed
+  action catalog exists to prevent on the CR side.
+- **Readiness is not the same as serving.** `helm --wait` returns when the Deployments
+  report ready; the script additionally waits for the `podchaos` CRD to be
+  `Established` and probes until the admission webhook answers. Without that, the first
+  create races the install and reads as a flaky test.
+- **It refuses any cluster that doesn't look like `kind`.** This installs a component
+  that can kill pods cluster-wide, and a mistyped context is the whole risk. Chaos Mesh
+  on a cluster you care about is your decision to make with your own tooling.
+
+Uninstall leaves the CRDs in place on purpose: removing a CRD cascades to every custom
+resource of that kind, including experiments MaKlaude didn't create.
+
 ## The guard is the executor's guard
 
 The chaos path gets its own package and identity. It does **not** get its own
@@ -194,16 +329,88 @@ scope can only pin the collection path, since that's where a `POST` goes), so a
 caller-supplied object would be a way to name an object the scope never approved.
 Building the body is part of the guard, not a convenience.
 
-## What the RBAC does *not* bound
+## Which namespaces MaKlaude can break, and how that is decided
 
-Read this before assuming the Role is the safety net.
+The `maklaude-chaos` Role in
+[`deploy/rbac/chaos/role.yaml`](../deploy/rbac/chaos/role.yaml) covers the namespace
+experiment **objects** live in. It says nothing about where a fault lands, and read
+alone it invites the conclusion that nothing does: MaKlaude writes a CR, Chaos Mesh's
+controller does the killing with its own substantial privileges, and none of
+MaKlaude's permissions are consulted for the killing itself.
 
-**It does not bound the blast radius of an experiment.** MaKlaude writes a CR;
-Chaos Mesh's own controller does the killing, with its own substantial privileges. A
-`PodChaos` created in `maklaude-chaos` whose selector names `kube-system` affects
-`kube-system`, and no permission of MaKlaude's is consulted for that.
+Something does, and it is the file most likely to be missed because it is
+deliberately *not* in the bundle:
+[`target-namespace-role.yaml`](../deploy/rbac/chaos/target-namespace-role.yaml),
+applied once per namespace you are willing to have broken.
 
-What bounds the damage is:
+```bash
+kubectl apply -f deploy/rbac/chaos/target-namespace-role.yaml        -n <target-ns>
+kubectl apply -f deploy/rbac/chaos/target-namespace-rolebinding.yaml -n <target-ns>
+```
+
+### Why that file exists — Chaos Mesh's contract, measured
+
+Chaos Mesh installs with permission validation **on by default**. Its `vauth.kb.io`
+validating webhook authorizes a create by asking the API server, once per namespace
+the experiment's **selector** names, whether the *requester* may create this chaos
+kind there:
+
+```yaml
+# One SubjectAccessReview per target namespace, with exactly these attributes.
+verb: create
+group: chaos-mesh.org
+resource: podchaos      # strings.ToLower(kind)
+namespace: <each namespace in the selector>
+```
+
+That's read out of
+[`pkg/webhook/validate_auth.go`](https://github.com/chaos-mesh/chaos-mesh/blob/v2.8.3/pkg/webhook/validate_auth.go)
+at the chart version [`scripts/install-chaos-mesh.sh`](../scripts/install-chaos-mesh.sh)
+pins, not inferred from behaviour. Three consequences, all load-bearing:
+
+- **It checks `chaos-mesh.org` permissions, not pod permissions.** An earlier version
+  of this document called that a genuine tension — the injector must not touch pods,
+  and permission validation appeared to require that it could. It doesn't, and the
+  resolution costs the chaos identity **no** grant on any workload. `create podchaos`
+  in the target namespace is the entire requirement.
+- **So the reachable namespaces are an allowlist a person writes.** A `PodChaos` in
+  `maklaude-chaos` whose selector names `kube-system` is *denied* unless somebody ran
+  the apply above for `kube-system`. The denial reads
+  `system:serviceaccount:maklaude:maklaude-chaos is forbidden on namespace kube-system`,
+  and it is the bound working rather than a bug.
+- **A cluster-scoped experiment is impossible.** A selector naming no namespace makes
+  the same webhook demand cluster-wide `create podchaos`, which no `Role` can confer.
+  `internal/chaos` also refuses to compose such a selector. Two independent layers,
+  the same answer.
+
+The toggle is `dashboard.securityMode` (default `true`) — misleadingly named, since
+the chart feeds it to the *controller* as `SECURITY_MODE` and disabling the dashboard
+does not disable the check. The install script sets it explicitly so this bound keeps
+existing if the upstream default ever flips.
+
+### What the target grant is, and what it deliberately is not
+
+One verb — `create podchaos.chaos-mesh.org` — which is exactly the review above.
+It confers no read of the namespace, no access to a pod, and no `list`/`delete` on
+experiments there. That last absence needs its reason stated, because the verb it
+*does* grant unavoidably also permits writing an experiment **object** into the
+target namespace: the webhook checks the same verb a write uses, so RBAC cannot tell
+"may aim here" from "may write here".
+
+An object outside `maklaude-chaos` is unreachable by every teardown path that exists
+— `Reaper.Reap` sweeps one namespace, and the chaos Role grants `list` and `delete`
+in that one alone — so it would be precisely the outlives-the-process leak this
+milestone is about. `internal/chaos` therefore refuses any experiment whose CR
+namespace appears in its own selector (`Experiment.placementProblems`). The two
+mechanisms are meant to be read together:
+
+| Mechanism | Namespaces a create could land in |
+|---|---|
+| RBAC alone | `maklaude-chaos` ∪ the granted target namespaces |
+| The validator subtracts | the granted target namespaces |
+| What remains | `maklaude-chaos` — the one namespace the reaper sweeps |
+
+### The other bounds, which this is not a substitute for
 
 - the selector MaKlaude writes, validated in `internal/chaos` and always naming its
   target namespaces explicitly;
@@ -211,22 +418,10 @@ What bounds the damage is:
 - M5's blast-radius budget, cooldown and circuit breaker, once chaos proposals run
   through the decision path (T4).
 
-The Role is what stops MaKlaude reaching *past* Chaos Mesh. It is not what stops
-Chaos Mesh reaching far.
-
-### An open deployment question
-
-Chaos Mesh can be installed with permission validation, where its admission webhook
-checks whether the *requester* may act on the objects a selector matches. Under that
-posture the `maklaude-chaos` identity will be **refused**, because it deliberately
-holds no permissions on pods.
-
-That's a genuine tension, not an oversight: MaKlaude's design says the injector must
-not be able to touch pods directly, and that feature says the injector must be able
-to. Resolving it means granting the target-namespace pod permissions Chaos Mesh
-checks, which widens this identity — an operator's decision, not a default. Which
-posture the `kind` job runs under is pinned by
-[T8](https://github.com/Sayfan-AI/MaKlaude/issues/197).
+The chaos Role is what stops MaKlaude reaching *past* Chaos Mesh. The target-namespace
+Role is what stops it pointing Chaos Mesh wherever it likes. Neither survives an
+operator turning permission validation off, which is why the posture is pinned rather
+than inherited.
 
 MaKlaude also does not install Chaos Mesh. It writes the custom resources;
 installing the controller and choosing its scope is yours.
@@ -234,13 +429,30 @@ installing the controller and choosing its scope is yours.
 ## Verifying it yourself
 
 ```bash
-# Manifest-level, seconds, no cluster: the Role grants exactly the three calls
+# Manifest-level, seconds, no cluster: the Role grants exactly the four calls
 # internal/chaos makes, it's namespaced rather than cluster-wide, and no other
 # identity holds it.
 go test ./test/rbac/
 
-# In-process: the scope door, the derived name, the create/teardown preconditions.
+# In-process: the scope door, the derived name, the create/teardown preconditions,
+# every action's declared self-limit, and the reaper's ownership test. Includes the
+# SIGKILL test — it spawns a child process, injects a real fault against a stub
+# apiserver, kills it, and asserts what a dead run leaves behind.
 go test ./internal/chaos/ ./internal/kube/
+
+# Against a live kind cluster with Chaos Mesh: create -> observe -> terminate, plus a
+# sweep that must collect MaKlaude's leftover object and leave the operator's alone.
+task chaos:install
+kubectl apply -f test/e2e/manifests/chaos-target.yaml
+kubectl apply -f test/e2e/manifests/chaos-foreign.yaml
+
+# The per-namespace capability. Skip it and every experiment below is denied by
+# admission — "forbidden on namespace maklaude-chaos-target" — which is the bound
+# described above doing its job, not a broken test.
+kubectl apply -f deploy/rbac/chaos/target-namespace-role.yaml        -n maklaude-chaos-target
+kubectl apply -f deploy/rbac/chaos/target-namespace-rolebinding.yaml -n maklaude-chaos-target
+
+task e2e:chaos   # see the target's desc for the kubeconfig env vars it needs
 ```
 
 Against a live cluster where you applied `deploy/rbac/chaos`, the same questions via
@@ -251,7 +463,7 @@ against the RBAC rules alone:
 CHAOS=system:serviceaccount:maklaude:maklaude-chaos
 
 # The catalog — each MUST print "true".
-for verb in get create delete; do
+for verb in get list create delete; do
   kubectl create -o jsonpath='{.status.allowed}{"\n"}' -f - <<EOF
 apiVersion: authorization.k8s.io/v1
 kind: SubjectAccessReview
@@ -277,20 +489,40 @@ spec:
 EOF
 ```
 
-The `e2e` CI job runs the full matrix — the catalog, every workload denial, the
-other-namespace denials, the neighbouring chaos kinds, and a re-check that the
-observation and executor identities gained nothing.
+Two CI jobs run the matrix, and the split is deliberate. `e2e on kind` asserts the
+grants through `SubjectAccessReview` on a cluster with **no** Chaos Mesh, because that
+proves the Role is evaluated against RBAC rules alone. `chaos on kind` re-asserts them
+with `kubectl auth can-i` against the real CRD — the complementary question, since
+`can-i` resolves the resource name through discovery — and then runs the lifecycle. Both
+cover every workload denial, the other-namespace denials, the neighbouring chaos kinds,
+and a re-check that the observation and executor identities gained nothing.
+
+The target-namespace capability is checked as a **before/after pair**, and the ordering
+is the point. `chaos on kind` asserts `create podchaos` in `maklaude-chaos-target` is
+DENIED before the grant is applied and ALLOWED after, so the permission is demonstrably
+caused by that apply rather than by a cluster that permits everything. It then asserts
+the grant conferred nothing else there — no read of the namespace, no verb on a pod, no
+`list`/`delete` on experiments — and that `default` and `kube-system` still refuse,
+which is what makes it an allowlist rather than a switch. `TestE2E_ChaosTargetRoleIsTheAllowlist`
+closes the loop from MaKlaude's side: a real experiment aimed at `default`, in dry-run,
+must be refused *by admission* — the test rejects MaKlaude's own local refusals
+explicitly, since an error from the wrong layer is no evidence about the allowlist.
+
+`chaos on kind` also asserts, on the way out and with `always()` so a *failed* run is
+covered too, that no MaKlaude-derived experiment object outlived the job and that the
+operator's own experiment is still there. A leak is most likely precisely when a test
+failed partway through, which is the case a passing-run-only check would never see.
 
 ## What isn't built yet
 
-This is T2 of nine. The write path exists and is unreachable from any config
-surface, which is the same posture `kube.ExecuteMode` shipped in at M4: the
-strongest form of "off" there is.
+This is T3 of nine. The write path and its teardown guarantee exist and are unreachable
+from any config surface, which is the same posture `kube.ExecuteMode` shipped in at M4:
+the strongest form of "off" there is. Nothing schedules a sweep yet either — `Reaper`
+has no production caller until chaos becomes a proposal class in T4.
 
 | Task | What it adds |
 | ---- | ------------ |
-| [T3](https://github.com/Sayfan-AI/MaKlaude/issues/192) | Experiment lifecycle and guaranteed teardown — a leaked experiment is a bug, not an inconvenience |
-| [T4](https://github.com/Sayfan-AI/MaKlaude/issues/193) | Chaos as a proposal class through M5's decision path: same budget, cooldown and breaker; injections **never** promote to unattended |
+| [T4](https://github.com/Sayfan-AI/MaKlaude/issues/193) | Chaos as a proposal class through M5's decision path: same budget, cooldown and breaker; injections **never** promote to unattended. Also where the reaper gets scheduled. |
 | [T5](https://github.com/Sayfan-AI/MaKlaude/issues/194) | Fault injection *during* remediation — the condition none of the fixtures could create |
 | [T6](https://github.com/Sayfan-AI/MaKlaude/issues/195) | Correctness scoring: did it fix the fault, and should it have been allowed |
 | [T7](https://github.com/Sayfan-AI/MaKlaude/issues/196) | The narrowed no-writes guarantee, encoded in tests as precisely as in prose |

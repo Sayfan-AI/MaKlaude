@@ -12,7 +12,8 @@ is the point:
 | ------ | -------- | ------ | ------------ |
 | [`deploy/rbac/`](../deploy/rbac/) | `maklaude` | `get`/`list`/`watch` on a fixed resource set — **no mutating verb anywhere** | `kubectl apply -k deploy/rbac` |
 | [`deploy/rbac/write/`](../deploy/rbac/write/) — optional | `maklaude-executor` | the same reads, **plus** exactly three mutating verbs | `kubectl apply -k deploy/rbac/write` |
-| [`deploy/rbac/chaos/`](../deploy/rbac/chaos/) — optional | `maklaude-chaos` | `get`/`create`/`delete` on Chaos Mesh custom resources in **one** namespace, and nothing else | `kubectl apply -k deploy/rbac/chaos` |
+| [`deploy/rbac/chaos/`](../deploy/rbac/chaos/) — optional | `maklaude-chaos` | `get`/`list`/`create`/`delete` on Chaos Mesh custom resources in **one** namespace, and nothing else | `kubectl apply -k deploy/rbac/chaos` |
+| [`target-namespace-*.yaml`](../deploy/rbac/chaos/) — optional, per namespace | `maklaude-chaos` | `create` on `podchaos` in **one target namespace**: the permission to aim a fault there, and nothing else | `kubectl apply -f deploy/rbac/chaos/target-namespace-role.yaml -n <ns>` (plus the RoleBinding) |
 
 Install only the first and MaKlaude provably cannot change anything: everything
 that watches, collects, detects, correlates, diagnoses, and proposes runs as
@@ -339,10 +340,14 @@ Two things differ from the write bundle above, both deliberate:
   where experiment objects live. So the grant can't follow the identity into another
   namespace, and `kubectl get podchaos -n maklaude-chaos` is the complete list of
   what MaKlaude has outstanding on the cluster.
-- **It gets no reads at all** — not even the additive `maklaude-readonly` binding
-  the executor needs. The chaos path re-reads only its own custom resources.
-  Everything MaKlaude observes about a cluster it has broken, it observes through
-  the observation identity.
+- **It gets no reads of any workload** — not even the additive `maklaude-readonly`
+  binding the executor needs. The two reads it does have, `get` and `list`, cover only
+  its own custom resources: `get` is the create-shaped precondition (a create has no
+  `resourceVersion` to condition on, so the guard is "no experiment with this derived
+  name is live"), and `list` is how the reaper finds objects a *killed* run left behind
+  — a process that was `SIGKILL`ed holds no record of what it created, so the next run
+  has to ask the cluster. Everything MaKlaude observes about a cluster it has broken,
+  it observes through the observation identity.
 
 ```bash
 kubectl apply -k deploy/rbac         # required first: reads + the maklaude SA
@@ -351,13 +356,28 @@ kubectl apply -k deploy/rbac/chaos   # optional: deliberate experiments
 kubectl delete -k deploy/rbac/chaos  # revoke chaos alone, no restart
 ```
 
-Applying it enables nothing on its own: a per-cluster eligibility marker in the
-config and the `kube.ExecuteMode` kill switch are two further gates, in two other
-places. **And this Role does not bound an experiment's blast radius** — MaKlaude
-writes the CR, Chaos Mesh's controller does the killing with its own privileges.
-[`chaos.md`](chaos.md) is the whole story, including the `auth can-i` matrix (via
-`SubjectAccessReview`, since the CRDs may not be installed) and the
-permission-validation tension worth knowing about before you enable it.
+Applying it enables nothing on its own, and it does not let MaKlaude break a single
+workload. Three further gates sit in three other places: a per-cluster eligibility
+marker in the config, the `kube.ExecuteMode` kill switch, and — per namespace, one
+namespace at a time — the two files in that directory the kustomization deliberately
+leaves out:
+
+```bash
+# "MaKlaude may aim chaos at THIS namespace." Nothing above implies it.
+kubectl apply -f deploy/rbac/chaos/target-namespace-role.yaml        -n <target-ns>
+kubectl apply -f deploy/rbac/chaos/target-namespace-rolebinding.yaml -n <target-ns>
+```
+
+That grant is one verb, `create podchaos.chaos-mesh.org`, and it exists because Chaos
+Mesh's permission-validation webhook (on by default) authorizes a create by reviewing
+that exact attribute set in every namespace an experiment's *selector* names. So the
+namespaces MaKlaude can reach are an allowlist a person writes, and it costs the chaos
+identity **no** permission on any pod — the check is on `chaos-mesh.org` resources, not
+on the objects the selector matches. **Neither Role bounds what Chaos Mesh itself does
+once admitted**: MaKlaude writes the CR, Chaos Mesh's controller does the killing with
+its own privileges. [`chaos.md`](chaos.md) is the whole story, including the exact
+`SubjectAccessReview`, the misleadingly-named toggle that disables it, and the
+`auth can-i` matrix (via `SubjectAccessReview`, since the CRDs may not be installed).
 
 ## Validation status
 
@@ -365,9 +385,13 @@ All three bundles assemble cleanly under `kubectl kustomize`, and their contents
 asserted by the unit suite in [`test/rbac/`](../test/rbac/), which runs on every
 PR without needing a cluster: `maklaude-readonly` grants **no** mutating verb,
 `maklaude-write` grants **exactly** the executor's three, the chaos `Role` grants
-**exactly** the injector's three and is namespaced rather than cluster-wide, no
-binding hands a mutating or chaos role to another identity, and the base
-kustomization pulls in neither delta (nor does either delta pull in the other).
+**exactly** the four calls `internal/chaos` makes and is namespaced rather than
+cluster-wide, the per-target-namespace `Role` grants **exactly** the one attribute set
+Chaos Mesh's webhook reviews and carries no namespace of its own (so the apply chooses
+it), no binding hands a mutating or chaos role to another identity, and the base
+kustomization pulls in neither delta (nor does either delta pull in the other, nor does
+the chaos kustomization pull in the target grant — while every *other* manifest in that
+directory must be in it, so a file can't go quietly unapplied either).
 
 Against a live API server, the `e2e` CI job applies all three bundles to a `kind`
 cluster and runs every assertion above — including the re-check that the earlier

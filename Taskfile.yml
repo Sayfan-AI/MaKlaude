@@ -57,6 +57,40 @@ tasks:
       # longer".
       - go test -tags e2e -count=1 -timeout 30m -v ./test/e2e/...
 
+  e2e:chaos:
+    desc: |
+      Run ONLY the chaos lifecycle e2e, against a kind cluster that has Chaos Mesh
+      installed (`task chaos:install`) and the chaos seeds applied. Env vars:
+        MAKLAUDE_E2E_CHAOS_KUBECONFIG  the maklaude-chaos ServiceAccount kubeconfig
+                                       (deploy/rbac/chaos must be applied)
+        MAKLAUDE_E2E_KUBECONFIG        (optional) read-only SA kubeconfig, used only to
+                                       corroborate that the fault visibly landed
+        MAKLAUDE_E2E_CONTEXT           context to select within both kubeconfigs
+      It is a separate target from `e2e` because the two need different clusters: this
+      one installs a fault injector, and the remediation suite asserts convergence on
+      workloads a live experiment would disturb. The chaos test SKIPS under `task e2e`
+      when its kubeconfig is unset, so the main suite is unaffected either way.
+    cmds:
+      - go test -tags e2e -count=1 -timeout 20m -v -run 'TestE2E_Chaos' ./test/e2e/...
+
+  chaos:install:
+    desc: |
+      Install Chaos Mesh into the current kind cluster, pinned and idempotent.
+      Wraps scripts/install-chaos-mesh.sh, which the CI chaos job also calls — so a
+      failure reproduced locally runs the same code CI ran, and the pinned version has
+      exactly one home. The script refuses any cluster that does not look like kind.
+        KUBE_CONTEXT  optional context to select
+    cmds:
+      - bash scripts/install-chaos-mesh.sh
+
+  chaos:uninstall:
+    desc: |
+      Remove the Chaos Mesh release from the current kind cluster. Leaves the CRDs in
+      place deliberately: deleting a CRD cascades to every custom resource of that
+      kind, including experiments MaKlaude did not create.
+    cmds:
+      - bash scripts/install-chaos-mesh.sh --uninstall
+
   vet:
     desc: Run go vet, including every build-tagged suite CI compiles
     cmds:

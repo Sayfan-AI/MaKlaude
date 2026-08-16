@@ -46,11 +46,14 @@ type Injected struct {
 	Name      string
 
 	// UID is the created object's unique identity, and the precondition
-	// [Injector.Remove] tears down against. Empty under a dry run, where nothing
-	// was created.
+	// [Injector.Remove] tears down against. A non-empty value means an object exists:
+	// it is empty under a dry run, which [Injector.Inject] has to enforce rather than
+	// inherit, because a real API server returns a generated UID for a dryRun=All
+	// create even though it stores nothing.
 	UID string
 
-	// ResourceVersion is the created object's version as the API server returned it.
+	// ResourceVersion is the created object's version as the API server returned it,
+	// and empty under a dry run for the same reason as UID.
 	ResourceVersion string
 
 	// Scope is the rendered [kube.WriteScope] the create ran under — the exact
@@ -254,6 +257,30 @@ func (i *Injector) Inject(ctx context.Context, e Experiment) (*Injected, error) 
 			ErrInject, kind, e.Namespace+"/"+name, i.Name(), err)
 	}
 
+	// A preview creates nothing, so its record must carry nothing that identifies a
+	// stored object — and the API server does NOT make that automatic. A dryRun=All
+	// create returns the object as it *would* have been persisted, and a real cluster
+	// fills in a freshly generated `metadata.uid`, because a UID is assigned in the
+	// create path before storage is ever reached. (Observed against kind: uid
+	// populated, resourceVersion empty. Which generated fields a preview happens to
+	// carry is an implementation detail, so both are dropped rather than the one that
+	// showed up.)
+	//
+	// Left in place, that UID is a phantom identity: [Injector.Remove] conditions a
+	// teardown on exactly this field, the [Reaper] uses it to prove ownership before
+	// deleting, and an audit record would name an object nobody can look up. The
+	// invariant worth having is "a non-empty UID means an object exists", so it is
+	// established here, at the one place a UID enters the package.
+	//
+	// This is also a reminder about proxies for real behaviour: the stub in
+	// injector_test.go answers a create with a uid regardless of dryRun, and the
+	// doc comment on [Injected.UID] has claimed "empty under a dry run" since T2 —
+	// nothing compared the two until a real API server did.
+	uid, resourceVersion := string(created.GetUID()), created.GetResourceVersion()
+	if i.dryRun() {
+		uid, resourceVersion = "", ""
+	}
+
 	return &Injected{
 		Cluster:         i.Name(),
 		Acknowledgement: i.target.Acknowledgement(),
@@ -261,8 +288,8 @@ func (i *Injector) Inject(ctx context.Context, e Experiment) (*Injected, error) 
 		Kind:            kind,
 		Namespace:       e.Namespace,
 		Name:            name,
-		UID:             string(created.GetUID()),
-		ResourceVersion: created.GetResourceVersion(),
+		UID:             uid,
+		ResourceVersion: resourceVersion,
 		Scope:           scope.String(),
 		DryRun:          i.dryRun(),
 	}, nil
@@ -322,6 +349,21 @@ func (i *Injector) assertAbsent(ctx context.Context, e Experiment) error {
 // The delete overrides neither propagation policy nor grace period, so Chaos Mesh's
 // finalizer runs and a persisting fault is reverted before the object disappears.
 // Forcing the object away would remove the record while leaving the fault.
+//
+// So a successful Remove means the deletion was ACCEPTED, not that the object is
+// gone: Chaos Mesh holds a finalizer (`chaos-mesh/records`) and clears it only after
+// its controller has recovered the fault, which leaves the object in Terminating for
+// as long as that takes. Two consequences a caller has to expect. A second Remove in
+// that window reports success with [Removal.AlreadyAbsent] FALSE, because the object
+// is genuinely still there — `AlreadyAbsent` is the receipt for "gone", so it is also
+// the receipt for "recovery finished". And [Injector.Inject] of the same experiment
+// fails with [ErrExperimentExists] until then, since the derived name is still taken;
+// that is the create-shaped precondition working, not a stale read.
+//
+// The upside is worth naming, because it is the guarantee this milestone is about:
+// the finalizer makes recovery independent of MaKlaude. Once the delete is accepted,
+// a MaKlaude that is SIGKILLed one instant later still leaves a cluster that
+// un-breaks itself.
 func (i *Injector) Remove(ctx context.Context, in Injected) (*Removal, error) {
 	if err := validateName("namespace", in.Namespace); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidExperiment, err)

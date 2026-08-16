@@ -13,8 +13,8 @@
 # but it does expect the `maklaude` namespace to exist, which the base bundle
 # creates.
 #
-# APPLYING THIS BUNDLE DOES NOT ENABLE CHAOS. Three independent gates have to be
-# opened, by a person, in three different places:
+# APPLYING THIS BUNDLE DOES NOT ENABLE CHAOS. Four independent gates have to be
+# opened, by a person, in four different places:
 #
 #   1. this bundle (the API server will permit the CR write);
 #   2. a per-cluster eligibility block in MaKlaude's cluster config, naming the
@@ -22,11 +22,22 @@
 #      cluster.ChaosEligibility and docs/chaos.md. Absent, the cluster mints no
 #      chaos capability and internal/chaos cannot be constructed for it at all;
 #   3. kube.ExecuteMode set to something other than disabled, which is the same
-#      kill switch approved remediation rides.
+#      kill switch approved remediation rides;
+#   4. a per-target-namespace grant, one namespace at a time, via the two files in
+#      this directory that are NOT listed below — target-namespace-role.yaml and
+#      target-namespace-rolebinding.yaml. Chaos Mesh's permission-validation webhook
+#      authorizes a create against the namespaces an experiment's SELECTOR names, so
+#      without that grant every experiment is denied by admission even though this
+#      bundle permits the write. They are excluded from `resources:` deliberately:
+#      they have no namespace of their own, and which namespaces may be broken is not
+#      a decision `kubectl apply -k` should make on an operator's behalf. See the
+#      header of target-namespace-role.yaml for the exact check it satisfies.
 #
-# Any one of the three closes the path. Revoke the fastest one:
+# Any one of the four closes the path. Revoke the fastest one:
 #
-#   kubectl delete -k deploy/rbac/chaos
+#   kubectl delete -k deploy/rbac/chaos              # the identity, cluster-wide
+#   kubectl delete -f deploy/rbac/chaos/target-namespace-rolebinding.yaml -n <ns>
+#                                                    # or just one namespace's turn
 #
 # It also does not install Chaos Mesh. MaKlaude writes the custom resources; Chaos
 # Mesh's controller is what acts on them, and installing it — and choosing how

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Sayfan-AI/MaKlaude/internal/cluster"
@@ -42,8 +43,16 @@ type stubReply struct {
 // Mesh CRDs. It records every request and answers per-method, so a test can set up
 // "the object is absent, the create succeeds" or "the create loses a race" without
 // a cluster.
+//
+// The mutex is not decoration. Most tests here drive it from one goroutine, but the
+// SIGKILL test in kill_test.go drives it from a SEPARATE PROCESS — and the
+// happens-before edge that orders "the handler recorded the request" against "the
+// parent reads the record" runs through a socket and a pipe, which the race detector
+// cannot see. Without the lock, `go test -race` is entitled to report that access as
+// unsynchronised, and it would be right.
 type chaosStub struct {
 	*httptest.Server
+	mu    sync.Mutex
 	seen  []recordedRequest
 	reply map[string]stubReply
 }
@@ -77,9 +86,12 @@ func newChaosStub(t *testing.T) *chaosStub {
 		if err := json.NewDecoder(r.Body).Decode(&raw); err == nil {
 			_ = json.Unmarshal(raw, &rec.Body)
 		}
-		stub.seen = append(stub.seen, rec)
 
+		stub.mu.Lock()
+		stub.seen = append(stub.seen, rec)
 		reply := stub.reply[r.Method]
+		stub.mu.Unlock()
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(reply.status)
 		_, _ = w.Write([]byte(reply.body))
@@ -90,11 +102,15 @@ func newChaosStub(t *testing.T) *chaosStub {
 
 // answer overrides the canned reply for one method.
 func (s *chaosStub) answer(method string, status int, body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.reply[method] = stubReply{status: status, body: body}
 }
 
 // requestsFor returns every recorded request with the given method.
 func (s *chaosStub) requestsFor(method string) []recordedRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var out []recordedRequest
 	for _, r := range s.seen {
 		if r.Method == method {
@@ -104,12 +120,19 @@ func (s *chaosStub) requestsFor(method string) []recordedRequest {
 	return out
 }
 
+// recorded returns every request the stub saw, in order.
+func (s *chaosStub) recorded() []recordedRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]recordedRequest(nil), s.seen...)
+}
+
 // only returns the single recorded request with the given method.
 func (s *chaosStub) only(t *testing.T, method string) recordedRequest {
 	t.Helper()
 	got := s.requestsFor(method)
 	if len(got) != 1 {
-		t.Fatalf("expected exactly 1 %s, got %d (all: %+v)", method, len(got), s.seen)
+		t.Fatalf("expected exactly 1 %s, got %d (all: %+v)", method, len(got), s.recorded())
 	}
 	return got[0]
 }
@@ -120,7 +143,7 @@ func (s *chaosStub) only(t *testing.T, method string) recordedRequest {
 // extra one.
 func (s *chaosStub) assertOnlyChaosPaths(t *testing.T) {
 	t.Helper()
-	for _, r := range s.seen {
+	for _, r := range s.recorded() {
 		if !strings.HasPrefix(r.Path, kube.ChaosAPIPathPrefix) {
 			t.Errorf("request outside the chaos API group: %s %s", r.Method, r.Path)
 		}
@@ -378,6 +401,19 @@ func TestInject_DryRunPreviews(t *testing.T) {
 	if !strings.HasSuffix(got.Scope, "(dry-run only)") {
 		t.Errorf("recorded scope should say it was preview-only, got %q", got.Scope)
 	}
+
+	// The stub answers this POST with `uid-1` and `resourceVersion: 42` — exactly as a
+	// real API server answers a dryRun=All create, which returns the object as it would
+	// have been persisted with a freshly generated UID. Neither may reach the record: a
+	// UID is what Remove conditions a teardown on and what the reaper checks ownership
+	// with, so a preview carrying one is a phantom identity for an object that does not
+	// exist. This assertion is the one the e2e had to discover was missing.
+	if got.UID != "" {
+		t.Errorf("a preview must carry no UID, got %q — the object was never stored, and Remove/Reap treat a UID as proof it was", got.UID)
+	}
+	if got.ResourceVersion != "" {
+		t.Errorf("a preview must carry no resourceVersion, got %q", got.ResourceVersion)
+	}
 }
 
 // TestInject_RefusesAnInvalidExperimentWithoutSending proves validation happens
@@ -392,8 +428,8 @@ func TestInject_RefusesAnInvalidExperimentWithoutSending(t *testing.T) {
 	if _, err := i.Inject(context.Background(), e); !errors.Is(err, ErrInvalidExperiment) {
 		t.Fatalf("expected ErrInvalidExperiment, got: %v", err)
 	}
-	if len(stub.seen) != 0 {
-		t.Fatalf("an invalid experiment must reach no network at all, got %+v", stub.seen)
+	if got := stub.recorded(); len(got) != 0 {
+		t.Fatalf("an invalid experiment must reach no network at all, got %+v", got)
 	}
 }
 
@@ -448,8 +484,8 @@ func TestRemove_RequiresAUID(t *testing.T) {
 	if !errors.Is(err, ErrMissingUID) {
 		t.Fatalf("expected ErrMissingUID, got: %v", err)
 	}
-	if len(stub.seen) != 0 {
-		t.Fatalf("nothing must be sent, got %+v", stub.seen)
+	if got := stub.recorded(); len(got) != 0 {
+		t.Fatalf("nothing must be sent, got %+v", got)
 	}
 }
 
@@ -538,8 +574,8 @@ func TestRemove_RefusesAnUnknownKind(t *testing.T) {
 	if !errors.Is(err, ErrInvalidExperiment) {
 		t.Fatalf("expected ErrInvalidExperiment, got: %v", err)
 	}
-	if len(stub.seen) != 0 {
-		t.Fatalf("nothing must be sent, got %+v", stub.seen)
+	if got := stub.recorded(); len(got) != 0 {
+		t.Fatalf("nothing must be sent, got %+v", got)
 	}
 }
 
