@@ -32,6 +32,10 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash .genesis/scripts/host-guard.sh"
+          },
+          {
+            "type": "command",
             "command": "bash .genesis/scripts/log.sh pre-tool-use"
           }
         ]
